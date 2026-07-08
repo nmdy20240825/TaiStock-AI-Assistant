@@ -1,14 +1,13 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import pandas_ta as ta
 import google.generativeai as genai
 
 # 1. 網頁基本配置
-st.set_page_config(page_title="台股AI波段交易助手 V6.0", layout="wide", page_icon="📈")
+st.set_page_config(page_title="台股AI波段交易助手 V7.0", layout="wide", page_icon="📈")
 
 # 2. 側邊欄配置
-st.sidebar.title("🤖 台股AI波段助手 V6.0")
+st.sidebar.title("🤖 台股AI波段助手 V7.0")
 st.sidebar.markdown("---")
 
 api_key = st.sidebar.text_input("🔑 請輸入 Gemini API 金鑰", type="password")
@@ -36,7 +35,7 @@ if 'watchlist' not in st.session_state:
 if 'sys_settings' not in st.session_state:
     st.session_state.sys_settings = {"stop_loss": 8.0, "take_profit": 15.0, "model": "gemini-1.5-pro"}
 
-# 4. 核心功能模組
+# 4. 核心功能模組 (完全移除 pandas_ta，改用純 Pandas 數學運算，百毒不侵)
 def get_taiwan_stock_data(symbol):
     for suffix in ['.TW', '.TWO']:
         ticker = f"{symbol}{suffix}"
@@ -46,7 +45,6 @@ def get_taiwan_stock_data(symbol):
     return pd.DataFrame(), None
 
 def get_market_trend():
-    """抓取加權指數(^TWII)判斷大盤多空"""
     try:
         twii = yf.Ticker("^TWII").history(period="1mo")
         if twii.empty: return "震盪 (無法取得指數)"
@@ -56,43 +54,61 @@ def get_market_trend():
         elif latest_close < ma20 * 0.99: return "🧊 偏空 (跌破月線)"
         else: return "⚖️ 震盪 (月線糾結)"
     except:
-        return "⚖️ 震盪 (數據讀取異常)"
+        return "⚖️ 震盪 (數據異常)"
 
 def compute_signals(df):
     if df.empty or len(df) < 30:
         return None
     data = df.copy()
     try:
-        macd = data.ta.macd(fast=12, slow=26, signal=9)
-        kd = data.ta.stoch(fastk=9, k=3, d=3)
-        rsi = data.ta.rsi(length=14)
+        # 內建 MACD 運算
+        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+        m_l = exp1 - exp2
+        m_s = m_l.ewm(span=9, adjust=False).mean()
+        m_h = m_l - m_s
         
-        combined = pd.concat([data, macd, kd, rsi], axis=1)
-        latest = combined.iloc[-1]
+        # 內建 RSI 運算
+        delta = data['Close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.rolling(window=14, min_periods=1).mean()
+        avg_loss = loss.rolling(window=14, min_periods=1).mean()
+        rs = avg_gain / avg_loss
+        r_v = 100 - (100 / (1 + rs))
         
-        m_l = latest[[c for c in combined.columns if 'MACD_' in c][0]]
-        m_s = latest[[c for c in combined.columns if 'MACDs_' in c][0]]
-        m_h = latest[[c for c in combined.columns if 'MACDh_' in c][0]]
-        k_v = latest[[c for c in combined.columns if 'STOCHk_' in c][0]]
-        d_v = latest[[c for c in combined.columns if 'STOCHd_' in c][0]]
-        r_v = latest[[c for c in combined.columns if 'RSI_' in c][0]]
+        # 內建 KD 運算
+        low_min = data['Low'].rolling(window=9, min_periods=1).min()
+        high_max = data['High'].rolling(window=9, min_periods=1).max()
+        rsv = 100 * ((data['Close'] - low_min) / (high_max - low_min))
+        rsv = rsv.fillna(50)
+        k_v = rsv.ewm(com=2, adjust=False).mean()
+        d_v = k_v.ewm(com=2, adjust=False).mean()
         
-        price_ma20 = data['Close'].rolling(20).mean().iloc[-1]
-        vol_ma20 = data['Volume'].rolling(20).mean().iloc[-1]
-        close_price = latest['Close']
-        current_vol = latest['Volume']
+        # 均線與均量
+        price_ma20 = data['Close'].rolling(20).mean()
+        vol_ma20 = data['Volume'].rolling(20).mean()
+        
+        # 取得今日最新數值
+        close_price = data['Close'].iloc[-1]
+        current_vol = data['Volume'].iloc[-1]
+        v_ma20_val = vol_ma20.iloc[-1]
+        m_h_val = m_h.iloc[-1]
+        k_val = k_v.iloc[-1]
+        d_val = d_v.iloc[-1]
+        r_val = r_v.iloc[-1]
         
         # 波段分數計分
         score = 0
-        if close_price > price_ma20: score += 20
-        if current_vol > vol_ma20: score += 10
-        if m_h > 0: score += 15
-        if m_l > m_s: score += 10
-        if k_v > d_v: score += 15
-        if k_v > d_v and k_v < 35: score += 10
-        if k_v > 85: score -= 10
-        if 50 <= r_v <= 75: score += 20
-        elif r_v > 75: score += 10
+        if close_price > price_ma20.iloc[-1]: score += 20
+        if current_vol > v_ma20_val: score += 10
+        if m_h_val > 0: score += 15
+        if m_l.iloc[-1] > m_s.iloc[-1]: score += 10
+        if k_val > d_val: score += 15
+        if k_val > d_val and k_val < 35: score += 10
+        if k_val > 85: score -= 10
+        if 50 <= r_val <= 75: score += 20
+        elif r_val > 75: score += 10
         score = max(0, min(100, score))
         
         if score >= 90: score_badge = "🟢 強烈留意"
@@ -102,44 +118,38 @@ def compute_signals(df):
         
         return {
             "現價": round(close_price, 2),
-            "漲跌幅": round(((close_price - combined['Close'].iloc[-2]) / combined['Close'].iloc[-2]) * 100, 2),
+            "漲跌幅": round(((close_price - data['Close'].iloc[-2]) / data['Close'].iloc[-2]) * 100, 2),
             "評級": score_badge,
             "純分數": score,
             "今日成交量": current_vol,
-            "月均成交量": vol_ma20,
-            "K值": round(k_v, 2),
-            "D值": round(d_v, 2),
-            "MACD狀態": "多頭" if m_h > 0 else "空頭",
-            "量能狀態": "量增" if current_vol > vol_ma20 else "量縮"
+            "月均成交量": v_ma20_val,
+            "K值": round(k_val, 2),
+            "D值": round(d_val, 2),
+            "MACD狀態": "多頭" if m_h_val > 0 else "空頭",
+            "量能狀態": "量增" if current_vol > v_ma20_val else "量縮"
         }
     except Exception as e:
         return None
 
 # -----------------------------------------------------------------------------
-# 頁面 1: Dashboard 首頁 (🌟 全新 AI 每日晨報 30 秒決策面板)
+# 頁面 UI 渲染
 # -----------------------------------------------------------------------------
 if page == "Dashboard（首頁）":
-    st.title("🌅 AI 每日晨報")
+    st.title("🌅 AI 每日晨報 V7.0")
     st.markdown("🎯 **目標：30 秒內掌握今日戰略**")
     
     with st.spinner("正在掃描大盤與您的專屬股池..."):
-        # 1. 計算大盤趨勢
         market_trend = get_market_trend()
-        
-        # 2. 計算總損益與掃描個股最高/最低分
         total_pnl = 0.0
         best_stock = {"名稱": "無", "分數": -1, "漲幅": 0}
         worst_stock = {"名稱": "無", "分數": 101, "跌幅": 0}
         
         all_stocks_to_scan = list(set(st.session_state.portfolio["代號"].tolist() + st.session_state.watchlist["代號"].tolist()))
-        stock_reports = []
 
         for sym in all_stocks_to_scan:
             df, _ = get_taiwan_stock_data(sym)
             sig = compute_signals(df)
             if sig:
-                stock_reports.append(f"{sym}({sig['純分數']}分)")
-                # 判斷是否為庫存並計算損益
                 if sym in st.session_state.portfolio["代號"].values:
                     idx = st.session_state.portfolio[st.session_state.portfolio["代號"] == sym].index[0]
                     cost = st.session_state.portfolio.at[idx, "持有均價"]
@@ -147,54 +157,35 @@ if page == "Dashboard（首頁）":
                     pnl = (sig["現價"] - cost) * shares
                     total_pnl += pnl
                 
-                # 紀錄最高與最低分
                 if sig["純分數"] > best_stock["分數"]:
                     best_stock = {"名稱": sym, "分數": sig["純分數"], "漲幅": sig["漲跌幅"]}
                 if sig["純分數"] < worst_stock["分數"]:
                     worst_stock = {"名稱": sym, "分數": sig["純分數"], "跌幅": sig["漲跌幅"]}
 
-        # --- 渲染視覺化卡片 ---
         st.markdown("---")
         c1, c2 = st.columns(2)
         c1.metric("📊 今日大盤趨勢", market_trend)
         c2.metric("💰 預估庫存總損益", f"NT$ {total_pnl:,.0f}", f"{'▲ 獲利中' if total_pnl >=0 else '▼ 虧損中'}")
         
         st.markdown("<br>", unsafe_allow_html=True)
-        
         c3, c4 = st.columns(2)
         with c3:
-            st.success(f"🎯 **今日最值得注意**\n\n**{best_stock['名稱']}** (AI分數: {best_stock['分數']})\n\n漲跌幅: {best_stock['漲幅']}%")
+            st.success(f"🎯 **今日最值得注意**\n\n**{best_stock['名稱']}** (分數: {best_stock['分數']})\n\n漲幅: {best_stock['漲幅']}%")
         with c4:
-            st.error(f"⚠️ **今日最大風險**\n\n**{worst_stock['名稱']}** (AI分數: {worst_stock['分數']})\n\n漲跌幅: {worst_stock['跌幅']}%")
+            st.error(f"⚠️ **今日最大風險**\n\n**{worst_stock['名稱']}** (分數: {worst_stock['分數']})\n\n跌幅: {worst_stock['跌幅']}%")
         
         st.markdown("---")
-        
-        # 3. 🤖 AI 一句話決策總結
         st.subheader("🤖 AI 晨報 30 秒決策結論")
         if api_key:
             try:
                 model = genai.GenerativeModel(st.session_state.sys_settings["model"])
-                prompt = f"""
-                你是追求極致效率的台股波段交易教練。
-                今日大盤狀態：{market_trend}
-                持股損益狀態：{'獲利中' if total_pnl >= 0 else '虧損中'} (金額: {total_pnl})
-                強勢股：{best_stock['名稱']} ({best_stock['分數']}分)
-                弱勢股：{worst_stock['名稱']} ({worst_stock['分數']}分)
-                
-                請嚴格用「一句話（不超過 40 字）」告訴我今天該怎麼做。
-                範例格式：大盤偏空且持股虧損，今日請勿動作，優先檢視並停損弱勢股。
-                或：大盤站穩月線，強勢股動能佳，可針對高分標的伺機加碼。
-                """
-                response = model.generate_content(prompt)
-                st.info(f"**{response.text}**")
-            except Exception as e:
-                st.warning("AI 產生結論失敗，請確認 API 狀態。")
+                prompt = f"你是台股波段教練。大盤：{market_trend}，損益：{total_pnl}。強勢股：{best_stock['名稱']}。弱勢股：{worst_stock['名稱']}。請用一句話告訴我今天該怎麼做。"
+                st.info(f"**{model.generate_content(prompt).text}**")
+            except:
+                st.warning("AI 產生失敗。")
         else:
-            st.warning("⚠️ 請至左側輸入 Gemini API 金鑰以啟用「AI 一句話決策」。")
+            st.warning("⚠️ 請輸入 API 金鑰。")
 
-# -----------------------------------------------------------------------------
-# 其他頁面 UI (維持 V5.0 完整功能)
-# -----------------------------------------------------------------------------
 elif page == "📌 AI 雷達":
     st.title("📡 AI 盤後主力與趨勢雷達")
     scan_pool = ["2330", "2317", "2382", "3017", "3037", "3711", "3443", "2454", "3231", "2376", "2603", "2303"]
@@ -206,7 +197,6 @@ elif page == "📌 AI 雷達":
             sig = compute_signals(df)
             if sig:
                 sig['代號'] = sym
-                sig['爆量倍數'] = round(sig['今日成交量'] / sig['月均成交量'], 2) if sig['月均成交量'] > 0 else 0
                 results.append(sig)
             progress_bar.progress((i + 1) / len(scan_pool))
         
@@ -243,29 +233,16 @@ elif page == "💬 AI 教練模式":
         if not api_key:
             st.warning("⚠️ 請先在左側欄輸入 API 金鑰。")
         else:
-            with st.spinner(f"正在審視 {selected_stock} 的數據..."):
+            with st.spinner(f"正在審視 {selected_stock}..."):
                 df, _ = get_taiwan_stock_data(selected_stock)
-                signals = compute_signals(df)
-                if signals:
+                sig = compute_signals(df)
+                if sig:
                     model = genai.GenerativeModel(st.session_state.sys_settings["model"])
-                    prompt = f"""
-                    你現在是一位嚴苛的波段交易教練。我要詢問：{selected_stock}。
-                    綜合分數：{signals['評級']}({signals['純分數']}分)。現價：{signals['現價']} (漲跌 {signals['漲跌幅']}%)
-                    KD：K={signals['K值']}, D={signals['D值']}。MACD：{signals['MACD狀態']}。量能：{signals['量能狀態']}
-                    
-                    請「嚴格」依照以下格式輸出：
-                    【教練指示】：(一句話)
-                    【背後原因】：
-                    ① (KD分析)
-                    ② (量能分析)
-                    ③ (MACD/分數分析)
-                    【教練總結行動】：(具體行動)
-                    """
+                    prompt = f"你是嚴苛教練。標的：{selected_stock}。分數：{sig['純分數']}。現價：{sig['現價']}。KD：K={sig['K值']}, D={sig['D值']}。MACD：{sig['MACD狀態']}。量能：{sig['量能狀態']}。請照格式回覆：【教練指示】、【背後原因】(①②③)、【教練總結行動】。"
                     try:
-                        response = model.generate_content(prompt)
-                        st.success(response.text)
+                        st.success(model.generate_content(prompt).text)
                     except:
-                        st.error("AI 發生錯誤。")
+                        st.error("AI 錯誤。")
 
 elif page == "歷史紀錄與績效":
     st.title("📚 波段績效分析")
@@ -273,7 +250,6 @@ elif page == "歷史紀錄與績效":
 
 elif page == "系統設定":
     st.title("⚙️ 風控參數設定")
-    st.session_state.sys_settings["stop_loss"] = st.number_input("強制停損百分比 (%)", value=st.session_state.sys_settings["stop_loss"], step=0.5)
+    st.session_state.sys_settings["stop_loss"] = st.number_input("強制停損 (%)", value=st.session_state.sys_settings["stop_loss"], step=0.5)
     st.session_state.sys_settings["model"] = st.selectbox("核心 AI 模型", ["gemini-1.5-pro", "gemini-1.5-flash"])
     st.success("參數已儲存！")
-          
