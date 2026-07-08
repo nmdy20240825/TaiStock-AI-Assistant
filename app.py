@@ -5,7 +5,7 @@ import google.generativeai as genai
 import requests
 
 # 1. 網頁基本配置
-st.set_page_config(page_title="台股AI波段交易助手 V13.0", layout="wide", page_icon="📈")
+st.set_page_config(page_title="台股AI波段交易助手 V15.0", layout="wide", page_icon="📈")
 
 st.markdown("""
 <style>
@@ -16,7 +16,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 2. 側邊欄配置
-st.sidebar.title("🤖 波段助手 V13.0")
+st.sidebar.title("🤖 波段助手 V15.0")
 st.sidebar.markdown("---")
 
 saved_key = ""
@@ -46,8 +46,7 @@ if 'watchlist' not in st.session_state:
     ])
 
 if 'sys_settings' not in st.session_state:
-    # 關鍵修正 1：使用帶有 -latest 尾綴的安全模型名稱，避免 404 錯誤
-    st.session_state.sys_settings = {"stop_loss": 8.0, "take_profit": 15.0, "model": "gemini-1.5-flash-latest"}
+    st.session_state.sys_settings = {"stop_loss": 8.0, "take_profit": 15.0, "model": "gemini-pro"}
 
 STOCK_MAPPING = {
     "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3017": "奇鋐",
@@ -115,6 +114,9 @@ def compute_signals(df):
         k_v = rsv.ewm(com=2, adjust=False).mean()
         d_v = k_v.ewm(com=2, adjust=False).mean()
         
+        # 均線系統擴充：加入 5MA 與 10MA 用於區間與股性運算
+        price_ma5 = data['Close'].rolling(5).mean()
+        price_ma10 = data['Close'].rolling(10).mean()
         price_ma20 = data['Close'].rolling(20).mean()
         vol_ma20 = data['Volume'].rolling(20).mean()
         
@@ -129,12 +131,29 @@ def compute_signals(df):
         k_val = k_v.iloc[-1]
         d_val = d_v.iloc[-1]
         r_val = r_v.iloc[-1]
+        ma5_val = price_ma5.iloc[-1]
+        ma10_val = price_ma10.iloc[-1]
+        ma20_val = price_ma20.iloc[-1]
         
-        ma20_status = "站上月線" if close_price > price_ma20.iloc[-1] else "跌破月線"
+        ma20_status = "站上月線" if close_price > ma20_val else "跌破月線"
         vol_ratio = current_vol / v_ma20_val if v_ma20_val > 0 else 0
         
+        # 股性判別邏輯
+        if close_price > ma5_val > ma10_val and (close_price - ma20_val)/ma20_val > 0.08:
+            stock_nature = "🚀 急漲高波段"
+        elif close_price < ma20_val * 0.95:
+            stock_nature = "📉 弱勢探底段"
+        else:
+            stock_nature = "🚶 一般節奏段"
+
+        # 戰略區間計算
+        zone_add = f"{round(ma10_val, 1)} ~ {round(ma5_val, 1)}"
+        zone_tp_short = f"{round(close_price * 1.05, 1)} ~ {round(close_price * 1.10, 1)}"
+        zone_tp_swing = f"{round(close_price * 1.15, 1)} ~ {round(close_price * 1.25, 1)}"
+        zone_risk = f"{round(close_price * 0.92, 1)} ~ {round(ma20_val, 1)}"
+        
         score = 0
-        if close_price > price_ma20.iloc[-1]: score += 20
+        if close_price > ma20_val: score += 20
         if current_vol > v_ma20_val: score += 10
         if m_h_val > 0: score += 15
         if m_l.iloc[-1] > m_s.iloc[-1]: score += 10
@@ -155,7 +174,12 @@ def compute_signals(df):
             "漲跌幅(%)": round(((close_price - data['Close'].iloc[-2]) / data['Close'].iloc[-2]) * 100, 2),
             "月線狀態": ma20_status,
             "主力動能(爆量倍數)": f"{vol_ratio:.1f} 倍",
-            "純量化倍數": round(vol_ratio, 2), # 新增純數字欄位，防呆專用
+            "純量化倍數": round(vol_ratio, 2),
+            "股性判別": stock_nature,
+            "起漲加碼區間": zone_add,
+            "短線停利區間": zone_tp_short,
+            "波段停利區間": zone_tp_swing,
+            "風險管控區間": zone_risk,
             "K值": round(k_val, 2),
             "D值": round(d_val, 2),
             "MACD柱": round(m_h_val, 2),
@@ -227,11 +251,10 @@ elif page == "📌 AI 雷達":
                 results.append(sig)
             progress_bar.progress((i + 1) / len(tickers))
         
-        # 關鍵修正 2：捨棄 Pandas 過濾，改用純 Python 列表過濾，防呆 100%
         good_list = [r for r in results if r['純分數'] >= 90 or r['純量化倍數'] >= 1.5]
         bad_list = [r for r in results if r['純分數'] < 60]
         
-        cols = ['代號', '名稱', '現價', '漲跌幅(%)', '主力動能(爆量倍數)', '月線狀態', 'K值', 'D值', 'MACD柱', 'RSI', '評級']
+        cols = ['代號', '名稱', '現價', '漲跌幅(%)', '股性判別', '主力動能(爆量倍數)', '月線狀態', 'K值', 'D值', 'MACD柱', '評級']
         
         st.subheader("🔥 強烈留意 (>90分) 或 主力爆量")
         if good_list:
@@ -305,10 +328,17 @@ elif page == "💬 AI 教練模式":
                     st.line_chart(df['Close'])
                     sig = compute_signals(df)
                     if sig:
-                        st.write(f"📝 現價 {sig['現價']}｜月線：{sig['月線狀態']}｜主力動能(爆量)：{sig['主力動能(爆量倍數)']}｜K={sig['K值']}, D={sig['D值']}｜MACD柱={sig['MACD柱']}")
+                        # 將戰略區間直接顯示在畫面上供檢視
+                        st.write(f"📝 現價 {sig['現價']}｜{sig['股性判別']}｜主力動能：{sig['主力動能(爆量倍數)']}")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("起漲加碼區間", sig['起漲加碼區間'])
+                        c2.metric("短線停利區間", sig['短線停利區間'])
+                        c3.metric("波段停利區間", sig['波段停利區間'])
+                        c4.metric("風險管控區間", sig['風險管控區間'])
+                        st.markdown("---")
                         
                         model = genai.GenerativeModel(st.session_state.sys_settings["model"])
-                        prompt = f"你是教練。標的：{selected_stock}。現價：{sig['現價']}。月線：{sig['月線狀態']}。爆量倍數：{sig['主力動能(爆量倍數)']}。KD：K={sig['K值']}, D={sig['D值']}。MACD柱：{sig['MACD柱']}。請回覆：\n【教練指示】\n【背後原因】(①均線與籌碼動能 ②KD ③MACD)\n【教練總結行動】"
+                        prompt = f"你是嚴格的台股波段教練。標的：{selected_stock}。現價：{sig['現價']}。股性：{sig['股性判別']}。加碼區：{sig['起漲加碼區間']}。短線停利區：{sig['短線停利區間']}。波段停利區：{sig['波段停利區間']}。風控區：{sig['風險管控區間']}。請用繁體中文回覆：\n【教練戰略指示】\n【技術與籌碼綜合解析】\n【操作紀律總結】"
                         try:
                             st.success(model.generate_content(prompt).text)
                         except Exception as e:
@@ -321,6 +351,5 @@ elif page == "歷史紀錄與績效":
 elif page == "系統設定":
     st.title("⚙️ 風控參數設定")
     st.session_state.sys_settings["stop_loss"] = st.number_input("強制停損 (%)", value=st.session_state.sys_settings["stop_loss"], step=0.5)
-    # 提供最安全與最新版的模型選項
-    st.session_state.sys_settings["model"] = st.selectbox("核心 AI 模型", ["gemini-1.5-flash-latest", "gemini-1.5-pro-latest", "gemini-1.0-pro"])
+    st.session_state.sys_settings["model"] = st.selectbox("核心 AI 模型", ["gemini-pro", "gemini-1.5-flash-latest"])
     st.success("參數已儲存！")
