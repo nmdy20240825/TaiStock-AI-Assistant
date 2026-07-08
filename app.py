@@ -5,9 +5,8 @@ import google.generativeai as genai
 import requests
 
 # 1. 網頁基本配置
-st.set_page_config(page_title="台股AI波段交易助手 V11.0", layout="wide", page_icon="📈")
+st.set_page_config(page_title="台股AI波段交易助手 V12.0", layout="wide", page_icon="📈")
 
-# 注入 CSS 語法強制放大側邊欄選單字體，適合手機點擊
 st.markdown("""
 <style>
     div[data-testid="stSidebarNav"] span { font-size: 18px !important; font-weight: bold; }
@@ -16,11 +15,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 2. 側邊欄配置與 API 永久記憶邏輯
-st.sidebar.title("🤖 波段助手 V11.0")
+# 2. 側邊欄配置
+st.sidebar.title("🤖 波段助手 V12.0")
 st.sidebar.markdown("---")
 
-# 嘗試從雲端秘密金庫讀取金鑰，若無則要求手動輸入
 saved_key = ""
 if "GEMINI_API_KEY" in st.secrets:
     saved_key = st.secrets["GEMINI_API_KEY"]
@@ -32,7 +30,7 @@ if api_key:
 st.sidebar.markdown("---")
 page = st.sidebar.radio("功能選單", ["Dashboard（首頁）", "📌 AI 雷達", "我的持股", "自選股觀察", "💬 AI 教練模式", "歷史紀錄與績效", "系統設定"])
 
-# 3. 初始化記憶體資料與股票名稱字典
+# 3. 初始化記憶體資料
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = pd.DataFrame([
         {"代號": "2317", "名稱": "鴻海", "持有均價": 180.0, "股數": 1000},
@@ -48,7 +46,8 @@ if 'watchlist' not in st.session_state:
     ])
 
 if 'sys_settings' not in st.session_state:
-    st.session_state.sys_settings = {"stop_loss": 8.0, "take_profit": 15.0, "model": "gemini-1.5-pro"}
+    # 修正：將預設模型切換為最穩定的 gemini-1.5-flash 以避開 404 錯誤
+    st.session_state.sys_settings = {"stop_loss": 8.0, "take_profit": 15.0, "model": "gemini-1.5-flash"}
 
 STOCK_MAPPING = {
     "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3017": "奇鋐",
@@ -63,13 +62,15 @@ http_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 })
 
-# 4. 核心功能模組
+# 4. 核心功能模組 (加入防呆與資料清洗)
 def get_taiwan_stock_data(symbol):
     for suffix in ['.TW', '.TWO']:
         ticker = f"{symbol}{suffix}"
         try:
             stock = yf.Ticker(ticker, session=http_session)
             df = stock.history(period="6mo")
+            # 關鍵修復：剔除包含 NaN 的瑕疵資料行，防止數學運算崩潰
+            df = df.dropna(subset=['Close', 'Volume'])
             if not df.empty and len(df) > 30:
                 return df, ticker
         except:
@@ -79,6 +80,7 @@ def get_taiwan_stock_data(symbol):
 def get_market_trend():
     try:
         twii = yf.Ticker("^TWII", session=http_session).history(period="1mo")
+        twii = twii.dropna(subset=['Close'])
         if twii.empty: return "⚖️ 無數據"
         latest_close = twii['Close'].iloc[-1]
         ma20 = twii['Close'].rolling(20).mean().iloc[-1]
@@ -120,6 +122,11 @@ def compute_signals(df):
         close_price = data['Close'].iloc[-1]
         current_vol = data['Volume'].iloc[-1]
         v_ma20_val = vol_ma20.iloc[-1]
+        
+        # 防止出現 nan 的二次保險
+        if pd.isna(close_price):
+            return None
+
         m_h_val = m_h.iloc[-1]
         k_val = k_v.iloc[-1]
         d_val = d_v.iloc[-1]
@@ -222,23 +229,33 @@ elif page == "📌 AI 雷達":
             progress_bar.progress((i + 1) / len(tickers))
         
         df_res = pd.DataFrame(results)
-        if not df_res.empty:
+        
+        # 關鍵修復：確保 df_res 內部真的有成功算出的分數，才進行過濾，防止 KeyError
+        if not df_res.empty and '純分數' in df_res.columns:
             cols = ['代號', '名稱', '現價', '漲跌幅(%)', '主力動能(爆量倍數)', '月線狀態', 'K值', 'D值', 'MACD柱', 'RSI', '評級']
-            df_res = df_res[cols]
+            cols_to_use = [c for c in cols if c in df_res.columns]
+            df_res = df_res[cols_to_use]
             
             st.subheader("🔥 強烈留意 (>90分) 或 主力爆量")
-            good = df_res[(df_res['純分數'] >= 90) | (df_res['主力動能(爆量倍數)'].str.replace(' 倍', '').astype(float) >= 1.5)]
-            if not good.empty:
-                st.dataframe(good, hide_index=True)
+            # 加入安全防護，確保欄位存在
+            if '純分數' in df_res.columns and '主力動能(爆量倍數)' in df_res.columns:
+                good = df_res[(df_res['純分數'] >= 90) | (df_res['主力動能(爆量倍數)'].str.replace(' 倍', '', regex=False).astype(float) >= 1.5)]
+                if not good.empty:
+                    st.dataframe(good, hide_index=True)
+                else:
+                    st.write("無符合標的")
             else:
-                st.write("無符合標的")
+                st.write("資料運算異常。")
                 
             st.subheader("⚠️ 弱勢檢視 (<60分)")
-            bad = df_res[df_res['純分數'] < 60]
-            if not bad.empty:
-                st.dataframe(bad, hide_index=True)
-            else:
-                st.write("無符合標的")
+            if '純分數' in df_res.columns:
+                bad = df_res[df_res['純分數'] < 60]
+                if not bad.empty:
+                    st.dataframe(bad, hide_index=True)
+                else:
+                    st.write("無符合標的")
+        else:
+            st.warning("⚠️ 目前 Yahoo 財經未回傳有效數據，請稍後再試。")
 
 elif page == "我的持股":
     st.title("💼 我的庫存持股管理")
@@ -316,5 +333,6 @@ elif page == "歷史紀錄與績效":
 elif page == "系統設定":
     st.title("⚙️ 風控參數設定")
     st.session_state.sys_settings["stop_loss"] = st.number_input("強制停損 (%)", value=st.session_state.sys_settings["stop_loss"], step=0.5)
-    st.session_state.sys_settings["model"] = st.selectbox("核心 AI 模型", ["gemini-1.5-pro", "gemini-1.5-flash"])
+    # 修正：加入 gemini-1.5-pro-latest 作為備用選項
+    st.session_state.sys_settings["model"] = st.selectbox("核心 AI 模型", ["gemini-1.5-flash", "gemini-1.5-pro-latest"])
     st.success("參數已儲存！")
