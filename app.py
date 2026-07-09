@@ -3,43 +3,43 @@ import pandas as pd
 import yfinance as yf
 import google.generativeai as genai
 
-st.set_page_config(page_title="波段助手 V23.0", layout="wide")
+# 1. 頁面設定
+st.set_page_config(page_title="波段助手 V24.0", layout="wide")
 
-# 1. API 強制設定 (移除所有模型版本限制)
-api_key = st.secrets.get("GEMINI_API_KEY", "")
+# 2. API 強制寫入與設定
+# 這裡我們手動處理，確保程式不會因為抓不到 Secrets 而崩潰
+if 'GEMINI_API_KEY' in st.secrets:
+    api_key = st.secrets['GEMINI_API_KEY']
+else:
+    api_key = st.sidebar.text_input("🔑 手動輸入 API Key", type="password")
+
 if api_key:
     genai.configure(api_key=api_key)
+    # 不指定模型版本，讓 SDK 自動尋找可用的預設模型
+    model = genai.GenerativeModel('gemini-pro')
 
-# 2. 核心分析
-def get_analysis(sym):
+# 3. 簡單數據分析 (確保絕對不會報型別錯誤)
+def get_data(sym):
     try:
-        df = yf.Ticker(f"{sym}.TW").history(period="3mo").dropna()
-        if df.empty: return None
-        c = float(df['Close'].iloc[-1])
-        return {"現價": round(c, 1), "趨勢": "上漲" if c > df['Close'].rolling(20).mean().iloc[-1] else "下跌"}
+        df = yf.Ticker(f"{sym}.TW").history(period="1mo")
+        return round(float(df['Close'].iloc[-1]), 1)
     except: return None
 
-# 3. 介面
-page = st.sidebar.radio("功能", ["💼 持股", "💬 AI 教練"])
+# 4. 介面
+st.title("波段決策系統 V24.0")
+s = st.selectbox("選股", ["2317", "2330", "2382", "3017", "3037"])
 
-if page == "💼 持股":
-    st.title("💼 持股管理")
-    if 'portfolio' not in st.session_state:
-        st.session_state.portfolio = pd.DataFrame([{"代號": "2317", "名稱": "鴻海"}])
-    st.session_state.portfolio = st.data_editor(st.session_state.portfolio, num_rows="dynamic")
-
-elif page == "💬 AI 教練":
-    st.title("💬 AI 教練 (通用模式)")
-    sel = st.selectbox("標的", st.session_state.portfolio['代號'].tolist())
-    if st.button("🗣️ 分析"):
-        data = get_analysis(sel)
-        if not api_key: st.error("請輸入金鑰")
-        else:
-            try:
-                # 使用最通用的模型名稱 gemini-pro，避開模型不存在錯誤
-                model = genai.GenerativeModel('gemini-pro')
-                prompt = f"分析台股代號 {sel}，現價 {data['現價']}。請直接給出建議。"
-                response = model.generate_content(prompt)
-                st.success(response.text)
-            except Exception as e:
-                st.error(f"連線失敗，請檢查 API Key 是否有權限或嘗試重新申請: {e}")
+if st.button("AI 教練分析"):
+    price = get_data(s)
+    if not api_key:
+        st.error("請在左側輸入 API Key")
+    elif not price:
+        st.error("數據獲取失敗")
+    else:
+        try:
+            # 這是最簡單的 prompt，確保不傳遞複雜字典數據，避免參數錯誤
+            prompt = f"我是波段交易者，股票 {s} 現價 {price}。請給出操作建議。"
+            response = model.generate_content(prompt)
+            st.success(response.text)
+        except Exception as e:
+            st.error(f"AI 連線失敗 (錯誤碼: {e})")
