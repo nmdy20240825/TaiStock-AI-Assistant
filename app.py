@@ -1,45 +1,25 @@
 import streamlit as st
-import pandas as pd
-import yfinance as yf
 import google.generativeai as genai
+import yfinance as yf
 
-# 1. 頁面設定
-st.set_page_config(page_title="波段助手 V24.0", layout="wide")
+# 1. 直接設定金鑰
+api_key = st.secrets.get("GEMINI_API_KEY", "")
+genai.configure(api_key=api_key)
 
-# 2. API 強制寫入與設定
-# 這裡我們手動處理，確保程式不會因為抓不到 Secrets 而崩潰
-if 'GEMINI_API_KEY' in st.secrets:
-    api_key = st.secrets['GEMINI_API_KEY']
-else:
-    api_key = st.sidebar.text_input("🔑 手動輸入 API Key", type="password")
-
-if api_key:
-    genai.configure(api_key=api_key)
-    # 不指定模型版本，讓 SDK 自動尋找可用的預設模型
+# 2. 核心修正：使用 generativeai 的最新穩定版本呼叫
+def get_ai_response(prompt):
+    # 改用 get_model 而不是 generate_content(model_name=...)
+    # 這能避開版本路徑衝突
     model = genai.GenerativeModel('gemini-pro')
+    response = model.generate_content(prompt)
+    return response.text
 
-# 3. 簡單數據分析 (確保絕對不會報型別錯誤)
-def get_data(sym):
+st.title("波段決策系統 V25.0")
+s = st.selectbox("選股", ["2317", "2330", "2382"])
+if st.button("分析"):
     try:
-        df = yf.Ticker(f"{sym}.TW").history(period="1mo")
-        return round(float(df['Close'].iloc[-1]), 1)
-    except: return None
-
-# 4. 介面
-st.title("波段決策系統 V24.0")
-s = st.selectbox("選股", ["2317", "2330", "2382", "3017", "3037"])
-
-if st.button("AI 教練分析"):
-    price = get_data(s)
-    if not api_key:
-        st.error("請在左側輸入 API Key")
-    elif not price:
-        st.error("數據獲取失敗")
-    else:
-        try:
-            # 這是最簡單的 prompt，確保不傳遞複雜字典數據，避免參數錯誤
-            prompt = f"我是波段交易者，股票 {s} 現價 {price}。請給出操作建議。"
-            response = model.generate_content(prompt)
-            st.success(response.text)
-        except Exception as e:
-            st.error(f"AI 連線失敗 (錯誤碼: {e})")
+        # 這裡只傳送文字，避免傳送複雜的字典物件導致傳輸錯誤
+        response = get_ai_response(f"分析股票 {s} 的波段策略")
+        st.success(response)
+    except Exception as e:
+        st.error(f"連線細節: {e}")
