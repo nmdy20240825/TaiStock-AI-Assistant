@@ -1,39 +1,44 @@
 import streamlit as st
 import requests
+import yfinance as yf
 
-# 頁面設定
-st.set_page_config(page_title="波段決策系統", layout="centered")
+st.title("波段決策系統 V40.0 (決策輔助版)")
 
-st.title("波段決策系統 V39.0")
-s = st.selectbox("請選擇要分析的股票代號:", ["2317", "2330", "2382", "3017", "3037"])
+# 1. 基礎設定
+stock_map = {"2317": "2317.TW", "2330": "2330.TW", "2382": "2382.TW"}
+s = st.selectbox("選擇股票", list(stock_map.keys()))
 
-if st.button("開始 AI 教練分析"):
-    # 從 Secrets 安全讀取金鑰
-    api_key = st.secrets.get("GEMINI_API_KEY", "")
+# 2. 加入成本輸入
+cost = st.number_input("請輸入您的持股成本價:", min_value=0.0, value=200.0)
+
+if st.button("開始計算與分析"):
+    ticker_symbol = stock_map[s]
     
-    if not api_key:
-        st.error("錯誤：請在 Streamlit Secrets 設定中確認 GEMINI_API_KEY 是否已填入。")
-    else:
-        # 使用經過清單驗證的模型名稱
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-        
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{
-                "parts": [{"text": f"你是專業台股教練，請針對股票 {s} 進行波段交易分析，包含趨勢判斷、潛在支撐壓力區、以及交易策略建議。"}]
-            }]
-        }
-        
-        with st.spinner('AI 教練正在分析中，請稍候...'):
-            try:
-                response = requests.post(url, headers=headers, json=payload)
-                result = response.json()
-                
-                if "candidates" in result:
-                    analysis_text = result["candidates"][0]["content"]["parts"][0]["text"]
-                    st.success("分析結果如下：")
-                    st.write(analysis_text)
-                else:
-                    st.error(f"API 回應異常，請確認金鑰權限: {result}")
-            except Exception as e:
-                st.error(f"連線過程中發生錯誤: {e}")
+    # 取得即時數據
+    ticker = yf.Ticker(ticker_symbol)
+    hist = ticker.history(period="6mo") # 取得近半年數據
+    current_price = hist['Close'].iloc[-1]
+    ma60 = hist['Close'].rolling(window=60).mean().iloc[-1] # 簡單季線
+    
+    stop_loss = cost * 0.92
+    
+    # 顯示數據分析
+    col1, col2, col3 = st.columns(3)
+    col1.metric("即時股價", f"{current_price:.2f}")
+    col2.metric("8% 停損點", f"{stop_loss:.2f}")
+    col3.metric("季線(MA60)", f"{ma60:.2f}")
+    
+    # AI 教練建議
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
+    
+    prompt = f"""
+    分析股票 {s}，目前股價 {current_price:.2f}，您的持有成本 {cost}，8%停損價 {stop_loss:.2f}，季線 {ma60:.2f}。
+    請分析目前股價相對於停損與季線的位置，並給出明確的交易操作建議。
+    """
+    
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    response = requests.post(url, json=payload).json()
+    
+    if "candidates" in response:
+        st.write(response["candidates"][0]["content"]["parts"][0]["text"])
