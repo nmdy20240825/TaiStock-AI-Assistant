@@ -2,43 +2,50 @@ import streamlit as st
 import requests
 import yfinance as yf
 
-st.title("波段決策系統 V40.0 (決策輔助版)")
+# 股票資料庫 (未來可持續擴充)
+STOCK_DATABASE = {
+    "2317": "鴻海", "2330": "台積電", "2382": "廣達", 
+    "3017": "奇鋐", "3037": "欣興", "3443": "創意"
+}
 
-# 1. 基礎設定
-stock_map = {"2317": "2317.TW", "2330": "2330.TW", "2382": "2382.TW"}
-s = st.selectbox("選擇股票", list(stock_map.keys()))
+st.set_page_config(page_title="波段決策儀表板", layout="wide")
+st.title("🚀 波段決策儀表板 V41.0")
 
-# 2. 加入成本輸入
-cost = st.number_input("請輸入您的持股成本價:", min_value=0.0, value=200.0)
+# 1. 側邊欄設定
+with st.sidebar:
+    st.header("設定")
+    selected_code = st.selectbox("選擇分析股票:", [f"{code} {name}" for code, name in STOCK_DATABASE.items()])
+    code = selected_code.split(" ")[0]
+    cost = st.number_input("持股成本價:", min_value=0.0, value=171.0)
 
-if st.button("開始計算與分析"):
-    ticker_symbol = stock_map[s]
-    
-    # 取得即時數據
-    ticker = yf.Ticker(ticker_symbol)
-    hist = ticker.history(period="6mo") # 取得近半年數據
-    current_price = hist['Close'].iloc[-1]
-    ma60 = hist['Close'].rolling(window=60).mean().iloc[-1] # 簡單季線
-    
-    stop_loss = cost * 0.92
-    
-    # 顯示數據分析
-    col1, col2, col3 = st.columns(3)
-    col1.metric("即時股價", f"{current_price:.2f}")
-    col2.metric("8% 停損點", f"{stop_loss:.2f}")
-    col3.metric("季線(MA60)", f"{ma60:.2f}")
-    
-    # AI 教練建議
+# 2. 數據獲取與計算
+ticker = yf.Ticker(f"{code}.TW")
+hist = ticker.history(period="6mo")
+current_price = hist['Close'].iloc[-1]
+ma60 = hist['Close'].rolling(window=60).mean().iloc[-1]
+stop_loss = cost * 0.92
+
+# 3. 視覺化儀表板排版
+col1, col2, col3 = st.columns(3)
+col1.metric("即時股價", f"{current_price:.2f}")
+col2.metric("8% 停損點", f"{stop_loss:.2f}")
+col3.metric("季線(MA60)", f"{ma60:.2f}", delta=f"{current_price - ma60:.2f}")
+
+# 風險警示邏輯
+if current_price < ma60:
+    st.warning("⚠️ 目前股價位於季線之下，請留意中線修正風險。")
+else:
+    st.success("✅ 目前股價位於季線之上，趨勢偏多。")
+
+# 4. AI 分析
+if st.button("更新 AI 深度分析"):
     api_key = st.secrets.get("GEMINI_API_KEY", "")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
     
-    prompt = f"""
-    分析股票 {s}，目前股價 {current_price:.2f}，您的持有成本 {cost}，8%停損價 {stop_loss:.2f}，季線 {ma60:.2f}。
-    請分析目前股價相對於停損與季線的位置，並給出明確的交易操作建議。
-    """
-    
+    prompt = f"針對 {selected_code}，現價 {current_price}，成本 {cost}，停損 {stop_loss}，季線 {ma60}。請提供簡潔的波段操作建議。"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    response = requests.post(url, json=payload).json()
     
+    response = requests.post(url, json=payload).json()
     if "candidates" in response:
+        st.write("---")
         st.write(response["candidates"][0]["content"]["parts"][0]["text"])
