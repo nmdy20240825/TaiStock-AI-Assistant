@@ -10,7 +10,7 @@ if 'portfolio' not in st.session_state:
     st.session_state.portfolio = {"2317": {"cost": 171.0, "shares": 1000}}
 
 st.set_page_config(page_title="波段決策系統", layout="wide")
-st.title("⚡ 波段決策儀表板 V61.0 (極簡穩定版)")
+st.title("⚡ 波段決策儀表板 V62.0 (強韌修正版)")
 
 # 2. 側邊欄
 with st.sidebar:
@@ -22,23 +22,26 @@ with st.sidebar:
             st.session_state.portfolio[code] = {"cost": cost, "shares": shares}
             st.rerun()
 
-# 3. 數據計算 (不使用 df.style，改用 round 處理)
+# 3. 數據計算 (全面使用 .item() 進行類型轉換)
 data = []
 for code, info in st.session_state.portfolio.items():
     df = yf.download(f"{code}.TW", period="1y", progress=False)
     if not df.empty:
-        c = float(df['Close'].iloc[-1])
+        # 使用 .item() 提取純數值
+        val_close = df['Close'].iloc[-1].item()
+        val_ma10 = df['Close'].rolling(10).mean().iloc[-1].item()
+        val_ma60 = df['Close'].rolling(60).mean().iloc[-1].item()
+        
         data.append({
             "代號": code, 
             "名稱": NAME_MAP.get(code, code), 
-            "現價": round(c, 2), 
-            "成本": round(info['cost'], 2),
-            "損益": round((c - info['cost']) * info['shares'], 0),
-            "10MA": round(float(df['Close'].rolling(10).mean().iloc[-1]), 2),
-            "60MA": round(float(df['Close'].rolling(60).mean().iloc[-1]), 2)
+            "現價": round(float(val_close), 2), 
+            "成本": round(float(info['cost']), 2),
+            "損益": round(float((val_close - info['cost']) * info['shares']), 0),
+            "10MA": round(float(val_ma10), 2), 
+            "60MA": round(float(val_ma60), 2)
         })
 
-# 直接顯示純資料框，完全不帶任何樣式，保證不報錯
 df = pd.DataFrame(data)
 st.table(df)
 
