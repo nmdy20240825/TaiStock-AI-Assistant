@@ -6,47 +6,68 @@ import os
 st.set_page_config(layout="wide", page_title="傑夫專用決策系統")
 st.title("⚡ TaiStock 進階決策系統")
 
-# --- 核心指標引擎 (完全不依賴 DataFrame 欄位名稱) ---
-def get_advanced_data(code):
-    df = yf.download(f"{code}.TW", period="1y", progress=False)
-    # 強制獲取列表 (確保完全擺脫欄位名稱依賴)
-    c = [float(x) for x in df.iloc[:, 3]] # Close
-    h = [float(x) for x in df.iloc[:, 1]] # High
-    l = [float(x) for x in df.iloc[:, 2]] # Low
-    v = [float(x) for x in df.iloc[:, 4]] # Volume
-    
-    # 計算 MA
-    ma10 = sum(c[-10:]) / 10
-    ma60 = sum(c[-60:]) / 60
-    
-    # MACD 簡易模擬
-    ema12 = sum(c[-12:]) / 12
-    ema26 = sum(c[-26:]) / 26
-    macd = ema12 - ema26
-    
-    # 簡易KD與RSI封裝
-    score = (25 if c[-1] > ma60 else 10) + (10 if macd > 0 else 0)
-    return c[-1], ma10, ma60, macd, score
+# --- 讀取與儲存 ---
+def load_portfolio():
+    if not os.path.exists('portfolio.json'): return {}
+    with open('portfolio.json', 'r', encoding='utf-8') as f:
+        try: return json.load(f)
+        except: return {}
 
-# --- 主介面 ---
-portfolio = json.load(open('portfolio.json', 'r', encoding='utf-8'))
+def save_portfolio(data):
+    with open('portfolio.json', 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
+# --- 側邊欄：持股管理 ---
+portfolio = load_portfolio()
+with st.sidebar:
+    st.header("⚙️ 持股管理")
+    with st.form("add_stock"):
+        new_code = st.text_input("代號")
+        new_name = st.text_input("名稱")
+        new_cost = st.number_input("成本", value=100.0)
+        if st.form_submit_button("新增/更新"):
+            portfolio[new_code] = [new_name, new_cost]
+            save_portfolio(portfolio)
+            st.rerun()
+    del_code = st.selectbox("刪除", [""] + list(portfolio.keys()))
+    if st.button("確認刪除"):
+        if del_code in portfolio:
+            del portfolio[del_code]
+            save_portfolio(portfolio)
+            st.rerun()
+
+# --- 數據處理引擎 ---
 for code, info in portfolio.items():
     name, cost = info
     try:
-        price, ma10, ma60, macd, score = get_advanced_data(code)
+        df = yf.download(f"{code}.TW", period="6mo", progress=False)
+        if df is None or len(df) < 60: continue
+        
+        # 轉換為純數值列表 (位置索引：0:Open, 1:High, 2:Low, 3:Close)
+        c = [float(x) for x in df.iloc[:, 3]]
+        price = c[-1]
+        ma10, ma60 = sum(c[-10:])/10, sum(c[-60:])/60
+        macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
+        
+        # 評分與建議
+        score = (25 if price > ma60 else 10) + (10 if macd > 0 else 0)
+        profit = ((price - cost) / cost) * 100
         
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             c1.metric("現價", f"{price:.2f}")
-            c2.metric("AI評分", f"{score}分")
+            c2.metric("損益", f"{profit:.1f}%")
+            c3.metric("AI評分", f"{score}分")
             
-            # 使用 expander 放入所有您要的功能
             with st.expander("👉 查看完整技術診斷"):
-                st.write(f"**均線結構**: MA10:{ma10:.1f} | MA60:{ma60:.1f}")
-                st.write(f"**MACD趨勢**: {macd:.3f}")
-                st.write(f"**操作建議**: {'強勢續抱' if score >= 25 else '風險控管'}")
-                st.write(f"**停利價**: {ma60*1.1:.1f} | **停損價**: {ma60*0.95:.1f}")
-                st.write(f"💡 指標已包含KD/RSI邏輯引擎")
+                st.write(f"均線: MA10:{ma10:.1f} | MA60:{ma60:.1f}")
+                st.write(f"MACD趨勢: {macd:.3f}")
+                st.write(f"建議: {'強勢續抱' if score >= 25 else '風險控管'}")
+                st.write(f"停利:{ma60*1.1:.1f} | 停損:{ma60*0.95:.1f}")
     except: continue
+
+# --- 評分標準 ---
+st.divider()
+st.subheader("📊 AI 評分標準說明")
+st.write("25分以上: 多頭強勢 | 15-20分: 穩健 | 10分以下: 風險控管")
