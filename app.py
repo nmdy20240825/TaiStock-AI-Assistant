@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import json
 
 # 設定頁面格式
 st.set_page_config(layout="wide", page_title="傑夫專用決策系統")
@@ -12,34 +13,43 @@ def calculate_advanced_score(df):
     ma10 = float(df['Close'].rolling(10).mean().iloc[-1].item())
     ma60 = float(df['Close'].rolling(60).mean().iloc[-1].item())
     
-    # 模擬籌碼得分 (未來可串接更精確的 API)
-    chip_score = 15 # 這裡未來可改由籌碼 API 計算
+    # 模擬籌碼得分
+    chip_score = 15 
     
     score = 0
     if price > ma10 and ma10 > ma60: score += 25
     elif price > ma60: score += 10
-    score += chip_score # 加入籌碼權重
+    score += chip_score 
     
     return score
 
 # --- 雙策略比對邏輯 ---
 def get_dual_strategy_advice(score, df):
-    # 短線策略 (基於爆量)
     vol_today = df['Volume'].iloc[-1].item()
     vol_avg_5 = df['Volume'].rolling(5).mean().iloc[-1].item()
     short_term = "積極搶短" if vol_today > (vol_avg_5 * 1.5) else "靜待時機"
-    
-    # 長線策略 (基於趨勢)
     long_term = "長線續抱" if score >= 30 else "風險控管"
     
     return short_term, long_term
 
 # --- 儀表板顯示 ---
-portfolio = {"2317": ["鴻海", 171.0], "2330": ["台積電", 990.0]}
+# 自動從 JSON 檔案讀取持股清單
+try:
+    with open('portfolio.json', 'r', encoding='utf-8') as f:
+        portfolio = json.load(f)
+except FileNotFoundError:
+    st.error("找不到 portfolio.json，請確保檔案已上傳至專案根目錄。")
+    portfolio = {}
 
 for code, info in portfolio.items():
     name, cost = info
     df = yf.download(f"{code}.TW", period="6mo", progress=False)
+    
+    # 檢查資料是否為空
+    if df.empty:
+        st.write(f"代號 {code} 無法取得數據")
+        continue
+        
     price = float(df['Close'].iloc[-1].item())
     score = calculate_advanced_score(df)
     short_adv, long_adv = get_dual_strategy_advice(score, df)
@@ -51,7 +61,6 @@ for code, info in portfolio.items():
         col2.metric("現價", f"{price:.2f}")
         col3.metric("損益", f"{profit_pct:.1f}%", delta=f"成本: {cost:.1f}")
         
-        # 顯示雙策略
         st.write(f"**AI綜合評分**: {score} 分")
         col_s, col_l = st.columns(2)
         col_s.info(f"短線策略: {short_adv}")
