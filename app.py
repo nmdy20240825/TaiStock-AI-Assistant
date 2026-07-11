@@ -43,13 +43,12 @@ for code, info in portfolio.items():
         df = yf.download(f"{code}.TW", period="6mo", progress=False)
         if df is None or len(df) < 60: continue
         
-        # 轉換為純數值列表 (位置索引：0:Open, 1:High, 2:Low, 3:Close)
         c = [float(x) for x in df.iloc[:, 3]]
         price = c[-1]
-        ma10, ma60 = sum(c[-10:])/10, sum(c[-60:])/60
+        # 計算 MA10, MA20, MA60
+        ma10, ma20, ma60 = sum(c[-10:])/10, sum(c[-20:])/20, sum(c[-60:])/60
         macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
         
-        # 評分與建議
         score = (25 if price > ma60 else 10) + (10 if macd > 0 else 0)
         profit = ((price - cost) / cost) * 100
         
@@ -61,7 +60,8 @@ for code, info in portfolio.items():
             c3.metric("AI評分", f"{score}分")
             
             with st.expander("👉 查看完整技術診斷"):
-                st.write(f"均線: MA10:{ma10:.1f} | MA60:{ma60:.1f}")
+                # 加入 MA20
+                st.write(f"均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
                 st.write(f"MACD趨勢: {macd:.3f}")
                 st.write(f"建議: {'強勢續抱' if score >= 25 else '風險控管'}")
                 st.write(f"停利:{ma60*1.1:.1f} | 停損:{ma60*0.95:.1f}")
