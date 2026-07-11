@@ -17,10 +17,26 @@ def save_portfolio(data):
     with open('portfolio.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- 核心邏輯 (保留所有原功能 + 疊加決策引擎) ---
+# --- [強制固定] 側邊欄 ---
 portfolio = load_portfolio()
-# (側邊欄管理省略，保持不變)
+with st.sidebar:
+    st.header("⚙️ 持股管理")
+    with st.form("add_stock"):
+        new_code = st.text_input("代號")
+        new_name = st.text_input("名稱")
+        new_cost = st.number_input("成本", value=100.0)
+        if st.form_submit_button("新增/更新"):
+            portfolio[new_code] = [new_name, new_cost]
+            save_portfolio(portfolio)
+            st.rerun()
+    del_code = st.selectbox("刪除", [""] + list(portfolio.keys()))
+    if st.button("確認刪除"):
+        if del_code in portfolio:
+            del portfolio[del_code]
+            save_portfolio(portfolio)
+            st.rerun()
 
+# --- 核心引擎 (固定結構) ---
 for code, info in portfolio.items():
     name, cost = info
     try:
@@ -31,14 +47,19 @@ for code, info in portfolio.items():
         h = [float(x) for x in df.iloc[:, 1]]
         l = [float(x) for x in df.iloc[:, 2]]
         
-        # 1. 既有指標計算
+        # 1. 數據計算 (均線/MACD/KD)
         ma10, ma20, ma60 = sum(c[-10:])/10, sum(c[-20:])/20, sum(c[-60:])/60
         macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
         rsv = (c[-1] - min(l[-9:])) / (max(h[-9:]) - min(l[-9:]) + 0.001) * 100
         k, d = (2/3 * 50 + 1/3 * rsv), (2/3 * 50 + 1/3 * (2/3 * 50 + 1/3 * rsv))
-        rsi = 50.0 # 暫留
         
-        # 2. 決策解釋邏輯
+        # 2. 真實 RSI 計算 (修正固定值問題)
+        delta = [c[i] - c[i-1] for i in range(1, len(c))]
+        up = sum([x for x in delta[-14:] if x > 0]) / 14
+        down = abs(sum([x for x in delta[-14:] if x < 0])) / 14
+        rsi = 100 - (100 / (1 + (up / (down + 0.001))))
+        
+        # 3. 決策引擎疊加
         reasons = []
         if macd > 0: reasons.append("② MACD黃金交叉")
         if c[-1] > ma20: reasons.append("③ MA20向上支撐")
