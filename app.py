@@ -42,9 +42,14 @@ def check_volume_breakout(df):
     return False, "無特別訊號"
 
 # --- 儀表板顯示 ---
-portfolio = {"2317": 171.0, "2330": 990.0}
+# 資料結構: 代號: [名稱, 成本]
+portfolio = {
+    "2317": ["鴻海", 171.0], 
+    "2330": ["台積電", 990.0]
+}
 
-for code, cost in portfolio.items():
+for code, info in portfolio.items():
+    name, cost = info
     df = yf.download(f"{code}.TW", period="6mo", progress=False)
     price = float(df['Close'].iloc[-1].item())
     score = calculate_advanced_score(df)
@@ -54,7 +59,8 @@ for code, cost in portfolio.items():
     
     with st.container(border=True):
         col1, col2, col3 = st.columns(3)
-        col1.subheader(f"代號: {code}")
+        # 在這裡顯示代號與名稱
+        col1.subheader(f"{name} ({code})")
         col2.metric("現價", f"{price:.2f}")
         col3.metric("損益", f"{profit_pct:.1f}%", delta=f"成本: {cost:.1f}")
         
