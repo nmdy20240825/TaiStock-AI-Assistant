@@ -17,6 +17,19 @@ def save_portfolio(data):
     with open('portfolio.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+# --- 決策解釋引擎 (新功能模組) ---
+def get_decision_reason(score, macd, ma20_up, volume_up):
+    reasons = []
+    if macd > 0: reasons.append("① MACD 黃金交叉 (趨勢向上)")
+    if ma20_up: reasons.append("② MA20 向上 (中線走強)")
+    if volume_up: reasons.append("③ 成交量放大 (買盤進駐)")
+    if score >= 25: 
+        status = "續抱"
+    else: 
+        status = "風險控管"
+        reasons.append("注意：指標動能轉弱，建議優先保護資本")
+    return status, reasons
+
 # --- 側邊欄 ---
 portfolio = load_portfolio()
 with st.sidebar:
@@ -44,26 +57,17 @@ for code, info in portfolio.items():
         if df is None or len(df) < 60: continue
         
         c = [float(x) for x in df.iloc[:, 3]]
-        h = [float(x) for x in df.iloc[:, 1]]
-        l = [float(x) for x in df.iloc[:, 2]]
-        
-        # 技術指標計算
+        v = [float(x) for x in df.iloc[:, 4]]
         ma10, ma20, ma60 = sum(c[-10:])/10, sum(c[-20:])/20, sum(c[-60:])/60
         macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
-        rsv = (c[-1] - min(l[-9:])) / (max(h[-9:]) - min(l[-9:]) + 0.001) * 100
-        k, d = (2/3 * 50 + 1/3 * rsv), (2/3 * 50 + 1/3 * (2/3 * 50 + 1/3 * rsv))
         
-        # RSI 計算
-        delta = [c[i] - c[i-1] for i in range(1, len(c))]
-        gain = sum([x for x in delta[-14:] if x > 0]) / 14
-        loss = abs(sum([x for x in delta[-14:] if x < 0])) / 14
-        rsi = 100 - (100 / (1 + (gain / (loss + 0.001))))
-        
-        # --- 您指定的股性公式 ---
-        coeff = c[-1] / ma20 if ma20 != 0 else 1
-        nature = "起漲股" if coeff > 1.15 else "一般股"
-        
+        # 決策判斷條件
+        ma20_up = c[-1] > ma20
+        volume_up = v[-1] > (sum(v[-5:])/5 * 1.2)
         score = (25 if c[-1] > ma60 else 10) + (10 if macd > 0 else 0)
+        
+        # 取得決策解釋
+        status, reasons = get_decision_reason(score, macd, ma20_up, volume_up)
         profit = ((c[-1] - cost) / cost) * 100
         
         with st.container(border=True):
@@ -73,11 +77,13 @@ for code, info in portfolio.items():
             c2.metric("損益", f"{profit:.1f}%")
             c3.metric("AI評分", f"{score}分")
             
-            with st.expander("👉 查看完整技術診斷"):
+            with st.expander("👉 決策解釋引擎"):
+                st.write(f"**建議**: {status}")
+                st.write("**原因**:")
+                for r in reasons: st.write(r)
+                st.write("---")
                 st.write(f"均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
-                st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
-                st.write(f"股性: {nature} (係數:{coeff:.2f}) | 建議: {'強勢續抱' if score >= 25 else '風險控管'}")
-                st.write(f"停利:{c[-1]*1.05:.1f} | 停損:{c[-1]*0.95:.1f} | 加碼:觸及MA20")
+                st.write(f"股性: {'起漲股' if (c[-1]/ma20) > 1.15 else '一般股'}")
     except: continue
 
 st.divider()
