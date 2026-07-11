@@ -1,7 +1,5 @@
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
 import json
 import os
 
@@ -21,38 +19,57 @@ def save_portfolio(data):
 
 # --- 側邊欄 ---
 portfolio = load_portfolio()
-# ... (側邊欄管理表單代碼保持不變) ...
+with st.sidebar:
+    st.header("⚙️ 持股管理")
+    with st.form("add_stock"):
+        new_code = st.text_input("代號")
+        new_name = st.text_input("名稱")
+        new_cost = st.number_input("成本", value=100.0)
+        if st.form_submit_button("新增/更新"):
+            portfolio[new_code] = [new_name, new_cost]
+            save_portfolio(portfolio)
+            st.rerun()
+    del_code = st.selectbox("刪除", [""] + list(portfolio.keys()))
+    if st.button("確認刪除"):
+        if del_code in portfolio:
+            del portfolio[del_code]
+            save_portfolio(portfolio)
+            st.rerun()
 
-# --- 真實指標計算引擎 (引入 pandas_ta) ---
+# --- 核心引擎 (無依賴版本) ---
 for code, info in portfolio.items():
     name, cost = info
     try:
         df = yf.download(f"{code}.TW", period="6mo", progress=False)
         if df is None or len(df) < 60: continue
         
-        # 使用 pandas_ta 計算真實指標
-        df.ta.macd(append=True) # MACD_12_26_9
-        df.ta.stoch(append=True) # STOCH_k, STOCH_d
-        df.ta.rsi(append=True)   # RSI_14
+        # 轉換為列表
+        c = [float(x) for x in df.iloc[:, 3]]
+        h = [float(x) for x in df.iloc[:, 1]]
+        l = [float(x) for x in df.iloc[:, 2]]
         
-        last = df.iloc[-1]
-        price = float(last['Close'])
-        # 抓取真實指標 (名稱依據 pandas_ta 自動產生)
-        macd = float(last['MACD_12_26_9'])
-        k = float(last['STOCHk_14_3_3'])
-        d = float(last['STOCHd_14_3_3'])
-        rsi = float(last['RSI_14'])
+        # 指標計算
+        ma10, ma20, ma60 = sum(c[-10:])/10, sum(c[-20:])/20, sum(c[-60:])/60
+        # MACD (DIF 簡易版)
+        macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
+        # KD (RSV)
+        rsv = (c[-1] - min(l[-9:])) / (max(h[-9:]) - min(l[-9:]) + 0.001) * 100
+        k = 50 if len(c) < 10 else (2/3 * 50 + 1/3 * rsv)
+        d = 50 if len(c) < 10 else (2/3 * 50 + 1/3 * k)
         
-        # 均線
-        ma10, ma20, ma60 = df['Close'].rolling(10).mean().iloc[-1], df['Close'].rolling(20).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
-        
-        score = (25 if price > ma60 else 10) + (10 if macd > 0 else 0)
+        profit = ((c[-1] - cost) / cost) * 100
+        score = (25 if c[-1] > ma60 else 10) + (10 if macd > 0 else 0)
         
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
-            # ... (顯示邏輯) ...
+            c1, c2, c3 = st.columns(3)
+            c1.metric("現價", f"{c[-1]:.2f}", delta=f"成本:{cost:.1f}")
+            c2.metric("損益", f"{profit:.1f}%")
+            c3.metric("AI評分", f"{score}分")
+            
             with st.expander("👉 查看完整技術診斷"):
-                st.write(f"均線: MA10:{ma10:.1f} | MA60:{ma60:.1f}")
-                st.write(f"指標: KD(K:{k:.1f}, D:{d:.1f}) | RSI:{rsi:.1f} | MACD:{macd:.3f}")
-    except Exception as e:
-        continue
+                st.write(f"均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
+                st.write(f"指標: K:{k:.1f} | D:{d:.1f} | MACD:{macd:.3f}")
+                st.write(f"建議: {'強勢續抱' if score >= 25 else '風險控管'}")
+                st.write(f"停利:{ma60*1.1:.1f} | 停損:{ma60*0.95:.1f} | 加碼:觸及MA20")
+    except: continue
