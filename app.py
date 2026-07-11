@@ -73,8 +73,8 @@ for code, info in portfolio.items():
             st.write(f"**AI綜合評分**: {score} 分")
             st.progress(min(score / 50, 1.0))
             
-            # --- 詳細技術指標展開 ---
-            with st.expander("📊 查看詳細技術指標"):
+            # --- 改用 Toggle 按鈕，觸控更靈敏 ---
+            if st.toggle(f"顯示 {name} 詳細技術指標", key=f"toggle_{code}"):
                 ma10 = df['Close'].rolling(10).mean().iloc[-1]
                 ma60 = df['Close'].rolling(60).mean().iloc[-1]
                 st.write(f"均線狀態: MA10={ma10:.1f}, MA60={ma60:.1f}")
