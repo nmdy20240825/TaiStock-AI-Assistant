@@ -3,78 +3,46 @@ import yfinance as yf
 import json
 import os
 
-st.set_page_config(layout="wide", page_title="傑夫專用決策系統")
-st.title("⚡ TaiStock 進階決策系統")
+st.set_page_config(layout="wide", page_title="傑夫進階策略系統")
+st.title("📈 傑夫策略儀表板 (ATR版)")
 
-# --- 讀取/儲存 ---
-def load_portfolio():
-    if not os.path.exists('portfolio.json'): return {}
-    with open('portfolio.json', 'r', encoding='utf-8') as f:
-        try: return json.load(f)
-        except: return {}
+# --- 核心數據處理 (ATR + 量價) ---
+def get_advanced_diagnosis(df):
+    # 計算基礎數值
+    c = [float(x) for x in df.iloc[:, 3]] # Close
+    h = [float(x) for x in df.iloc[:, 1]] # High
+    l = [float(x) for x in df.iloc[:, 2]] # Low
+    v = [float(x) for x in df.iloc[:, 4]] # Volume
+    
+    # ATR 計算 (動態停損)
+    tr = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(c))]
+    atr = sum(tr[-14:]) / 14
+    
+    # 量價分析 (判斷起漲訊號)
+    vol_avg = sum(v[-5:]) / 5
+    is_volume_up = v[-1] > vol_avg * 1.5
+    is_price_up = c[-1] > c[-2]
+    nature = "量價齊揚(起漲中)" if (is_volume_up and is_price_up) else "盤整/一般"
+    
+    # 策略數據
+    stop_loss = c[-1] - (atr * 2) # 動態停損：ATR*2
+    take_profit = c[-1] + (atr * 4) # 動態停利：ATR*4
+    
+    return nature, stop_loss, take_profit, atr
 
-def save_portfolio(data):
-    with open('portfolio.json', 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-# --- 側邊欄 ---
-portfolio = load_portfolio()
-with st.sidebar:
-    st.header("⚙️ 持股管理")
-    with st.form("add_stock"):
-        new_code = st.text_input("代號")
-        new_name = st.text_input("名稱")
-        new_cost = st.number_input("成本", value=100.0)
-        if st.form_submit_button("新增/更新"):
-            portfolio[new_code] = [new_name, new_cost]
-            save_portfolio(portfolio)
-            st.rerun()
-    del_code = st.selectbox("刪除", [""] + list(portfolio.keys()))
-    if st.button("確認刪除"):
-        if del_code in portfolio:
-            del portfolio[del_code]
-            save_portfolio(portfolio)
-            st.rerun()
-
-# --- 核心引擎 ---
+# --- 主程式 ---
+portfolio = json.load(open('portfolio.json', 'r', encoding='utf-8'))
 for code, info in portfolio.items():
     name, cost = info
     try:
         df = yf.download(f"{code}.TW", period="6mo", progress=False)
-        if df is None or len(df) < 60: continue
-        c = [float(x) for x in df.iloc[:, 3]]
-        h = [float(x) for x in df.iloc[:, 1]]
-        l = [float(x) for x in df.iloc[:, 2]]
-        
-        # 指標計算
-        ma10, ma20, ma60 = sum(c[-10:])/10, sum(c[-20:])/20, sum(c[-60:])/60
-        macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
-        rsv = (c[-1] - min(l[-9:])) / (max(h[-9:]) - min(l[-9:]) + 0.001) * 100
-        k = (2/3 * 50 + 1/3 * rsv)
-        d = (2/3 * 50 + 1/3 * k)
-        # RSI 計算
-        delta = [c[i] - c[i-1] for i in range(1, len(c))]
-        gain = sum([d for d in delta[-14:] if d > 0]) / 14
-        loss = abs(sum([d for d in delta[-14:] if d < 0])) / 14
-        rsi = 100 - (100 / (1 + (gain / (loss + 0.001))))
-        
-        score = (25 if c[-1] > ma60 else 10) + (10 if macd > 0 else 0)
-        profit = ((c[-1] - cost) / cost) * 100
+        nature, stop, profit_target, atr = get_advanced_diagnosis(df)
         
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("現價", f"{c[-1]:.2f}", delta=f"成本:{cost:.1f}")
-            c2.metric("損益", f"{profit:.1f}%")
-            c3.metric("AI評分", f"{score}分")
-            
-            with st.expander("👉 查看完整技術診斷"):
-                st.write(f"均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
-                st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
-                st.write(f"建議: {'強勢續抱' if score >= 25 else '風險控管'}")
-                st.write(f"停利:{ma60*1.1:.1f} | 停損:{ma60*0.95:.1f} | 加碼:觸及MA20")
+            st.write(f"**診斷分析**: {nature} | ATR波動: {atr:.2f}")
+            st.write(f"**策略建議**: 停損價 {stop:.1f} | 停利目標 {profit_target:.1f}")
+            with st.expander("👉 詳細數據"):
+                st.write(f"原始損益: {((df.iloc[-1, 3]-cost)/cost*100):.1f}%")
+                st.write("量價分析：使用 5 日成交量均值與 ATR 波幅進行動態校正")
     except: continue
-
-st.divider()
-st.subheader("📊 AI 評分標準說明")
-st.write("25分以上: 多頭強勢(續抱) | 15-20分: 穩健 | 10分以下: 風險控管(建議減碼)")
