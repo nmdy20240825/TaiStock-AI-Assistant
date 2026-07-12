@@ -10,9 +10,7 @@ st.set_page_config(layout="wide", page_title="TaiStock AI 完整決策系統")
 def fetch_stock_data(code):
     return yf.download(f"{code}.TW", period="6mo", progress=False)
 
-# 模擬法人數據函數 (保留架構)
 def get_institutional_data(code):
-    # 這裡可銜接真實API，目前先回傳結構供您測試顯示
     return {"buy_sell": 1500, "days": 3, "trend": "連3買"}
 
 def load_portfolio():
@@ -55,7 +53,7 @@ for code, info in portfolio.items():
         c, h, l, v = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze(), df['Volume'].squeeze()
         price, volume = float(c.iloc[-1]), float(v.iloc[-1])
         
-        # 指標計算
+        # 技術指標計算
         ma10, ma20, ma60 = float(c.rolling(10).mean().iloc[-1]), float(c.rolling(20).mean().iloc[-1]), float(c.rolling(60).mean().iloc[-1])
         macd = float((c.rolling(12).mean().iloc[-1]) - (c.rolling(26).mean().iloc[-1]))
         rsv = (price - float(l.rolling(9).min().iloc[-1])) / (float(h.rolling(9).max().iloc[-1]) - float(l.rolling(9).min().iloc[-1]) + 0.001) * 100
@@ -71,6 +69,7 @@ for code, info in portfolio.items():
         stock_type = "🚀 起漲股" if coeff > 1.15 else "📊 一般股"
         can_add = (inst['days'] >= 3 and coeff > 1.15)
         
+        # ATR 與 BIAS
         bias = ((price - ma60) / ma60) * 100
         tr_list = [max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]
         atr = sum(tr_list) / 14
@@ -84,7 +83,6 @@ for code, info in portfolio.items():
             c4.metric("股性判別", stock_type)
             
             with st.expander("🚦 查看完整決策診斷報告"):
-                # 紅綠燈
                 cols = st.columns(3)
                 cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
                 cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
