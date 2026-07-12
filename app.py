@@ -39,7 +39,7 @@ with st.sidebar:
             save_portfolio(portfolio)
             st.rerun()
 
-st.title("⚡ TaiStock 進階決策系統 (完整資料版)")
+st.title("⚡ TaiStock 進階決策系統 (全功能版)")
 
 for code, info in portfolio.items():
     name, cost = info
@@ -60,23 +60,26 @@ for code, info in portfolio.items():
         up, down = delta.clip(lower=0).rolling(14).mean().iloc[-1], -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
         rsi = 100 - (100 / (1 + (up / (down + 0.001))))
         
+        # 股性判別 (使用您指定的公式)
+        coeff = price / ma20
+        stock_type = "🚀 起漲股" if coeff > 1.15 else "📊 一般股"
+        
         bias = ((price - ma60) / ma60) * 100
         tr_list = [max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]
         atr = sum(tr_list) / 14
-        is_bullish = float(v.iloc[-1]) > (float(v.rolling(5).mean().iloc[-1]) * 1.2)
         
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
             c1, c2, c3 = st.columns(3)
             c1.metric("現價", f"{price:.2f}", delta=f"成本:{cost:.1f}")
             c2.metric("損益", f"{((price-cost)/cost*100):.1f}%")
-            c3.metric("AI 狀態", f"{'強勢' if k > 50 else '觀望'}")
+            c3.metric("股性判別", stock_type)
             
             with st.expander("🚦 查看完整決策診斷報告"):
                 cols = st.columns(3)
                 cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
                 cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
-                cols[2].markdown(f"### {'🟢' if is_bullish else '🟡'} 動能 {'量價齊揚' if is_bullish else '盤整中'}")
+                cols[2].markdown(f"### {'🟢' if stock_type == '🚀 起漲股' else '🟡'} 動能 {'起漲中' if stock_type == '🚀 起漲股' else '盤整中'}")
                 
                 st.divider()
                 st.write("**[完整技術數據]**")
@@ -85,13 +88,14 @@ for code, info in portfolio.items():
                 
                 st.write("**[動態交易策略]**")
                 st.write(f"💡 ATR 動態停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% {'(過熱)' if bias > 10 else '(穩)'}")
-                st.write(f"🎯 建議: {'加碼關注' if is_bullish else '風險控管'} | 波段停利: {(price * 1.1):.1f} | 強制停損: {price * 0.95:.1f}")
+                st.write(f"🎯 建議: {'加碼關注' if stock_type == '🚀 起漲股' else '風險控管'} | 波段停利: {(price * 1.1):.1f} | 強制停損: {price * 0.95:.1f}")
                 
                 st.divider()
                 st.caption("**[判別標準說明]**")
+                st.caption("• 股性係數：收盤價 ÷ 20MA > 1.15 為起漲股")
                 st.caption("• AI 狀態：強勢 (K > 50) | 觀望 (K <= 50)")
                 st.caption("• KD/MACD：🟢 多頭/向上 | 🔴 空頭/向下")
-                st.caption("• 動能燈號：🟢 量價齊揚 (買盤強) | 🟡 盤整中")
                 st.caption("• 乖離率 (BIAS)：乖離 > 10% 觸發過熱警示")
     except Exception as e:
         st.error(f"分析 {code} 發生異常: {e}")
+
