@@ -56,12 +56,10 @@ for code, info in portfolio.items():
         rsv = (price - float(l.rolling(9).min().iloc[-1])) / (float(h.rolling(9).max().iloc[-1]) - float(l.rolling(9).min().iloc[-1]) + 0.001) * 100
         k, d = float(2/3 * 50 + 1/3 * rsv), float(2/3 * 50 + 1/3 * (2/3 * 50 + 1/3 * rsv))
         
-        # RSI 計算
         delta = c.diff()
         up, down = delta.clip(lower=0).rolling(14).mean().iloc[-1], -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
         rsi = 100 - (100 / (1 + (up / (down + 0.001))))
         
-        # 專家級診斷指標
         bias = ((price - ma60) / ma60) * 100
         tr_list = [max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]
         atr = sum(tr_list) / 14
@@ -75,7 +73,6 @@ for code, info in portfolio.items():
             c3.metric("AI 狀態", f"{'強勢' if k > 50 else '觀望'}")
             
             with st.expander("🚦 查看完整決策診斷報告"):
-                # 紅綠燈
                 cols = st.columns(3)
                 cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
                 cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
@@ -89,6 +86,12 @@ for code, info in portfolio.items():
                 st.write("**[動態交易策略]**")
                 st.write(f"💡 ATR 動態停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% {'(過熱)' if bias > 10 else '(穩)'}")
                 st.write(f"🎯 建議: {'加碼關注' if is_bullish else '風險控管'} | 波段停利: {(price * 1.1):.1f} | 強制停損: {price * 0.95:.1f}")
+                
+                st.divider()
+                st.caption("**[判別標準說明]**")
+                st.caption("• AI 狀態：強勢 (K > 50) | 觀望 (K <= 50)")
+                st.caption("• KD/MACD：🟢 多頭/向上 | 🔴 空頭/向下")
+                st.caption("• 動能燈號：🟢 量價齊揚 (買盤強) | 🟡 盤整中")
+                st.caption("• 乖離率 (BIAS)：乖離 > 10% 觸發過熱警示")
     except Exception as e:
         st.error(f"分析 {code} 發生異常: {e}")
-
