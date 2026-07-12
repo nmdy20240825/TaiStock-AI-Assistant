@@ -39,7 +39,7 @@ with st.sidebar:
             save_portfolio(portfolio)
             st.rerun()
 
-st.title("⚡ TaiStock 進階決策系統 (功能全開版)")
+st.title("⚡ TaiStock 進階決策系統 (完整資料版)")
 
 for code, info in portfolio.items():
     name, cost = info
@@ -51,10 +51,15 @@ for code, info in portfolio.items():
         price = float(c.iloc[-1])
         
         # 指標計算
-        ma20, ma60 = float(c.rolling(20).mean().iloc[-1]), float(c.rolling(60).mean().iloc[-1])
+        ma10, ma20, ma60 = float(c.rolling(10).mean().iloc[-1]), float(c.rolling(20).mean().iloc[-1]), float(c.rolling(60).mean().iloc[-1])
         macd = float((c.rolling(12).mean().iloc[-1]) - (c.rolling(26).mean().iloc[-1]))
         rsv = (price - float(l.rolling(9).min().iloc[-1])) / (float(h.rolling(9).max().iloc[-1]) - float(l.rolling(9).min().iloc[-1]) + 0.001) * 100
         k, d = float(2/3 * 50 + 1/3 * rsv), float(2/3 * 50 + 1/3 * (2/3 * 50 + 1/3 * rsv))
+        
+        # RSI 計算
+        delta = c.diff()
+        up, down = delta.clip(lower=0).rolling(14).mean().iloc[-1], -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
+        rsi = 100 - (100 / (1 + (up / (down + 0.001))))
         
         # 專家級診斷指標
         bias = ((price - ma60) / ma60) * 100
@@ -69,7 +74,7 @@ for code, info in portfolio.items():
             c2.metric("損益", f"{((price-cost)/cost*100):.1f}%")
             c3.metric("AI 狀態", f"{'強勢' if k > 50 else '觀望'}")
             
-            with st.expander("🚦 查看完整診斷面板"):
+            with st.expander("🚦 查看完整決策診斷報告"):
                 # 紅綠燈
                 cols = st.columns(3)
                 cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
@@ -77,11 +82,13 @@ for code, info in portfolio.items():
                 cols[2].markdown(f"### {'🟢' if is_bullish else '🟡'} 動能 {'量價齊揚' if is_bullish else '盤整中'}")
                 
                 st.divider()
-                st.write(f"**💡 ATR 動態停損**: {price - (atr * 2):.1f}")
-                bias_color = "🔴" if bias > 10 else "🟢"
-                st.markdown(f"**📈 乖離率狀態**: {bias_color} {bias:.1f}% {'(⚠️ 短線過熱)' if bias > 10 else '(✅ 穩定)'}")
-                st.write("---")
-                st.write(f"均線: MA20:{ma20:.1f} | MA60:{ma60:.1f}")
-                st.write(f"技術指標: MACD:{macd:.3f} | K:{k:.1f} | D:{d:.1f}")
+                st.write("**[完整技術數據]**")
+                st.write(f"均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
+                st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
+                
+                st.write("**[動態交易策略]**")
+                st.write(f"💡 ATR 動態停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% {'(過熱)' if bias > 10 else '(穩)'}")
+                st.write(f"🎯 建議: {'加碼關注' if is_bullish else '風險控管'} | 波段停利: {(price * 1.1):.1f} | 強制停損: {price * 0.95:.1f}")
     except Exception as e:
         st.error(f"分析 {code} 發生異常: {e}")
+
