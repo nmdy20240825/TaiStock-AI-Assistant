@@ -60,9 +60,10 @@ for code, info in portfolio.items():
         up, down = delta.clip(lower=0).rolling(14).mean().iloc[-1], -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
         rsi = 100 - (100 / (1 + (up / (down + 0.001))))
         
-        # 股性判別 (使用您指定的公式)
+        # 判斷邏輯
         coeff = price / ma20
         stock_type = "🚀 起漲股" if coeff > 1.15 else "📊 一般股"
+        ai_status = "強勢" if k > 50 else "觀望"
         
         bias = ((price - ma60) / ma60) * 100
         tr_list = [max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]
@@ -70,10 +71,11 @@ for code, info in portfolio.items():
         
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("現價", f"{price:.2f}", delta=f"成本:{cost:.1f}")
             c2.metric("損益", f"{((price-cost)/cost*100):.1f}%")
-            c3.metric("股性判別", stock_type)
+            c3.metric("AI 狀態", ai_status)
+            c4.metric("股性判別", stock_type)
             
             with st.expander("🚦 查看完整決策診斷報告"):
                 cols = st.columns(3)
@@ -98,4 +100,3 @@ for code, info in portfolio.items():
                 st.caption("• 乖離率 (BIAS)：乖離 > 10% 觸發過熱警示")
     except Exception as e:
         st.error(f"分析 {code} 發生異常: {e}")
-
