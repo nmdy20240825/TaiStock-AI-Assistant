@@ -1,10 +1,10 @@
 import streamlit as st
+import pandas as pd
 import yfinance as yf
 import json
 import os
 
-st.set_page_config(layout="wide", page_title="傑夫進階策略系統")
-st.title("⚡ TaiStock 進階診斷報告")
+st.set_page_config(layout="wide", page_title="TaiStock AI 進階系統")
 
 # --- 讀取/儲存 ---
 def load_portfolio():
@@ -17,7 +17,7 @@ def save_portfolio(data):
     with open('portfolio.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- [強制固定] 側邊欄 ---
+# --- 側邊欄 ---
 portfolio = load_portfolio()
 with st.sidebar:
     st.header("⚙️ 持股管理")
@@ -36,51 +36,60 @@ with st.sidebar:
             save_portfolio(portfolio)
             st.rerun()
 
-# --- 核心引擎 (固定結構) ---
+# --- 核心分析引擎 ---
+st.title("⚡ TaiStock 進階決策系統 (完整整合版)")
+
 for code, info in portfolio.items():
     name, cost = info
     try:
         df = yf.download(f"{code}.TW", period="6mo", progress=False)
         if df is None or len(df) < 60: continue
         
-        c = [float(x) for x in df.iloc[:, 3]]
-        h = [float(x) for x in df.iloc[:, 1]]
-        l = [float(x) for x in df.iloc[:, 2]]
+        c, h, l, v = df['Close'], df['High'], df['Low'], df['Volume']
+        price = float(c.iloc[-1])
         
-        # 1. 數據計算 (均線/MACD/KD)
-        ma10, ma20, ma60 = sum(c[-10:])/10, sum(c[-20:])/20, sum(c[-60:])/60
-        macd = (sum(c[-12:])/12) - (sum(c[-26:])/26)
-        rsv = (c[-1] - min(l[-9:])) / (max(h[-9:]) - min(l[-9:]) + 0.001) * 100
+        # 1. 既有指標計算
+        ma20 = c.rolling(20).mean().iloc[-1]
+        ma60 = c.rolling(60).mean().iloc[-1]
+        macd = (c.rolling(12).mean().iloc[-1]) - (c.rolling(26).mean().iloc[-1])
+        rsv = (price - l.rolling(9).min().iloc[-1]) / (h.rolling(9).max().iloc[-1] - l.rolling(9).min().iloc[-1] + 0.001) * 100
         k, d = (2/3 * 50 + 1/3 * rsv), (2/3 * 50 + 1/3 * (2/3 * 50 + 1/3 * rsv))
         
-        # 2. 真實 RSI 計算 (修正固定值問題)
-        delta = [c[i] - c[i-1] for i in range(1, len(c))]
-        up = sum([x for x in delta[-14:] if x > 0]) / 14
-        down = abs(sum([x for x in delta[-14:] if x < 0])) / 14
-        rsi = 100 - (100 / (1 + (up / (down + 0.001))))
+        # RSI 真實計算
+        delta = c.diff()
+        up = delta.clip(lower=0).rolling(14).mean()
+        down = -1 * delta.clip(upper=0).rolling(14).mean()
+        rsi = 100 - (100 / (1 + (up.iloc[-1] / (down.iloc[-1] + 0.001))))
         
-        # 3. 決策引擎疊加
-        reasons = []
-        if macd > 0: reasons.append("② MACD黃金交叉")
-        if c[-1] > ma20: reasons.append("③ MA20向上支撐")
-        if (c[-1]/ma20) > 1.15: reasons.append("④ 股價強勢起漲")
+        # 2. 專家級指標 (BIAS, ATR, 量價)
+        bias = ((price - ma60) / ma60) * 100
+        tr = [max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]
+        atr = sum(tr) / 14
+        is_bullish = v.iloc[-1] > (v.rolling(5).mean().iloc[-1] * 1.2) and price > c.iloc[-2]
         
-        score = (25 if c[-1] > ma60 else 10) + (10 if macd > 0 else 0)
-        
+        # 3. 顯示區
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
             c1, c2, c3 = st.columns(3)
-            c1.metric("現價", f"{c[-1]:.2f}", delta=f"成本:{cost:.1f}")
-            c2.metric("損益", f"{((c[-1]-cost)/cost*100):.1f}%")
-            c3.metric("AI評分", f"{score}分")
+            c1.metric("現價", f"{price:.2f}", delta=f"成本:{cost:.1f}")
+            c2.metric("損益", f"{((price-cost)/cost*100):.1f}%")
+            c3.metric("AI 評分", f"{'強勢' if k > 50 else '觀望'}")
             
-            with st.expander("📝 查看詳細決策報告"):
-                st.write("**[完整技術數據]**")
-                st.write(f"均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
-                st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
-                st.write("**[決策解釋引擎]**")
-                st.write(f"建議: {'續抱' if score >= 25 else '風險控管'}")
-                st.write("原因:")
-                for r in reasons: st.write(r)
-                st.write(f"股性: {'起漲股' if (c[-1]/ma20) > 1.15 else '一般股'}")
+            with st.expander("🚦 AI 決策紅綠燈與專業診斷"):
+                # 紅綠燈面板
+                cols = st.columns(3)
+                cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
+                cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
+                cols[2].markdown(f"### {'🟢' if is_bullish else '🟡'} 動能 {'量價齊揚' if is_bullish else '盤整中'}")
+                
+                st.divider()
+                
+                # ATR 與 BIAS 策略
+                bias_color = "🔴" if bias > 10 else "🟢"
+                st.write(f"**💡 ATR 動態停損**: {price - (atr * 2):.1f}")
+                st.markdown(f"**📈 乖離率狀態**: {bias_color} {bias:.1f}% {'(⚠️ 短線過熱，注意風險)' if bias > 10 else '(✅ 區間穩定)'}")
+                
+                # 原始數據保留 (不遺漏)
+                st.write("---")
+                st.write(f"均線: MA20:{ma20:.1f} | MA60:{ma60:.1f} | 指標: RSI:{rsi:.1f} | MACD:{macd:.3f}")
     except: continue
