@@ -9,7 +9,7 @@ import datetime
 
 st.set_page_config(layout="wide", page_title="TaiStock 專業決策系統")
 
-# --- 1. 報價與技術資料抓取 (支援上市/上櫃) ---
+# --- 1. 報價與技術資料抓取 ---
 @st.cache_data(ttl=300) 
 def fetch_stock_data(code):
     try:
@@ -25,7 +25,7 @@ def fetch_stock_data(code):
     except Exception:
         return pd.DataFrame()
 
-# --- 2. 真實三大法人籌碼抓取 (FinMind API) ---
+# --- 2. 真實三大法人籌碼抓取 ---
 @st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
@@ -90,7 +90,7 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-# --- 4. 側邊欄 UI (新增資金與部位管理) ---
+# --- 4. 側邊欄 UI ---
 with st.sidebar:
     st.header("⚙️ 資金與部位管理")
     total_capital = st.number_input("總操作資金 (台幣)", value=100000, step=10000)
@@ -157,34 +157,24 @@ else:
             coeff = price / ma20
             inst = get_institutional_data(code)
             
-            # --- SOP 檢核邏輯 ---
             step1_pass = inst['buy_sell'] > 0 and inst['days'] >= 3
             step2_pass = (k > d) and (rsi > 50)
             step3_pass = ma20 <= price <= (ma20 * 1.03) 
             sop_ready = step1_pass and step2_pass and step3_pass
             
-            # --- 零股部位精算邏輯 ---
-            # 計算公式：可承受風險金額 / ATR真實波幅 = 建議買進股數
             suggested_shares = 0
             if atr > 0:
                 raw_shares = int(risk_amount / atr)
-                # 防呆機制：確保買進總額不會超過您的總操作資金
                 max_affordable_shares = int(total_capital / price)
                 suggested_shares = min(raw_shares, max_affordable_shares)
             
-            # 存入總表清單
             summary_data.append({
-                "代號": code,
-                "名稱": name,
-                "現價": round(price, 2),
-                "成本": round(cost, 2),
-                "法人動能": inst['trend'],
-                "AI狀態": "強勢" if k > 50 else "觀望",
+                "代號": code, "名稱": name, "現價": round(price, 2), "成本": round(cost, 2),
+                "法人動能": inst['trend'], "AI狀態": "強勢" if k > 50 else "觀望",
                 "建議部位": f"{suggested_shares} 股" if sop_ready else "-",
                 "SOP判定": "🟢 強烈進場" if sop_ready else "⏳ 觀察中"
             })
             
-            # 存入卡片清單
             card_data.append({
                 "code": code, "name": name, "cost": cost, "price": price, "volume": volume,
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi,
@@ -245,3 +235,11 @@ else:
                 st.write(f"指標: K:{data['k']:.1f} | D:{data['d']:.1f} | RSI:{data['rsi']:.1f} | MACD:{data['macd']:.3f}")
                 st.write("**[專屬交易策略]**")
                 st.write(f"💡 基準 ATR 停損: {atr_stop_price:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離率: {data['bias']:.1f}%")
+
+    # --- 6. 系統燈號定義說明 (新增於面板最下方) ---
+    st.divider()
+    st.markdown("### 🚦 系統燈號與判定定義說明")
+    st.markdown("- **🟢 綠燈**：代表趨勢偏多、指標交叉向上、或動能處於強勢起漲狀態（股價突破 20MA 的 1.15 倍）。")
+    st.markdown("- **🔴 紅燈**：代表趨勢偏空、指標交叉向下、或處於弱勢格局。")
+    st.markdown("- **🟡 黃燈**：代表動能平緩、目前處於盤整區間。")
+    st.markdown("- **⏳ 沙漏**：代表嚴格進場 SOP 條件（法人、指標、均線）尚未完全齊備，建議耐心等待。")
