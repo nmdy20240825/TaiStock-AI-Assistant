@@ -90,24 +90,23 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-# --- 4. 側邊欄 UI ---
+# --- 4. 側邊欄 UI (改為單股獨立風控) ---
 with st.sidebar:
-    st.header("⚙️ 資金與部位管理")
-    total_capital = st.number_input("總操作資金 (台幣)", value=100000, step=10000)
-    risk_pct = st.number_input("單筆風險承受度 (%)", value=1.0, step=0.1, help="建議單筆虧損控制在總資金的 1%~2%")
-    risk_amount = total_capital * (risk_pct / 100)
-    st.info(f"單筆最大停損金額: **{risk_amount:,.0f} 元**")
-    st.divider()
-
-    st.header("📋 持股名單")
+    st.header("📋 持股與專屬風控設定")
+    st.caption("您可以為每一檔股票設定獨立的分配資金與風險承受度。")
     with st.form("add_stock"):
         new_code = st.text_input("代號")
         new_name = st.text_input("名稱")
-        new_cost = st.number_input("成本", value=100.0, step=0.1)
-        if st.form_submit_button("儲存/更新"):
+        new_cost = st.number_input("成本價", value=100.0, step=0.1)
+        st.divider()
+        new_cap = st.number_input("分配操作資金 (台幣)", value=50000, step=5000)
+        new_risk = st.number_input("單筆風險承受度 (%)", value=1.0, step=0.1, help="建議控制在 1%~2%")
+        
+        if st.form_submit_button("儲存/更新設定"):
             fetch_stock_data.clear() 
             get_institutional_data.clear()
-            portfolio[new_code] = [new_name, new_cost]
+            # 將獨立的資金與風險一起存入 json
+            portfolio[new_code] = [new_name, new_cost, new_cap, new_risk]
             save_portfolio(portfolio)
             st.rerun()
             
@@ -119,16 +118,26 @@ with st.sidebar:
             st.rerun()
 
 # --- 5. 主面板運算與顯示 ---
-st.title("⚡ TaiStock 進階決策系統 (全功能完全體)")
+st.title("⚡ TaiStock 進階決策系統 (單股獨立風控版)")
 
 if not portfolio:
-    st.info("👈 請先從左側邊欄新增股票代號與成本！")
+    st.info("👈 請先從左側邊欄新增股票代號、成本與專屬資金！")
 else:
     summary_data = []
     card_data = []
 
     for code, info in portfolio.items():
-        name, cost = info
+        # 向下相容處理：判斷舊資料(2個參數)還是新資料(4個參數)
+        if len(info) == 2:
+            name, cost = info
+            cap, risk_pct = 50000.0, 1.0 # 舊資料預設值
+        elif len(info) == 4:
+            name, cost, cap, risk_pct = info
+        else:
+            continue
+            
+        risk_amount = cap * (risk_pct / 100)
+
         try:
             df = fetch_stock_data(code)
             if df is None or df.empty or len(df) < 60: 
@@ -165,11 +174,12 @@ else:
             suggested_shares = 0
             if atr > 0:
                 raw_shares = int(risk_amount / atr)
-                max_affordable_shares = int(total_capital / price)
+                max_affordable_shares = int(cap / price)
                 suggested_shares = min(raw_shares, max_affordable_shares)
             
             summary_data.append({
                 "代號": code, "名稱": name, "現價": round(price, 2), "成本": round(cost, 2),
+                "分配資金": f"{cap:,.0f}", "單筆容損": f"{risk_amount:,.0f}",
                 "法人動能": inst['trend'], "AI狀態": "強勢" if k > 50 else "觀望",
                 "建議部位": f"{suggested_shares} 股" if sop_ready else "-",
                 "SOP判定": "🟢 強烈進場" if sop_ready else "⏳ 觀察中"
@@ -179,6 +189,7 @@ else:
                 "code": code, "name": name, "cost": cost, "price": price, "volume": volume,
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi,
                 "atr": atr, "bias": bias, "coeff": coeff, "inst": inst,
+                "cap": cap, "risk_pct": risk_pct, "risk_amount": risk_amount,
                 "step1": step1_pass, "step2": step2_pass, "step3": step3_pass, "sop_ready": sop_ready,
                 "shares": suggested_shares
             })
@@ -204,18 +215,18 @@ else:
             sop_status_text = "⏳ 條件未齊，持續觀察"
         
         with st.container(border=True):
-            st.subheader(f"{data['name']} ({data['code']})")
+            st.subheader(f"{data['name']} ({data['code']}) - 專屬分配資金: {data['cap']:,.0f} 元")
             
             if data['cost'] > 0: 
                 if data['price'] <= atr_stop_price:
-                    st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破 ATR 停損點 ({atr_stop_price:.2f})！請嚴格執行紀律。")
+                    st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破 ATR 停損點 ({atr_stop_price:.2f})！最大容許虧損設定為 {data['risk_amount']:,.0f} 元。")
                 elif data['price'] >= take_profit_price:
-                    st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段停利目標 ({take_profit_price:.2f})！可考慮分批了結。")
+                    st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段停利目標 ({take_profit_price:.2f})！")
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("現價", f"{data['price']:.2f}", delta=f"成本:{data['cost']:.1f}")
             c2.metric("法人動能", data['inst']['trend'], delta=f"{data['inst']['buy_sell']}張")
-            c3.metric("AI 狀態", "強勢" if data['k'] > 50 else "觀望")
+            c3.metric("單筆容損金額", f"{data['risk_amount']:,.0f} 元", delta=f"{data['risk_pct']}% 風險")
             c4.metric("建議部位", f"{data['shares']} 股" if data['sop_ready'] else "等待訊號")
             
             st.markdown("##### 📋 嚴格進場 SOP 檢核")
@@ -236,10 +247,10 @@ else:
                 st.write("**[專屬交易策略]**")
                 st.write(f"💡 基準 ATR 停損: {atr_stop_price:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離率: {data['bias']:.1f}%")
 
-    # --- 6. 系統燈號定義說明 (新增於面板最下方) ---
+    # --- 6. 系統燈號定義說明 ---
     st.divider()
     st.markdown("### 🚦 系統燈號與判定定義說明")
     st.markdown("- **🟢 綠燈**：代表趨勢偏多、指標交叉向上、或動能處於強勢起漲狀態（股價突破 20MA 的 1.15 倍）。")
     st.markdown("- **🔴 紅燈**：代表趨勢偏空、指標交叉向下、或處於弱勢格局。")
     st.markdown("- **🟡 黃燈**：代表動能平緩、目前處於盤整區間。")
-    st.markdown("- **⏳ 沙漏**：代表嚴格進場 SOP 條件（法人、指標、均線）尚未完全齊備，建議耐心等待。")
+    st.markdown("- **⏳ 沙漏**：代表嚴格進場 SOP 條件尚未完全齊備，建議耐心等待。")
