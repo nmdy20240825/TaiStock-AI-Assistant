@@ -1,15 +1,37 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import json
+import os
+import numpy as np
 import requests
 import datetime
-# 記得確保頂部有引入 numpy, pandas, streamlit 等既有套件
 
-@st.cache_data(ttl=3600)  # 加入 1 小時快取，避免頻繁重整耗盡 API 免費額度
+st.set_page_config(layout="wide", page_title="TaiStock 專業決策系統")
+
+# --- 1. 報價與技術資料抓取 (支援上市/上櫃) ---
+@st.cache_data(ttl=300) 
+def fetch_stock_data(code):
+    try:
+        if code.endswith('.TW') or code.endswith('.TWO') or code.endswith('.US'):
+            return yf.download(code, period="6mo", progress=False)
+            
+        df_tw = yf.download(f"{code}.TW", period="6mo", progress=False)
+        if df_tw is not None and not df_tw.empty and len(df_tw) > 0:
+            return df_tw
+            
+        df_two = yf.download(f"{code}.TWO", period="6mo", progress=False)
+        return df_two
+    except Exception:
+        return pd.DataFrame()
+
+# --- 2. 真實三大法人籌碼抓取 (FinMind API) ---
+@st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
-        # 1. 設定時間區間：抓取近 30 天的資料來計算連續買賣
         end_date = datetime.datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
         
-        # 2. 呼叫 FinMind 獲取法人數據
         url = "https://api.finmindtrade.com/api/v4/data"
         parameter = {
             "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
@@ -20,28 +42,20 @@ def get_institutional_data(code):
         resp = requests.get(url, params=parameter, timeout=5)
         data = resp.json()
         
-        # 驗證資料是否成功回傳
         if data.get("msg") != "success" or not data.get("data"):
             return {"buy_sell": 0, "days": 0, "trend": "資料不足"}
             
-        # 3. 資料清洗與轉換
         df_inst = pd.DataFrame(data["data"])
-        
-        # 計算淨買賣超 (FinMind 的單位為「股」)
         df_inst['net_buy'] = df_inst['buy'] - df_inst['sell']
         
-        # 將外資、投信、自營商的數據「按日期」加總
         daily_net = df_inst.groupby('date')['net_buy'].sum().reset_index()
-        # 日期由新到舊排序
         daily_net = daily_net.sort_values('date', ascending=False).reset_index(drop=True)
         
         if daily_net.empty:
             return {"buy_sell": 0, "days": 0, "trend": "近期無交易"}
             
-        # 將最新一日的淨買超股數除以 1000，換算為「張數」
         latest_net = int(daily_net.iloc[0]['net_buy'] / 1000)
         
-        # 4. 計算連續買賣天數邏輯
         days = 0
         is_buy = latest_net > 0
         
@@ -51,9 +65,8 @@ def get_institutional_data(code):
             elif not is_buy and val < 0:
                 days += 1
             else:
-                break # 遇到反向操作即停止計算
+                break 
                 
-        # 5. 輸出狀態字串
         if days == 0:
             trend_str = "盤整"
         else:
@@ -61,6 +74,114 @@ def get_institutional_data(code):
             
         return {"buy_sell": latest_net, "days": days, "trend": trend_str}
         
-    except Exception as e:
-        # 例外處理：若網路異常，回傳預設值以避免系統崩潰
+    except Exception:
         return {"buy_sell": 0, "days": 0, "trend": "API異常"}
+
+# --- 3. 持股檔案管理 ---
+def load_portfolio():
+    if not os.path.exists('portfolio.json'): return {}
+    with open('portfolio.json', 'r', encoding='utf-8') as f:
+        try: return json.load(f)
+        except: return {}
+
+def save_portfolio(data):
+    with open('portfolio.json', 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+portfolio = load_portfolio()
+
+# --- 4. 側邊欄 UI ---
+with st.sidebar:
+    st.header("⚙️ 持股管理")
+    with st.form("add_stock"):
+        new_code = st.text_input("代號")
+        new_name = st.text_input("名稱")
+        new_cost = st.number_input("成本", value=100.0, step=0.1)
+        if st.form_submit_button("儲存/更新"):
+            fetch_stock_data.clear() 
+            get_institutional_data.clear() # 更新股票時一併清除法人快取
+            portfolio[new_code] = [new_name, new_cost]
+            save_portfolio(portfolio)
+            st.rerun()
+            
+    del_code = st.selectbox("刪除持股", [""] + list(portfolio.keys()))
+    if st.button("確認刪除"):
+        if del_code in portfolio:
+            del portfolio[del_code]
+            save_portfolio(portfolio)
+            st.rerun()
+
+# --- 5. 主面板運算與顯示 ---
+st.title("⚡ TaiStock 進階決策系統 (全資料真實版)")
+
+if not portfolio:
+    st.info("👈 請先從左側邊欄新增股票代號與成本！")
+
+for code, info in portfolio.items():
+    name, cost = info
+    try:
+        df = fetch_stock_data(code)
+        
+        if df is None or df.empty or len(df) < 60: 
+            st.warning(f"⚠️ {name} ({code}) 歷史資料不足或 API 暫時無回應，請稍後再試。")
+            continue
+        
+        c, h, l = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze()
+        v = df.get('Volume', pd.Series(0, index=df.index)).squeeze()
+        price, volume = float(c.iloc[-1]), float(v.iloc[-1])
+        
+        k, d, macd, rsi = 50.0, 50.0, 0.0, 50.0
+        
+        ma10 = float(c.rolling(10).mean().iloc[-1])
+        ma20 = float(c.rolling(20).mean().iloc[-1])
+        ma60 = float(c.rolling(60).mean().iloc[-1])
+        macd = float((c.rolling(12).mean().iloc[-1]) - (c.rolling(26).mean().iloc[-1]))
+        
+        rsv_val = (price - float(l.rolling(9).min().iloc[-1])) / (float(h.rolling(9).max().iloc[-1]) - float(l.rolling(9).min().iloc[-1]) + 0.001) * 100
+        k = float(2/3 * 50 + 1/3 * np.nan_to_num(rsv_val))
+        d = float(2/3 * 50 + 1/3 * k)
+        
+        delta = c.diff()
+        up = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+        down = -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
+        rsi = 100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001))))
+        
+        coeff = price / ma20
+        inst = get_institutional_data(code)
+        bias = ((price - ma60) / ma60) * 100
+        atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
+        
+        breakout_price = ma20 * 1.15
+        pullback_price = ma10
+        
+        if inst['days'] >= 3 and coeff > 1.15:
+            add_signal = f"🎯 強力加碼 (已達起漲狀態，順勢操作)"
+        elif coeff > 1.0:
+            add_signal = f"⏳ 觀察中 (拉回 {pullback_price:.1f} 或 突破 {breakout_price:.1f} 佈局)"
+        else:
+            add_signal = "🛡️ 偏弱，暫不建議加碼"
+            
+        with st.container(border=True):
+            st.subheader(f"{name} ({code})")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("現價", f"{price:.2f}", delta=f"成本:{cost:.1f}")
+            c2.metric("法人動能", inst['trend'], delta=f"{inst['buy_sell']}張")
+            c3.metric("AI 狀態", "強勢" if k > 50 else "觀望")
+            c4.metric("股性判別", "🚀 起漲股" if coeff > 1.15 else "📊 一般股")
+            
+            with st.expander("🚦 查看完整決策診斷報告"):
+                cols = st.columns(3)
+                cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
+                cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
+                cols[2].markdown(f"### {'🟢' if coeff > 1.15 else '🟡'} 動能 {'起漲中' if coeff > 1.15 else '盤整中'}")
+                st.divider()
+                st.write("**[完整技術數據]**")
+                st.write(f"成交量: {volume:,.0f} | 均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
+                st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
+                st.write("**[動態交易策略]**")
+                st.write(f"💡 ATR 停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% | 🎯 波段停利: {(price * 1.1):.1f}")
+                st.write(f"➕ **加碼時機**: {add_signal}")
+                st.caption("• 股性係數：收盤價 ÷ 20MA > 1.15 為起漲股")
+                
+    except Exception as e:
+        st.error(f"分析 {code} 發生錯誤: {e}")
