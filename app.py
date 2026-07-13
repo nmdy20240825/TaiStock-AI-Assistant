@@ -25,7 +25,7 @@ def fetch_stock_data(code):
     except Exception:
         return pd.DataFrame()
 
-# --- 2. 真實三大法人籌碼抓取 (新增累積金額計算) ---
+# --- 2. 真實三大法人籌碼抓取 (累積金額計算) ---
 @st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
@@ -167,7 +167,6 @@ else:
             
             inst = get_institutional_data(code)
             
-            # --- 升級 1：計算法人連續買賣超金額 (億元) ---
             inst_amount_e = (inst['accumulated_shares'] * price) / 100000000
             if inst_amount_e > 0:
                 inst_trend_display = f"{inst['trend']} (流入 {inst_amount_e:.1f}億)"
@@ -183,7 +182,6 @@ else:
             
             atr_stop_price = cost - (atr * 2) if cost > 0 else 0
             
-            # --- 升級 4：終極判定燈號整合 ---
             if cost > 0 and price <= atr_stop_price:
                 final_status = "🔴 禁止進場 (已破停損)"
                 status_score = 3
@@ -209,7 +207,7 @@ else:
                 "法人動態": inst_trend_display, 
                 "建議部位": f"{suggested_shares} 股" if status_score == 1 else "-",
                 "終極判定": final_status,
-                "_score": status_score # 用於排序的隱藏欄位
+                "_score": status_score 
             })
             
             card_data.append({
@@ -225,11 +223,10 @@ else:
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
-    # --- 升級 2：多股戰情總表 (依 SOP 狀態排序) ---
+    # --- 繪製多股戰情總表 ---
     if summary_data:
         st.markdown("### 📊 持股戰情總表")
         df_summary = pd.DataFrame(summary_data)
-        # 依據評分排序：綠燈(1) -> 黃燈(2) -> 紅燈(3)
         df_summary = df_summary.sort_values(by="_score").drop(columns=["_score"])
         st.dataframe(df_summary, use_container_width=True, hide_index=True)
         st.divider()
@@ -241,7 +238,6 @@ else:
         with st.container(border=True):
             st.subheader(f"{data['name']} ({data['code']}) - 專屬資金: {data['cap']:,.0f} 元")
             
-            # --- 升級 3：±2% 預警防護機制 ---
             if data['cost'] > 0: 
                 if data['price'] <= data['atr_stop_price']:
                     st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破停損 ({data['atr_stop_price']:.2f})！請執行紀律。")
@@ -268,7 +264,6 @@ else:
             buy_zone_top = data['ma20'] * 1.03
             st.info(f"🎯 **建議進場區間 (20MA 突破)**：{buy_zone_bottom:.2f} ~ {buy_zone_top:.2f} 元")
             
-            # 整合後的終極判定
             st.markdown(f"**最終判定**: {data['final_status']}")
             
             with st.expander("🚦 查看完整決策診斷報告"):
@@ -282,3 +277,10 @@ else:
                 st.write(f"指標: K:{data['k']:.1f} | D:{data['d']:.1f} | RSI:{data['rsi']:.1f} | MACD:{data['macd']:.3f}")
                 st.write("**[專屬交易策略]**")
                 st.write(f"💡 基準 ATR 停損: {data['atr_stop_price']:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離: {data['bias']:.1f}%")
+
+    # --- 6. 系統燈號與判定定義說明 (精進版補回) ---
+    st.divider()
+    st.markdown("### 🚦 系統燈號與判定定義說明")
+    st.markdown("- **🟢 允許進場 (SOP 齊備)**：代表法人連續買超、技術指標轉強，且股價剛突破月線（±3% 內），具備強勢起漲條件，系統將顯示建議精算之零股部位。")
+    st.markdown("- **🟡 觀望等待**：代表嚴格進場 SOP 的三項條件尚未完全齊備，目前可能處於盤整或動能不足的狀態，建議耐心等待訊號。")
+    st.markdown("- **🔴 禁止進場**：代表股價已跌破專屬的 ATR 停損點，或是嚴重跌破 20 日月線（大於 5% 乖離），趨勢偏空，系統強制禁止進場或提醒應果斷執行停損紀律。")
