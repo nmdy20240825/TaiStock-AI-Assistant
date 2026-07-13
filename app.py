@@ -7,7 +7,6 @@ import numpy as np
 
 st.set_page_config(layout="wide", page_title="TaiStock 專業決策系統")
 
-# 將 TTL 縮短，並在主程式中加入重新抓取機制
 @st.cache_data(ttl=300) 
 def fetch_stock_data(code):
     try:
@@ -39,7 +38,6 @@ with st.sidebar:
         new_name = st.text_input("名稱")
         new_cost = st.number_input("成本", value=100.0, step=0.1)
         if st.form_submit_button("儲存/更新"):
-            # 儲存前先清除一下這檔股票的快取，強迫重抓
             fetch_stock_data.clear() 
             portfolio[new_code] = [new_name, new_cost]
             save_portfolio(portfolio)
@@ -62,9 +60,8 @@ for code, info in portfolio.items():
     try:
         df = fetch_stock_data(code)
         
-        # 再次確認機制：如果是空的，提示使用者可以怎麼做
         if df is None or df.empty or len(df) < 60: 
-            st.warning(f"⚠️ {name} ({code}) 歷史資料不足或 Yahoo API 暫時無回應。請稍後再試，或在網頁上按鍵盤 'C' 清除快取。")
+            st.warning(f"⚠️ {name} ({code}) 歷史資料不足或 API 暫時無回應，請稍後再試。")
             continue
         
         c, h, l = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze()
@@ -92,6 +89,17 @@ for code, info in portfolio.items():
         bias = ((price - ma60) / ma60) * 100
         atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
         
+        # --- 加碼策略運算 ---
+        breakout_price = ma20 * 1.15
+        pullback_price = ma10
+        
+        if inst['days'] >= 3 and coeff > 1.15:
+            add_signal = f"🎯 強力加碼 (已達起漲狀態，順勢操作)"
+        elif coeff > 1.0:
+            add_signal = f"⏳ 觀察中 (拉回 {pullback_price:.1f} 或 突破 {breakout_price:.1f} 佈局)"
+        else:
+            add_signal = "🛡️ 偏弱，暫不建議加碼"
+            
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
             c1, c2, c3, c4 = st.columns(4)
@@ -111,6 +119,8 @@ for code, info in portfolio.items():
                 st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
                 st.write("**[動態交易策略]**")
                 st.write(f"💡 ATR 停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% | 🎯 波段停利: {(price * 1.1):.1f}")
+                # 將加碼時機與價位寫入畫面
+                st.write(f"➕ **加碼時機**: {add_signal}")
                 st.caption("• 股性係數：收盤價 ÷ 20MA > 1.15 為起漲股")
                 
     except Exception as e:
