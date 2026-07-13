@@ -99,7 +99,7 @@ with st.sidebar:
         new_cost = st.number_input("成本", value=100.0, step=0.1)
         if st.form_submit_button("儲存/更新"):
             fetch_stock_data.clear() 
-            get_institutional_data.clear() # 更新股票時一併清除法人快取
+            get_institutional_data.clear()
             portfolio[new_code] = [new_name, new_cost]
             save_portfolio(portfolio)
             st.rerun()
@@ -112,7 +112,7 @@ with st.sidebar:
             st.rerun()
 
 # --- 5. 主面板運算與顯示 ---
-st.title("⚡ TaiStock 進階決策系統 (全資料真實版)")
+st.title("⚡ TaiStock 進階決策系統 (第一階段：嚴格風控版)")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號與成本！")
@@ -126,12 +126,12 @@ for code, info in portfolio.items():
             st.warning(f"⚠️ {name} ({code}) 歷史資料不足或 API 暫時無回應，請稍後再試。")
             continue
         
+        # 基本數據
         c, h, l = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze()
         v = df.get('Volume', pd.Series(0, index=df.index)).squeeze()
         price, volume = float(c.iloc[-1]), float(v.iloc[-1])
         
-        k, d, macd, rsi = 50.0, 50.0, 0.0, 50.0
-        
+        # 技術指標
         ma10 = float(c.rolling(10).mean().iloc[-1])
         ma20 = float(c.rolling(20).mean().iloc[-1])
         ma60 = float(c.rolling(60).mean().iloc[-1])
@@ -146,42 +146,60 @@ for code, info in portfolio.items():
         down = -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
         rsi = 100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001))))
         
+        atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
+        bias = ((price - ma60) / ma60) * 100
         coeff = price / ma20
         inst = get_institutional_data(code)
-        bias = ((price - ma60) / ma60) * 100
-        atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
         
-        breakout_price = ma20 * 1.15
-        pullback_price = ma10
+        # --- 模組 A：嚴格進場 SOP 檢核邏輯 ---
+        step1_pass = inst['buy_sell'] > 0 and inst['days'] >= 3
+        step2_pass = (k > d) and (rsi > 50)
+        # 突破 MA20 且乖離不超過 3% (確保不追高)
+        step3_pass = ma20 <= price <= (ma20 * 1.03) 
         
-        if inst['days'] >= 3 and coeff > 1.15:
-            add_signal = f"🎯 強力加碼 (已達起漲狀態，順勢操作)"
-        elif coeff > 1.0:
-            add_signal = f"⏳ 觀察中 (拉回 {pullback_price:.1f} 或 突破 {breakout_price:.1f} 佈局)"
-        else:
-            add_signal = "🛡️ 偏弱，暫不建議加碼"
-            
+        sop_ready = step1_pass and step2_pass and step3_pass
+        sop_status_text = "🟢 **強烈進場訊號** (符合嚴格 SOP)" if sop_ready else "⏳ 條件未齊，持續觀察"
+        
+        # --- 模組 B：動態風控警示邏輯 (基於輸入成本) ---
+        atr_stop_price = cost - (atr * 2)
+        take_profit_price = cost * 1.10
+        
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
+            
+            # --- 風控警示橫幅 ---
+            if cost > 0: # 確保有輸入成本才計算
+                if price <= atr_stop_price:
+                    st.error(f"🚨 **風控警報**：現價 ({price:.2f}) 已跌破 ATR 停損點 ({atr_stop_price:.2f})！請嚴格執行紀律。")
+                elif price >= take_profit_price:
+                    st.success(f"🎉 **停利提醒**：現價 ({price:.2f}) 已達 10% 波段停利目標 ({take_profit_price:.2f})！可考慮分批了結。")
+            
+            # --- 核心看板 ---
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("現價", f"{price:.2f}", delta=f"成本:{cost:.1f}")
             c2.metric("法人動能", inst['trend'], delta=f"{inst['buy_sell']}張")
             c3.metric("AI 狀態", "強勢" if k > 50 else "觀望")
             c4.metric("股性判別", "🚀 起漲股" if coeff > 1.15 else "📊 一般股")
             
+            # --- 嚴格 SOP 檢核表 ---
+            st.markdown("##### 📋 嚴格進場 SOP 檢核")
+            st.markdown(f"- **Step 1**: 法人連續買超 ≥ 3 天 ➔ {'✅' if step1_pass else '❌'}")
+            st.markdown(f"- **Step 2**: KD 交叉向上 且 RSI > 50 ➔ {'✅' if step2_pass else '❌'}")
+            st.markdown(f"- **Step 3**: 收盤價突破 MA20 (±3% 內) ➔ {'✅' if step3_pass else '❌'}")
+            st.markdown(f"**最終判定**: {sop_status_text}")
+            
             with st.expander("🚦 查看完整決策診斷報告"):
                 cols = st.columns(3)
-                cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '交叉向下'}")
+                cols[0].markdown(f"### {'🟢' if k > d else '🔴'} KD {'向上' if k > d else '向下'}")
                 cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
                 cols[2].markdown(f"### {'🟢' if coeff > 1.15 else '🟡'} 動能 {'起漲中' if coeff > 1.15 else '盤整中'}")
                 st.divider()
                 st.write("**[完整技術數據]**")
                 st.write(f"成交量: {volume:,.0f} | 均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
                 st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
-                st.write("**[動態交易策略]**")
-                st.write(f"💡 ATR 停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% | 🎯 波段停利: {(price * 1.1):.1f}")
-                st.write(f"➕ **加碼時機**: {add_signal}")
-                st.caption("• 股性係數：收盤價 ÷ 20MA > 1.15 為起漲股")
+                st.write("**[專屬交易策略]**")
+                st.write(f"💡 基準 ATR 停損: {atr_stop_price:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離率: {bias:.1f}%")
+                st.caption("• 系統自動依據輸入成本計算停損與停利提醒")
                 
     except Exception as e:
         st.error(f"分析 {code} 發生錯誤: {e}")
