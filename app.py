@@ -7,11 +7,23 @@ import numpy as np
 
 st.set_page_config(layout="wide", page_title="TaiStock 專業決策系統")
 
+# --- 升級版資料抓取模組 (支援上市與上櫃自動切換) ---
 @st.cache_data(ttl=300) 
 def fetch_stock_data(code):
     try:
-        df = yf.download(f"{code}.TW", period="6mo", progress=False)
-        return df
+        # 如果使用者自己手動打了後綴，直接用使用者的
+        if code.endswith('.TW') or code.endswith('.TWO') or code.endswith('.US'):
+            return yf.download(code, period="6mo", progress=False)
+            
+        # 1. 先嘗試抓取「上市」資料 (.TW)
+        df_tw = yf.download(f"{code}.TW", period="6mo", progress=False)
+        if df_tw is not None and not df_tw.empty and len(df_tw) > 0:
+            return df_tw
+            
+        # 2. 若上市抓不到 (或資料為空)，則自動切換嘗試抓取「上櫃」資料 (.TWO)
+        df_two = yf.download(f"{code}.TWO", period="6mo", progress=False)
+        return df_two
+        
     except Exception:
         return pd.DataFrame()
 
@@ -50,7 +62,7 @@ with st.sidebar:
             save_portfolio(portfolio)
             st.rerun()
 
-st.title("⚡ TaiStock 進階決策系統 (全功能恢復版)")
+st.title("⚡ TaiStock 進階決策系統 (上市櫃雙引擎版)")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號與成本！")
@@ -119,7 +131,6 @@ for code, info in portfolio.items():
                 st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
                 st.write("**[動態交易策略]**")
                 st.write(f"💡 ATR 停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% | 🎯 波段停利: {(price * 1.1):.1f}")
-                # 將加碼時機與價位寫入畫面
                 st.write(f"➕ **加碼時機**: {add_signal}")
                 st.caption("• 股性係數：收盤價 ÷ 20MA > 1.15 為起漲股")
                 
