@@ -7,12 +7,16 @@ import numpy as np
 
 st.set_page_config(layout="wide", page_title="TaiStock 專業決策系統")
 
-@st.cache_data(ttl=3600)
+# 將 TTL 縮短，並在主程式中加入重新抓取機制
+@st.cache_data(ttl=300) 
 def fetch_stock_data(code):
-    return yf.download(f"{code}.TW", period="6mo", progress=False)
+    try:
+        df = yf.download(f"{code}.TW", period="6mo", progress=False)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 def get_institutional_data(code):
-    # 此處未來可對接真實 API
     data_map = {"3711": {"buy_sell": 1500, "days": 3, "trend": "連3買"}}
     return data_map.get(code, {"buy_sell": 0, "days": 0, "trend": "盤整"})
 
@@ -28,7 +32,6 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-# 👉 補回消失的側邊欄管理！
 with st.sidebar:
     st.header("⚙️ 持股管理")
     with st.form("add_stock"):
@@ -36,9 +39,12 @@ with st.sidebar:
         new_name = st.text_input("名稱")
         new_cost = st.number_input("成本", value=100.0, step=0.1)
         if st.form_submit_button("儲存/更新"):
+            # 儲存前先清除一下這檔股票的快取，強迫重抓
+            fetch_stock_data.clear() 
             portfolio[new_code] = [new_name, new_cost]
             save_portfolio(portfolio)
             st.rerun()
+            
     del_code = st.selectbox("刪除持股", [""] + list(portfolio.keys()))
     if st.button("確認刪除"):
         if del_code in portfolio:
@@ -48,7 +54,6 @@ with st.sidebar:
 
 st.title("⚡ TaiStock 進階決策系統 (全功能恢復版)")
 
-# 防呆：如果沒有持股，顯示提示文字避免畫面全白
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號與成本！")
 
@@ -56,19 +61,18 @@ for code, info in portfolio.items():
     name, cost = info
     try:
         df = fetch_stock_data(code)
-        if df.empty or len(df) < 60: 
-            st.warning(f"⚠️ {name} ({code}) 歷史資料不足")
+        
+        # 再次確認機制：如果是空的，提示使用者可以怎麼做
+        if df is None or df.empty or len(df) < 60: 
+            st.warning(f"⚠️ {name} ({code}) 歷史資料不足或 Yahoo API 暫時無回應。請稍後再試，或在網頁上按鍵盤 'C' 清除快取。")
             continue
         
-        # 數據提取
         c, h, l = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze()
         v = df.get('Volume', pd.Series(0, index=df.index)).squeeze()
         price, volume = float(c.iloc[-1]), float(v.iloc[-1])
         
-        # 1. 變數強制初始化 (防止 name 'k' is not defined)
         k, d, macd, rsi = 50.0, 50.0, 0.0, 50.0
         
-        # 2. 技術指標計算 (加入 np.nan_to_num 處理防當機)
         ma10 = float(c.rolling(10).mean().iloc[-1])
         ma20 = float(c.rolling(20).mean().iloc[-1])
         ma60 = float(c.rolling(60).mean().iloc[-1])
@@ -83,13 +87,11 @@ for code, info in portfolio.items():
         down = -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
         rsi = 100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001))))
         
-        # 3. 策略指標
         coeff = price / ma20
         inst = get_institutional_data(code)
         bias = ((price - ma60) / ma60) * 100
         atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
         
-        # 4. 面板顯示
         with st.container(border=True):
             st.subheader(f"{name} ({code})")
             c1, c2, c3, c4 = st.columns(4)
