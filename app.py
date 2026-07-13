@@ -3,9 +3,9 @@ import pandas as pd
 import yfinance as yf
 import json
 import os
-import numpy as np # 引入 numpy 處理數值異常
+import numpy as np
 
-st.set_page_config(layout="wide", page_title="TaiStock 最終修復版")
+st.set_page_config(layout="wide", page_title="TaiStock 專業決策系統")
 
 @st.cache_data(ttl=3600)
 def fetch_stock_data(code):
@@ -28,13 +28,37 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-st.title("⚡ TaiStock 進階決策系統 (最終修正版)")
+# 👉 補回消失的側邊欄管理！
+with st.sidebar:
+    st.header("⚙️ 持股管理")
+    with st.form("add_stock"):
+        new_code = st.text_input("代號")
+        new_name = st.text_input("名稱")
+        new_cost = st.number_input("成本", value=100.0, step=0.1)
+        if st.form_submit_button("儲存/更新"):
+            portfolio[new_code] = [new_name, new_cost]
+            save_portfolio(portfolio)
+            st.rerun()
+    del_code = st.selectbox("刪除持股", [""] + list(portfolio.keys()))
+    if st.button("確認刪除"):
+        if del_code in portfolio:
+            del portfolio[del_code]
+            save_portfolio(portfolio)
+            st.rerun()
+
+st.title("⚡ TaiStock 進階決策系統 (全功能恢復版)")
+
+# 防呆：如果沒有持股，顯示提示文字避免畫面全白
+if not portfolio:
+    st.info("👈 請先從左側邊欄新增股票代號與成本！")
 
 for code, info in portfolio.items():
     name, cost = info
     try:
         df = fetch_stock_data(code)
-        if df.empty or len(df) < 60: continue
+        if df.empty or len(df) < 60: 
+            st.warning(f"⚠️ {name} ({code}) 歷史資料不足")
+            continue
         
         # 數據提取
         c, h, l = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze()
@@ -44,7 +68,7 @@ for code, info in portfolio.items():
         # 1. 變數強制初始化 (防止 name 'k' is not defined)
         k, d, macd, rsi = 50.0, 50.0, 0.0, 50.0
         
-        # 2. 技術指標計算 (加入 np.nan_to_num 處理)
+        # 2. 技術指標計算 (加入 np.nan_to_num 處理防當機)
         ma10 = float(c.rolling(10).mean().iloc[-1])
         ma20 = float(c.rolling(20).mean().iloc[-1])
         ma60 = float(c.rolling(60).mean().iloc[-1])
@@ -54,7 +78,6 @@ for code, info in portfolio.items():
         k = float(2/3 * 50 + 1/3 * np.nan_to_num(rsv_val))
         d = float(2/3 * 50 + 1/3 * k)
         
-        # RSI 計算保護
         delta = c.diff()
         up = delta.clip(lower=0).rolling(14).mean().iloc[-1]
         down = -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
@@ -81,9 +104,12 @@ for code, info in portfolio.items():
                 cols[1].markdown(f"### {'🟢' if macd > 0 else '🔴'} MACD {'多頭' if macd > 0 else '空頭'}")
                 cols[2].markdown(f"### {'🟢' if coeff > 1.15 else '🟡'} 動能 {'起漲中' if coeff > 1.15 else '盤整中'}")
                 st.divider()
-                st.write(f"成交量: {volume:,.0f} | 均線: MA20:{ma20:.1f} | 乖離率: {bias:.1f}%")
+                st.write("**[完整技術數據]**")
+                st.write(f"成交量: {volume:,.0f} | 均線: MA10:{ma10:.1f} | MA20:{ma20:.1f} | MA60:{ma60:.1f}")
                 st.write(f"指標: K:{k:.1f} | D:{d:.1f} | RSI:{rsi:.1f} | MACD:{macd:.3f}")
-                st.write(f"💡 ATR 停損: {price - (atr * 2):.1f} | 🎯 波段停利: {(price * 1.1):.1f}")
+                st.write("**[動態交易策略]**")
+                st.write(f"💡 ATR 停損: {price - (atr * 2):.1f} | 📈 乖離率: {bias:.1f}% | 🎯 波段停利: {(price * 1.1):.1f}")
+                st.caption("• 股性係數：收盤價 ÷ 20MA > 1.15 為起漲股")
                 
     except Exception as e:
         st.error(f"分析 {code} 發生錯誤: {e}")
