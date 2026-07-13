@@ -25,7 +25,7 @@ def fetch_stock_data(code):
     except Exception:
         return pd.DataFrame()
 
-# --- 2. 真實三大法人籌碼抓取 ---
+# --- 2. 真實三大法人籌碼抓取 (新增累積金額計算) ---
 @st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
@@ -43,7 +43,7 @@ def get_institutional_data(code):
         data = resp.json()
         
         if data.get("msg") != "success" or not data.get("data"):
-            return {"buy_sell": 0, "days": 0, "trend": "資料不足"}
+            return {"buy_sell": 0, "days": 0, "trend": "資料不足", "accumulated_shares": 0}
             
         df_inst = pd.DataFrame(data["data"])
         df_inst['net_buy'] = df_inst['buy'] - df_inst['sell']
@@ -52,18 +52,21 @@ def get_institutional_data(code):
         daily_net = daily_net.sort_values('date', ascending=False).reset_index(drop=True)
         
         if daily_net.empty:
-            return {"buy_sell": 0, "days": 0, "trend": "近期無交易"}
+            return {"buy_sell": 0, "days": 0, "trend": "近期無交易", "accumulated_shares": 0}
             
         latest_net = int(daily_net.iloc[0]['net_buy'] / 1000)
         
         days = 0
         is_buy = latest_net > 0
+        accumulated_shares = 0
         
         for val in daily_net['net_buy']:
             if is_buy and val > 0:
                 days += 1
+                accumulated_shares += val
             elif not is_buy and val < 0:
                 days += 1
+                accumulated_shares += val
             else:
                 break 
                 
@@ -72,10 +75,10 @@ def get_institutional_data(code):
         else:
             trend_str = f"連{days}買" if is_buy else f"連{days}賣"
             
-        return {"buy_sell": latest_net, "days": days, "trend": trend_str}
+        return {"buy_sell": latest_net, "days": days, "trend": trend_str, "accumulated_shares": accumulated_shares}
         
     except Exception:
-        return {"buy_sell": 0, "days": 0, "trend": "API異常"}
+        return {"buy_sell": 0, "days": 0, "trend": "API異常", "accumulated_shares": 0}
 
 # --- 3. 持股檔案管理 ---
 def load_portfolio():
@@ -90,17 +93,16 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-# --- 4. 側邊欄 UI (單股獨立風控) ---
+# --- 4. 側邊欄 UI ---
 with st.sidebar:
     st.header("📋 持股與專屬風控設定")
-    st.caption("您可以為每一檔股票設定獨立的分配資金與風險承受度。")
     with st.form("add_stock"):
         new_code = st.text_input("代號")
         new_name = st.text_input("名稱")
         new_cost = st.number_input("成本價", value=100.0, step=0.1)
         st.divider()
         new_cap = st.number_input("分配操作資金 (台幣)", value=50000, step=5000)
-        new_risk = st.number_input("單筆風險承受度 (%)", value=1.0, step=0.1, help="建議控制在 1%~2%")
+        new_risk = st.number_input("單筆風險承受度 (%)", value=1.0, step=0.1)
         
         if st.form_submit_button("儲存/更新設定"):
             fetch_stock_data.clear() 
@@ -117,7 +119,7 @@ with st.sidebar:
             st.rerun()
 
 # --- 5. 主面板運算與顯示 ---
-st.title("⚡ TaiStock 進階決策系統 (全功能完全體)")
+st.title("⚡ TaiStock 進階決策系統 (全功能究極版)")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號、成本與專屬資金！")
@@ -162,12 +164,38 @@ else:
             atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
             bias = ((price - ma60) / ma60) * 100
             coeff = price / ma20
+            
             inst = get_institutional_data(code)
+            
+            # --- 升級 1：計算法人連續買賣超金額 (億元) ---
+            inst_amount_e = (inst['accumulated_shares'] * price) / 100000000
+            if inst_amount_e > 0:
+                inst_trend_display = f"{inst['trend']} (流入 {inst_amount_e:.1f}億)"
+            elif inst_amount_e < 0:
+                inst_trend_display = f"{inst['trend']} (流出 {abs(inst_amount_e):.1f}億)"
+            else:
+                inst_trend_display = inst['trend']
             
             step1_pass = inst['buy_sell'] > 0 and inst['days'] >= 3
             step2_pass = (k > d) and (rsi > 50)
             step3_pass = ma20 <= price <= (ma20 * 1.03) 
             sop_ready = step1_pass and step2_pass and step3_pass
+            
+            atr_stop_price = cost - (atr * 2) if cost > 0 else 0
+            
+            # --- 升級 4：終極判定燈號整合 ---
+            if cost > 0 and price <= atr_stop_price:
+                final_status = "🔴 禁止進場 (已破停損)"
+                status_score = 3
+            elif price < ma20 * 0.95:
+                final_status = "🔴 禁止進場 (嚴重破線)"
+                status_score = 3
+            elif sop_ready:
+                final_status = "🟢 允許進場 (SOP 齊備)"
+                status_score = 1
+            else:
+                final_status = "🟡 觀望等待"
+                status_score = 2
             
             suggested_shares = 0
             if atr > 0:
@@ -177,67 +205,71 @@ else:
             
             summary_data.append({
                 "代號": code, "名稱": name, "現價": round(price, 2), "成本": round(cost, 2),
-                "分配資金": f"{cap:,.0f}", "單筆容損": f"{risk_amount:,.0f}",
-                "法人動能": inst['trend'], "AI狀態": "強勢" if k > 50 else "觀望",
-                "建議部位": f"{suggested_shares} 股" if sop_ready else "-",
-                "SOP判定": "🟢 強烈進場" if sop_ready else "⏳ 觀察中"
+                "分配資金": f"{cap:,.0f}",
+                "法人動態": inst_trend_display, 
+                "建議部位": f"{suggested_shares} 股" if status_score == 1 else "-",
+                "終極判定": final_status,
+                "_score": status_score # 用於排序的隱藏欄位
             })
             
             card_data.append({
                 "code": code, "name": name, "cost": cost, "price": price, "volume": volume,
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi,
-                "atr": atr, "bias": bias, "coeff": coeff, "inst": inst,
+                "atr": atr, "bias": bias, "coeff": coeff, "inst": inst, "inst_trend_display": inst_trend_display,
                 "cap": cap, "risk_pct": risk_pct, "risk_amount": risk_amount,
-                "step1": step1_pass, "step2": step2_pass, "step3": step3_pass, "sop_ready": sop_ready,
-                "shares": suggested_shares
+                "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
+                "final_status": final_status, "status_score": status_score, "shares": suggested_shares,
+                "atr_stop_price": atr_stop_price
             })
             
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
-    # --- 繪製多股戰情總表 ---
+    # --- 升級 2：多股戰情總表 (依 SOP 狀態排序) ---
     if summary_data:
         st.markdown("### 📊 持股戰情總表")
         df_summary = pd.DataFrame(summary_data)
+        # 依據評分排序：綠燈(1) -> 黃燈(2) -> 紅燈(3)
+        df_summary = df_summary.sort_values(by="_score").drop(columns=["_score"])
         st.dataframe(df_summary, use_container_width=True, hide_index=True)
         st.divider()
 
     # --- 繪製個別診斷卡片 ---
     for data in card_data:
-        atr_stop_price = data['cost'] - (data['atr'] * 2)
-        take_profit_price = data['cost'] * 1.10
-        
-        if data['sop_ready']:
-            sop_status_text = f"🟢 **強烈進場訊號** (建議買進: {data['shares']} 股)"
-        else:
-            sop_status_text = "⏳ 條件未齊，持續觀察"
+        take_profit_price = data['cost'] * 1.10 if data['cost'] > 0 else 0
         
         with st.container(border=True):
-            st.subheader(f"{data['name']} ({data['code']}) - 專屬分配資金: {data['cap']:,.0f} 元")
+            st.subheader(f"{data['name']} ({data['code']}) - 專屬資金: {data['cap']:,.0f} 元")
             
+            # --- 升級 3：±2% 預警防護機制 ---
             if data['cost'] > 0: 
-                if data['price'] <= atr_stop_price:
-                    st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破 ATR 停損點 ({atr_stop_price:.2f})！最大容許虧損設定為 {data['risk_amount']:,.0f} 元。")
-                elif data['price'] >= take_profit_price:
-                    st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段停利目標 ({take_profit_price:.2f})！")
+                if data['price'] <= data['atr_stop_price']:
+                    st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破停損 ({data['atr_stop_price']:.2f})！請執行紀律。")
+                elif data['price'] <= data['atr_stop_price'] * 1.02:
+                    st.warning(f"⚠️ **停損預警**：現價 ({data['price']:.2f}) 距離停損點不到 2%，請準備執行紀律。")
+                
+                if data['price'] >= take_profit_price:
+                    st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段目標 ({take_profit_price:.2f})！")
+                elif data['price'] >= take_profit_price * 0.98:
+                    st.warning(f"⚠️ **停利預警**：現價 ({data['price']:.2f}) 距離 10% 停利目標不到 2%，可考慮分批了結。")
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("現價", f"{data['price']:.2f}", delta=f"成本:{data['cost']:.1f}")
-            c2.metric("法人動能", data['inst']['trend'], delta=f"{data['inst']['buy_sell']}張")
-            c3.metric("單筆容損金額", f"{data['risk_amount']:,.0f} 元", delta=f"{data['risk_pct']}% 風險")
-            c4.metric("建議部位", f"{data['shares']} 股" if data['sop_ready'] else "等待訊號")
+            c2.metric("法人動能", data['inst_trend_display'])
+            c3.metric("單筆容損", f"{data['risk_amount']:,.0f} 元", delta=f"{data['risk_pct']}% 風險")
+            c4.metric("建議部位", f"{data['shares']} 股" if data['status_score'] == 1 else "等待訊號")
             
             st.markdown("##### 📋 嚴格進場 SOP 檢核")
-            st.markdown(f"- **Step 1**: 法人連續買超 ≥ 3 天 ➔ {'✅' if data['step1'] else '❌'}")
-            st.markdown(f"- **Step 2**: KD 交叉向上 且 RSI > 50 ➔ {'✅' if data['step2'] else '❌'}")
+            st.markdown(f"- **Step 1**: 法人連買 ≥ 3 天 ➔ {'✅' if data['step1'] else '❌'}")
+            st.markdown(f"- **Step 2**: KD 向上且 RSI > 50 ➔ {'✅' if data['step2'] else '❌'}")
             st.markdown(f"- **Step 3**: 收盤價突破 MA20 (±3% 內) ➔ {'✅' if data['step3'] else '❌'}")
             
-            # 顯示精確進場區間
             buy_zone_bottom = data['ma20']
             buy_zone_top = data['ma20'] * 1.03
             st.info(f"🎯 **建議進場區間 (20MA 突破)**：{buy_zone_bottom:.2f} ~ {buy_zone_top:.2f} 元")
             
-            st.markdown(f"**最終判定**: {sop_status_text}")
+            # 整合後的終極判定
+            st.markdown(f"**最終判定**: {data['final_status']}")
             
             with st.expander("🚦 查看完整決策診斷報告"):
                 cols = st.columns(3)
@@ -249,12 +281,4 @@ else:
                 st.write(f"成交量: {data['volume']:,.0f} | 均線: MA10:{data['ma10']:.1f} | MA20:{data['ma20']:.1f} | MA60:{data['ma60']:.1f}")
                 st.write(f"指標: K:{data['k']:.1f} | D:{data['d']:.1f} | RSI:{data['rsi']:.1f} | MACD:{data['macd']:.3f}")
                 st.write("**[專屬交易策略]**")
-                st.write(f"💡 基準 ATR 停損: {atr_stop_price:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離率: {data['bias']:.1f}%")
-
-    # --- 6. 系統燈號定義說明 ---
-    st.divider()
-    st.markdown("### 🚦 系統燈號與判定定義說明")
-    st.markdown("- **🟢 綠燈**：代表趨勢偏多、指標交叉向上、或動能處於強勢起漲狀態（股價突破 20MA 的 1.15 倍）。")
-    st.markdown("- **🔴 紅燈**：代表趨勢偏空、指標交叉向下、或處於弱勢格局。")
-    st.markdown("- **🟡 黃燈**：代表動能平緩、目前處於盤整區間。")
-    st.markdown("- **⏳ 沙漏**：代表嚴格進場 SOP 條件尚未完全齊備，建議耐心等待。")
+                st.write(f"💡 基準 ATR 停損: {data['atr_stop_price']:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離: {data['bias']:.1f}%")
