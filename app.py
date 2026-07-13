@@ -90,9 +90,16 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-# --- 4. 側邊欄 UI ---
+# --- 4. 側邊欄 UI (新增資金與部位管理) ---
 with st.sidebar:
-    st.header("⚙️ 持股管理")
+    st.header("⚙️ 資金與部位管理")
+    total_capital = st.number_input("總操作資金 (台幣)", value=100000, step=10000)
+    risk_pct = st.number_input("單筆風險承受度 (%)", value=1.0, step=0.1, help="建議單筆虧損控制在總資金的 1%~2%")
+    risk_amount = total_capital * (risk_pct / 100)
+    st.info(f"單筆最大停損金額: **{risk_amount:,.0f} 元**")
+    st.divider()
+
+    st.header("📋 持股名單")
     with st.form("add_stock"):
         new_code = st.text_input("代號")
         new_name = st.text_input("名稱")
@@ -112,12 +119,11 @@ with st.sidebar:
             st.rerun()
 
 # --- 5. 主面板運算與顯示 ---
-st.title("⚡ TaiStock 進階決策系統 (多股戰情總表版)")
+st.title("⚡ TaiStock 進階決策系統 (全功能完全體)")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號與成本！")
 else:
-    # 預先計算所有股票數據，準備繪製總表
     summary_data = []
     card_data = []
 
@@ -151,11 +157,20 @@ else:
             coeff = price / ma20
             inst = get_institutional_data(code)
             
-            # SOP 檢核邏輯
+            # --- SOP 檢核邏輯 ---
             step1_pass = inst['buy_sell'] > 0 and inst['days'] >= 3
             step2_pass = (k > d) and (rsi > 50)
             step3_pass = ma20 <= price <= (ma20 * 1.03) 
             sop_ready = step1_pass and step2_pass and step3_pass
+            
+            # --- 零股部位精算邏輯 ---
+            # 計算公式：可承受風險金額 / ATR真實波幅 = 建議買進股數
+            suggested_shares = 0
+            if atr > 0:
+                raw_shares = int(risk_amount / atr)
+                # 防呆機制：確保買進總額不會超過您的總操作資金
+                max_affordable_shares = int(total_capital / price)
+                suggested_shares = min(raw_shares, max_affordable_shares)
             
             # 存入總表清單
             summary_data.append({
@@ -165,16 +180,17 @@ else:
                 "成本": round(cost, 2),
                 "法人動能": inst['trend'],
                 "AI狀態": "強勢" if k > 50 else "觀望",
-                "季線乖離(%)": round(bias, 2),
+                "建議部位": f"{suggested_shares} 股" if sop_ready else "-",
                 "SOP判定": "🟢 強烈進場" if sop_ready else "⏳ 觀察中"
             })
             
-            # 存入卡片清單 (避免重複運算)
+            # 存入卡片清單
             card_data.append({
                 "code": code, "name": name, "cost": cost, "price": price, "volume": volume,
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi,
                 "atr": atr, "bias": bias, "coeff": coeff, "inst": inst,
-                "step1": step1_pass, "step2": step2_pass, "step3": step3_pass, "sop_ready": sop_ready
+                "step1": step1_pass, "step2": step2_pass, "step3": step3_pass, "sop_ready": sop_ready,
+                "shares": suggested_shares
             })
             
         except Exception as e:
@@ -191,12 +207,15 @@ else:
     for data in card_data:
         atr_stop_price = data['cost'] - (data['atr'] * 2)
         take_profit_price = data['cost'] * 1.10
-        sop_status_text = "🟢 **強烈進場訊號** (符合嚴格 SOP)" if data['sop_ready'] else "⏳ 條件未齊，持續觀察"
+        
+        if data['sop_ready']:
+            sop_status_text = f"🟢 **強烈進場訊號** (建議買進: {data['shares']} 股)"
+        else:
+            sop_status_text = "⏳ 條件未齊，持續觀察"
         
         with st.container(border=True):
             st.subheader(f"{data['name']} ({data['code']})")
             
-            # 風控警示橫幅
             if data['cost'] > 0: 
                 if data['price'] <= atr_stop_price:
                     st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破 ATR 停損點 ({atr_stop_price:.2f})！請嚴格執行紀律。")
@@ -207,7 +226,7 @@ else:
             c1.metric("現價", f"{data['price']:.2f}", delta=f"成本:{data['cost']:.1f}")
             c2.metric("法人動能", data['inst']['trend'], delta=f"{data['inst']['buy_sell']}張")
             c3.metric("AI 狀態", "強勢" if data['k'] > 50 else "觀望")
-            c4.metric("股性判別", "🚀 起漲股" if data['coeff'] > 1.15 else "📊 一般股")
+            c4.metric("建議部位", f"{data['shares']} 股" if data['sop_ready'] else "等待訊號")
             
             st.markdown("##### 📋 嚴格進場 SOP 檢核")
             st.markdown(f"- **Step 1**: 法人連續買超 ≥ 3 天 ➔ {'✅' if data['step1'] else '❌'}")
