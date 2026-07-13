@@ -90,7 +90,7 @@ def save_portfolio(data):
 
 portfolio = load_portfolio()
 
-# --- 4. 側邊欄 UI (改為單股獨立風控) ---
+# --- 4. 側邊欄 UI (單股獨立風控) ---
 with st.sidebar:
     st.header("📋 持股與專屬風控設定")
     st.caption("您可以為每一檔股票設定獨立的分配資金與風險承受度。")
@@ -105,7 +105,6 @@ with st.sidebar:
         if st.form_submit_button("儲存/更新設定"):
             fetch_stock_data.clear() 
             get_institutional_data.clear()
-            # 將獨立的資金與風險一起存入 json
             portfolio[new_code] = [new_name, new_cost, new_cap, new_risk]
             save_portfolio(portfolio)
             st.rerun()
@@ -118,7 +117,7 @@ with st.sidebar:
             st.rerun()
 
 # --- 5. 主面板運算與顯示 ---
-st.title("⚡ TaiStock 進階決策系統 (單股獨立風控版)")
+st.title("⚡ TaiStock 進階決策系統 (全功能完全體)")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號、成本與專屬資金！")
@@ -127,10 +126,9 @@ else:
     card_data = []
 
     for code, info in portfolio.items():
-        # 向下相容處理：判斷舊資料(2個參數)還是新資料(4個參數)
         if len(info) == 2:
             name, cost = info
-            cap, risk_pct = 50000.0, 1.0 # 舊資料預設值
+            cap, risk_pct = 50000.0, 1.0 
         elif len(info) == 4:
             name, cost, cap, risk_pct = info
         else:
@@ -233,6 +231,12 @@ else:
             st.markdown(f"- **Step 1**: 法人連續買超 ≥ 3 天 ➔ {'✅' if data['step1'] else '❌'}")
             st.markdown(f"- **Step 2**: KD 交叉向上 且 RSI > 50 ➔ {'✅' if data['step2'] else '❌'}")
             st.markdown(f"- **Step 3**: 收盤價突破 MA20 (±3% 內) ➔ {'✅' if data['step3'] else '❌'}")
+            
+            # 顯示精確進場區間
+            buy_zone_bottom = data['ma20']
+            buy_zone_top = data['ma20'] * 1.03
+            st.info(f"🎯 **建議進場區間 (20MA 突破)**：{buy_zone_bottom:.2f} ~ {buy_zone_top:.2f} 元")
+            
             st.markdown(f"**最終判定**: {sop_status_text}")
             
             with st.expander("🚦 查看完整決策診斷報告"):
