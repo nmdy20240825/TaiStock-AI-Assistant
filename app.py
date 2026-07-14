@@ -25,7 +25,7 @@ def fetch_stock_data(code):
     except Exception:
         return pd.DataFrame()
 
-# --- 2. 真實法人籌碼抓取 (核心更新：主力成交量占比 15% 濾網) ---
+# --- 2. 真實法人籌碼抓取 (修復：同時計算「佔比」與「累積金額」) ---
 @st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
@@ -42,12 +42,11 @@ def get_institutional_data(code):
         resp = requests.get(url, params=parameter, timeout=5)
         data = resp.json()
         
-        # 獲取對應的成交量資料
         ticker = f"{code}.TW" if not code.endswith(('.TW', '.TWO', '.US')) else code
         stock_data = yf.download(ticker, period="1mo", progress=False)
         
         if data.get("msg") != "success" or not data.get("data") or stock_data.empty:
-            return {"buy_sell": 0, "days": 0, "trend": "資料不足", "avg_ratio": 0}
+            return {"buy_sell": 0, "days": 0, "trend": "資料不足", "avg_ratio": 0, "accumulated_shares": 0}
             
         df_inst = pd.DataFrame(data["data"])
         df_inst['net_buy'] = df_inst['buy'] - df_inst['sell']
@@ -55,30 +54,29 @@ def get_institutional_data(code):
         
         days = 0
         ratios = []
+        accumulated_shares = 0
         
-        # 計算連續天數與近三日買進佔比
         for date_key in daily_net.index:
             if date_key in stock_data.index:
                 net_buy = daily_net[date_key]
                 volume = stock_data.loc[date_key, 'Volume']
                 
-                # 若為買超，累計天數並計算佔比
                 if net_buy > 0:
                     days += 1
                     ratios.append((net_buy / volume) * 100)
-                # 遇到賣超或無動作即中斷連續天數計算
+                    accumulated_shares += net_buy
                 elif net_buy <= 0 and days > 0:
                     break
                 elif net_buy < 0 and days == 0:
-                    # 計算連續賣超天數
                     for sell_date in daily_net.index:
-                        if daily_net[sell_date] < 0:
+                        val = daily_net[sell_date]
+                        if val < 0:
                             days -= 1
+                            accumulated_shares += val
                         else:
                             break
                     break
                     
-        # 計算近三日(或有買進的天數)的平均佔比
         avg_ratio = sum(ratios[:3]) / 3 if len(ratios) >= 3 else (sum(ratios) / len(ratios) if ratios else 0)
         
         if days == 0:
@@ -88,10 +86,10 @@ def get_institutional_data(code):
         else:
             trend_str = f"連{abs(days)}賣"
             
-        return {"buy_sell": daily_net.iloc[0] if not daily_net.empty else 0, "days": days, "trend": trend_str, "avg_ratio": avg_ratio}
+        return {"buy_sell": daily_net.iloc[0] if not daily_net.empty else 0, "days": days, "trend": trend_str, "avg_ratio": avg_ratio, "accumulated_shares": accumulated_shares}
         
     except Exception:
-        return {"buy_sell": 0, "days": 0, "trend": "API異常", "avg_ratio": 0}
+        return {"buy_sell": 0, "days": 0, "trend": "API異常", "avg_ratio": 0, "accumulated_shares": 0}
 
 # --- 3. 持股檔案管理 ---
 def load_portfolio():
@@ -160,7 +158,6 @@ else:
             v = df.get('Volume', pd.Series(0, index=df.index)).squeeze()
             price, volume = float(c.iloc[-1]), float(v.iloc[-1])
             
-            # --- 完整技術指標計算 ---
             ma10 = float(c.rolling(10).mean().iloc[-1])
             ma20 = float(c.rolling(20).mean().iloc[-1])
             ma60 = float(c.rolling(60).mean().iloc[-1])
@@ -181,9 +178,12 @@ else:
             
             inst = get_institutional_data(code)
             
-            # --- 顯示法人動態與佔比 ---
-            if inst['days'] > 0:
-                inst_trend_display = f"{inst['trend']} (佔比 {inst['avg_ratio']:.1f}%)"
+            # --- 顯示法人動態 (合併億元與佔比) ---
+            inst_amount_e = (inst['accumulated_shares'] * price) / 100000000
+            if inst_amount_e > 0:
+                inst_trend_display = f"{inst['trend']} (流入 {inst_amount_e:.1f}億, 佔比 {inst['avg_ratio']:.1f}%)"
+            elif inst_amount_e < 0:
+                inst_trend_display = f"{inst['trend']} (流出 {abs(inst_amount_e):.1f}億)"
             else:
                 inst_trend_display = inst['trend']
             
@@ -195,7 +195,6 @@ else:
             
             atr_stop_price = cost - (atr * 2) if cost > 0 else 0
             
-            # --- 終極判定燈號 ---
             if cost > 0 and price <= atr_stop_price:
                 final_status = "🔴 禁止進場 (已破停損)"
                 status_score = 3
@@ -209,7 +208,6 @@ else:
                 final_status = "🟡 觀望等待"
                 status_score = 2
             
-            # --- 零股精算防護 ---
             suggested_shares = 0
             if atr > 0:
                 raw_shares = int(risk_amount / atr)
@@ -238,7 +236,7 @@ else:
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
-    # --- 繪製多股戰情總表 (排序) ---
+    # --- 繪製多股戰情總表 ---
     if summary_data:
         st.markdown("### 📊 持股戰情總表")
         df_summary = pd.DataFrame(summary_data)
@@ -253,7 +251,6 @@ else:
         with st.container(border=True):
             st.subheader(f"{data['name']} ({data['code']}) - 專屬資金: {data['cap']:,.0f} 元")
             
-            # --- ±2% 預警防護機制 ---
             if data['cost'] > 0: 
                 if data['price'] <= data['atr_stop_price']:
                     st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破停損 ({data['atr_stop_price']:.2f})！請執行紀律。")
@@ -265,28 +262,23 @@ else:
                 elif data['price'] >= take_profit_price * 0.98:
                     st.warning(f"⚠️ **停利預警**：現價 ({data['price']:.2f}) 距離 10% 停利目標不到 2%，可考慮分批了結。")
             
-            # --- 完整 4 欄位指標 ---
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("現價", f"{data['price']:.2f}", delta=f"成本:{data['cost']:.1f}")
             c2.metric("法人動能", data['inst_trend_display'])
             c3.metric("單筆容損", f"{data['risk_amount']:,.0f} 元", delta=f"{data['risk_pct']}% 風險")
             c4.metric("建議部位", f"{data['shares']} 股" if data['status_score'] == 1 else "等待訊號")
             
-            # --- 完整 3 步驟 SOP 檢核清單 ---
             st.markdown("##### 📋 嚴格進場 SOP 檢核")
             st.markdown(f"- **Step 1**: 法人連買 ≥ 3 天 且 主力佔比 > 15% ➔ {'✅' if data['step1'] else '❌'}")
             st.markdown(f"- **Step 2**: KD 向上且 RSI > 50 ➔ {'✅' if data['step2'] else '❌'}")
             st.markdown(f"- **Step 3**: 收盤價突破 MA20 (±3% 內) ➔ {'✅' if data['step3'] else '❌'}")
             
-            # --- 進場打擊區 ---
             buy_zone_bottom = data['ma20']
             buy_zone_top = data['ma20'] * 1.03
             st.info(f"🎯 **建議進場區間 (20MA 突破)**：{buy_zone_bottom:.2f} ~ {buy_zone_top:.2f} 元")
             
-            # --- 終極判定 ---
             st.markdown(f"**最終判定**: {data['final_status']}")
             
-            # --- 折疊式完整決策診斷報告 (紅綠黃燈) ---
             with st.expander("🚦 查看完整決策診斷報告"):
                 cols = st.columns(3)
                 cols[0].markdown(f"### {'🟢' if data['k'] > data['d'] else '🔴'} KD {'向上' if data['k'] > data['d'] else '向下'}")
