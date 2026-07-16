@@ -25,7 +25,7 @@ def fetch_stock_data(code):
     except Exception:
         return pd.DataFrame()
 
-# --- 2. 真實法人籌碼抓取 (修復：同時計算「佔比」與「累積金額」) ---
+# --- 2. 真實法人籌碼抓取 (加入髒資料防護與強制轉型) ---
 @st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
@@ -58,18 +58,33 @@ def get_institutional_data(code):
         
         for date_key in daily_net.index:
             if date_key in stock_data.index:
-                net_buy = daily_net[date_key]
-                volume = stock_data.loc[date_key, 'Volume']
+                # 防護機制：確保取出的淨買賣與成交量為絕對單一純數值
+                net_buy_raw = daily_net[date_key]
+                if isinstance(net_buy_raw, pd.Series):
+                    net_buy_raw = net_buy_raw.iloc[0]
+                net_buy = float(net_buy_raw)
                 
+                volume_raw = stock_data.loc[date_key, 'Volume']
+                if isinstance(volume_raw, pd.Series):
+                    volume_raw = volume_raw.iloc[0]
+                volume = float(volume_raw)
+                
+                # 若為買超，累計天數並計算佔比
                 if net_buy > 0:
                     days += 1
-                    ratios.append((net_buy / volume) * 100)
+                    if volume > 0:
+                        ratios.append((net_buy / volume) * 100)
                     accumulated_shares += net_buy
+                # 遇到賣超或無動作即中斷連續天數計算
                 elif net_buy <= 0 and days > 0:
                     break
                 elif net_buy < 0 and days == 0:
+                    # 計算連續賣超天數
                     for sell_date in daily_net.index:
-                        val = daily_net[sell_date]
+                        val_raw = daily_net[sell_date]
+                        if isinstance(val_raw, pd.Series): val_raw = val_raw.iloc[0]
+                        val = float(val_raw)
+                        
                         if val < 0:
                             days -= 1
                             accumulated_shares += val
@@ -77,6 +92,7 @@ def get_institutional_data(code):
                             break
                     break
                     
+        # 計算近三日平均佔比
         avg_ratio = sum(ratios[:3]) / 3 if len(ratios) >= 3 else (sum(ratios) / len(ratios) if ratios else 0)
         
         if days == 0:
@@ -86,7 +102,10 @@ def get_institutional_data(code):
         else:
             trend_str = f"連{abs(days)}賣"
             
-        return {"buy_sell": daily_net.iloc[0] if not daily_net.empty else 0, "days": days, "trend": trend_str, "avg_ratio": avg_ratio, "accumulated_shares": accumulated_shares}
+        latest_buy_sell = daily_net.iloc[0] if not daily_net.empty else 0
+        if isinstance(latest_buy_sell, pd.Series): latest_buy_sell = latest_buy_sell.iloc[0]
+            
+        return {"buy_sell": float(latest_buy_sell), "days": days, "trend": trend_str, "avg_ratio": float(avg_ratio), "accumulated_shares": float(accumulated_shares)}
         
     except Exception:
         return {"buy_sell": 0, "days": 0, "trend": "API異常", "avg_ratio": 0, "accumulated_shares": 0}
@@ -154,9 +173,21 @@ else:
             if df is None or df.empty or len(df) < 60: 
                 continue
             
-            c, h, l = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze()
+            # 防護機制：確保股價與成交量取出為單一純數值
+            c = df['Close'].squeeze()
+            if isinstance(c, pd.DataFrame): c = c.iloc[:, 0]
+            
+            h = df['High'].squeeze()
+            if isinstance(h, pd.DataFrame): h = h.iloc[:, 0]
+                
+            l = df['Low'].squeeze()
+            if isinstance(l, pd.DataFrame): l = l.iloc[:, 0]
+                
             v = df.get('Volume', pd.Series(0, index=df.index)).squeeze()
-            price, volume = float(c.iloc[-1]), float(v.iloc[-1])
+            if isinstance(v, pd.DataFrame): v = v.iloc[:, 0]
+                
+            price = float(c.iloc[-1])
+            volume = float(v.iloc[-1])
             
             ma10 = float(c.rolling(10).mean().iloc[-1])
             ma20 = float(c.rolling(20).mean().iloc[-1])
@@ -170,11 +201,14 @@ else:
             delta = c.diff()
             up = delta.clip(lower=0).rolling(14).mean().iloc[-1]
             down = -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
-            rsi = 100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001))))
+            rsi_raw = 100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001))))
+            rsi = float(rsi_raw) if not isinstance(rsi_raw, pd.Series) else float(rsi_raw.iloc[-1])
             
             atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
-            bias = ((price - ma60) / ma60) * 100
-            coeff = price / ma20
+            atr = float(atr)
+            
+            bias = float(((price - ma60) / ma60) * 100)
+            coeff = float(price / ma20)
             
             inst = get_institutional_data(code)
             
