@@ -248,7 +248,8 @@ else:
                 max_affordable_shares = int(cap / price)
                 suggested_shares = min(raw_shares, max_affordable_shares)
             
-            tech_str = f"{'KD▲' if k > d else 'KD▼'} | {'RSI>50' if rsi > 50 else 'RSI<50'} | {'MA20✓' if step3_pass else 'MA20❌'}"
+            # --- 將 S1/S2/S3 直接轉化為打勾與打叉圖示 ---
+            sop_str = f"S1:{'✅' if step1_pass else '❌'} | S2:{'✅' if step2_pass else '❌'} | S3:{'✅' if step3_pass else '❌'}"
             risk_str = f"{atr_stop_price:.1f} / {take_profit_price:.1f}" if cost > 0 else "- / -"
             
             summary_data.append({
@@ -258,7 +259,7 @@ else:
                 "成本": round(cost, 2),
                 "分配資金": f"{cap:,.0f}",
                 "法人動態": inst_trend_display, 
-                "進場Sop檢核": tech_str,
+                "進場SOP檢核": sop_str,
                 "風控點(損/利)": risk_str,
                 "建議部位": f"{suggested_shares} 股" if status_score == 1 else "-",
                 "終極判定": final_status,
