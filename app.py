@@ -25,7 +25,7 @@ def fetch_stock_data(code):
     except Exception:
         return pd.DataFrame()
 
-# --- 2. 真實法人籌碼抓取 (加入髒資料防護與強制轉型) ---
+# --- 2. 真實法人籌碼抓取 ---
 @st.cache_data(ttl=3600)  
 def get_institutional_data(code):
     try:
@@ -58,7 +58,6 @@ def get_institutional_data(code):
         
         for date_key in daily_net.index:
             if date_key in stock_data.index:
-                # 防護機制：確保取出的淨買賣與成交量為絕對單一純數值
                 net_buy_raw = daily_net[date_key]
                 if isinstance(net_buy_raw, pd.Series):
                     net_buy_raw = net_buy_raw.iloc[0]
@@ -69,17 +68,14 @@ def get_institutional_data(code):
                     volume_raw = volume_raw.iloc[0]
                 volume = float(volume_raw)
                 
-                # 若為買超，累計天數並計算佔比
                 if net_buy > 0:
                     days += 1
                     if volume > 0:
                         ratios.append((net_buy / volume) * 100)
                     accumulated_shares += net_buy
-                # 遇到賣超或無動作即中斷連續天數計算
                 elif net_buy <= 0 and days > 0:
                     break
                 elif net_buy < 0 and days == 0:
-                    # 計算連續賣超天數
                     for sell_date in daily_net.index:
                         val_raw = daily_net[sell_date]
                         if isinstance(val_raw, pd.Series): val_raw = val_raw.iloc[0]
@@ -92,7 +88,6 @@ def get_institutional_data(code):
                             break
                     break
                     
-        # 計算近三日平均佔比
         avg_ratio = sum(ratios[:3]) / 3 if len(ratios) >= 3 else (sum(ratios) / len(ratios) if ratios else 0)
         
         if days == 0:
@@ -110,12 +105,21 @@ def get_institutional_data(code):
     except Exception:
         return {"buy_sell": 0, "days": 0, "trend": "API異常", "avg_ratio": 0, "accumulated_shares": 0}
 
-# --- 3. 持股檔案管理 ---
+# --- 3. 持股檔案管理 (新增雲端防重啟預設清單) ---
 def load_portfolio():
-    if not os.path.exists('portfolio.json'): return {}
+    default_portfolio = {
+        "3711": ["日月光投控", 700.48, 20000, 5.0],
+        "6414": ["樺漢", 339.2, 20000, 5.0]
+    }
+    
+    if not os.path.exists('portfolio.json'): 
+        return default_portfolio
+        
     with open('portfolio.json', 'r', encoding='utf-8') as f:
-        try: return json.load(f)
-        except: return {}
+        try: 
+            return json.load(f)
+        except: 
+            return default_portfolio
 
 def save_portfolio(data):
     with open('portfolio.json', 'w', encoding='utf-8') as f:
@@ -128,18 +132,19 @@ with st.sidebar:
     st.header("📋 持股與專屬風控設定")
     with st.form("add_stock"):
         new_code = st.text_input("代號")
-        new_name = st.text_input("名稱")
+        new_name = st.text_input("名稱 (可留白)")
         new_cost = st.number_input("成本價", value=100.0, step=0.1)
         st.divider()
-        new_cap = st.number_input("分配操作資金 (台幣)", value=50000, step=5000)
-        new_risk = st.number_input("單筆風險承受度 (%)", value=1.0, step=0.1)
+        new_cap = st.number_input("分配操作資金 (台幣)", value=20000, step=5000)
+        new_risk = st.number_input("單筆風險承受度 (%)", value=5.0, step=0.1)
         
         if st.form_submit_button("儲存/更新設定"):
-            fetch_stock_data.clear() 
-            get_institutional_data.clear()
-            portfolio[new_code] = [new_name, new_cost, new_cap, new_risk]
-            save_portfolio(portfolio)
-            st.rerun()
+            if new_code:
+                fetch_stock_data.clear() 
+                get_institutional_data.clear()
+                portfolio[new_code] = [new_name, new_cost, new_cap, new_risk]
+                save_portfolio(portfolio)
+                st.rerun()
             
     del_code = st.selectbox("刪除持股", [""] + list(portfolio.keys()))
     if st.button("確認刪除"):
@@ -152,7 +157,7 @@ with st.sidebar:
 st.title("⚡ TaiStock 進階決策系統 (全功能完全體)")
 
 if not portfolio:
-    st.info("👈 請先從左側邊欄新增股票代號、成本與專屬資金！")
+    st.info("👈 請先從左側邊欄新增股票代號！")
 else:
     summary_data = []
     card_data = []
@@ -160,7 +165,7 @@ else:
     for code, info in portfolio.items():
         if len(info) == 2:
             name, cost = info
-            cap, risk_pct = 50000.0, 1.0 
+            cap, risk_pct = 20000.0, 5.0 
         elif len(info) == 4:
             name, cost, cap, risk_pct = info
         else:
@@ -173,16 +178,12 @@ else:
             if df is None or df.empty or len(df) < 60: 
                 continue
             
-            # 防護機制：確保股價與成交量取出為單一純數值
             c = df['Close'].squeeze()
             if isinstance(c, pd.DataFrame): c = c.iloc[:, 0]
-            
             h = df['High'].squeeze()
             if isinstance(h, pd.DataFrame): h = h.iloc[:, 0]
-                
             l = df['Low'].squeeze()
             if isinstance(l, pd.DataFrame): l = l.iloc[:, 0]
-                
             v = df.get('Volume', pd.Series(0, index=df.index)).squeeze()
             if isinstance(v, pd.DataFrame): v = v.iloc[:, 0]
                 
@@ -212,7 +213,6 @@ else:
             
             inst = get_institutional_data(code)
             
-            # --- 顯示法人動態 (合併億元與佔比) ---
             inst_amount_e = (inst['accumulated_shares'] * price) / 100000000
             if inst_amount_e > 0:
                 inst_trend_display = f"{inst['trend']} (流入 {inst_amount_e:.1f}億, 佔比 {inst['avg_ratio']:.1f}%)"
@@ -221,13 +221,13 @@ else:
             else:
                 inst_trend_display = inst['trend']
             
-            # --- 嚴格 SOP 濾網 (15% 佔比邏輯) ---
             step1_pass = inst['days'] >= 3 and inst['avg_ratio'] >= 15.0
             step2_pass = (k > d) and (rsi > 50)
             step3_pass = ma20 <= price <= (ma20 * 1.03) 
             sop_ready = step1_pass and step2_pass and step3_pass
             
             atr_stop_price = cost - (atr * 2) if cost > 0 else 0
+            take_profit_price = cost * 1.10 if cost > 0 else 0
             
             if cost > 0 and price <= atr_stop_price:
                 final_status = "🔴 禁止進場 (已破停損)"
@@ -248,10 +248,20 @@ else:
                 max_affordable_shares = int(cap / price)
                 suggested_shares = min(raw_shares, max_affordable_shares)
             
+            # --- 構建新增的高密度顯示欄位 ---
+            tech_str = f"{'KD▲' if k > d else 'KD▼'} | {'RSI>50' if rsi > 50 else 'RSI<50'} | {'MA20✓' if step3_pass else 'MA20❌'}"
+            risk_str = f"{atr_stop_price:.1f} / {take_profit_price:.1f}" if cost > 0 else "- / -"
+            
+            # --- 將新增欄位完美融入原有的資料結構中 ---
             summary_data.append({
-                "代號": code, "名稱": name, "現價": round(price, 2), "成本": round(cost, 2),
+                "代號": code, 
+                "名稱": name, 
+                "現價": round(price, 2), 
+                "成本": round(cost, 2),
                 "分配資金": f"{cap:,.0f}",
                 "法人動態": inst_trend_display, 
+                "技術面檢核": tech_str,
+                "風控點(損/利)": risk_str,
                 "建議部位": f"{suggested_shares} 股" if status_score == 1 else "-",
                 "終極判定": final_status,
                 "_score": status_score 
@@ -264,13 +274,13 @@ else:
                 "cap": cap, "risk_pct": risk_pct, "risk_amount": risk_amount,
                 "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "final_status": final_status, "status_score": status_score, "shares": suggested_shares,
-                "atr_stop_price": atr_stop_price
+                "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price
             })
             
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
-    # --- 繪製多股戰情總表 ---
+    # --- 繪製多股戰情總表 (包含新欄位) ---
     if summary_data:
         st.markdown("### 📊 持股戰情總表")
         df_summary = pd.DataFrame(summary_data)
@@ -280,8 +290,6 @@ else:
 
     # --- 繪製個別完整診斷卡片 ---
     for data in card_data:
-        take_profit_price = data['cost'] * 1.10 if data['cost'] > 0 else 0
-        
         with st.container(border=True):
             st.subheader(f"{data['name']} ({data['code']}) - 專屬資金: {data['cap']:,.0f} 元")
             
@@ -291,9 +299,9 @@ else:
                 elif data['price'] <= data['atr_stop_price'] * 1.02:
                     st.warning(f"⚠️ **停損預警**：現價 ({data['price']:.2f}) 距離停損點不到 2%，請準備執行紀律。")
                 
-                if data['price'] >= take_profit_price:
-                    st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段目標 ({take_profit_price:.2f})！")
-                elif data['price'] >= take_profit_price * 0.98:
+                if data['price'] >= data['take_profit_price']:
+                    st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段目標 ({data['take_profit_price']:.2f})！")
+                elif data['price'] >= data['take_profit_price'] * 0.98:
                     st.warning(f"⚠️ **停利預警**：現價 ({data['price']:.2f}) 距離 10% 停利目標不到 2%，可考慮分批了結。")
             
             c1, c2, c3, c4 = st.columns(4)
@@ -323,7 +331,7 @@ else:
                 st.write(f"成交量: {data['volume']:,.0f} | 均線: MA10:{data['ma10']:.1f} | MA20:{data['ma20']:.1f} | MA60:{data['ma60']:.1f}")
                 st.write(f"指標: K:{data['k']:.1f} | D:{data['d']:.1f} | RSI:{data['rsi']:.1f} | MACD:{data['macd']:.3f}")
                 st.write("**[專屬交易策略]**")
-                st.write(f"💡 基準 ATR 停損: {data['atr_stop_price']:.1f} | 🎯 10% 波段停利: {take_profit_price:.1f} | 📈 季線乖離: {data['bias']:.1f}%")
+                st.write(f"💡 基準 ATR 停損: {data['atr_stop_price']:.1f} | 🎯 10% 波段停利: {data['take_profit_price']:.1f} | 📈 季線乖離: {data['bias']:.1f}%")
 
     # --- 6. 系統燈號與判定定義說明 ---
     st.divider()
