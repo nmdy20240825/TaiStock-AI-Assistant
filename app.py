@@ -105,7 +105,7 @@ def get_institutional_data(code):
     except Exception:
         return {"buy_sell": 0, "days": 0, "trend": "API異常", "avg_ratio": 0, "accumulated_shares": 0}
 
-# --- 3. 持股檔案管理 (新增雲端防重啟預設清單) ---
+# --- 3. 持股檔案管理 ---
 def load_portfolio():
     default_portfolio = {
         "3711": ["日月光投控", 700.48, 20000, 5.0],
@@ -248,11 +248,9 @@ else:
                 max_affordable_shares = int(cap / price)
                 suggested_shares = min(raw_shares, max_affordable_shares)
             
-            # --- 構建新增的高密度顯示欄位 ---
             tech_str = f"{'KD▲' if k > d else 'KD▼'} | {'RSI>50' if rsi > 50 else 'RSI<50'} | {'MA20✓' if step3_pass else 'MA20❌'}"
             risk_str = f"{atr_stop_price:.1f} / {take_profit_price:.1f}" if cost > 0 else "- / -"
             
-            # --- 將新增欄位完美融入原有的資料結構中 ---
             summary_data.append({
                 "代號": code, 
                 "名稱": name, 
@@ -260,7 +258,7 @@ else:
                 "成本": round(cost, 2),
                 "分配資金": f"{cap:,.0f}",
                 "法人動態": inst_trend_display, 
-                "技術面檢核": tech_str,
+                "進場Sop檢核": tech_str,
                 "風控點(損/利)": risk_str,
                 "建議部位": f"{suggested_shares} 股" if status_score == 1 else "-",
                 "終極判定": final_status,
@@ -280,7 +278,7 @@ else:
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
-    # --- 繪製多股戰情總表 (包含新欄位) ---
+    # --- 繪製多股戰情總表 ---
     if summary_data:
         st.markdown("### 📊 持股戰情總表")
         df_summary = pd.DataFrame(summary_data)
