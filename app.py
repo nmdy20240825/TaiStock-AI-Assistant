@@ -186,6 +186,9 @@ else:
             price = float(c.iloc[-1])
             volume = float(v.iloc[-1])
             
+            # --- 新增：計算 5日均量 ---
+            vol_ma5 = float(v.rolling(5).mean().iloc[-1])
+            
             ma10 = float(c.rolling(10).mean().iloc[-1])
             ma20 = float(c.rolling(20).mean().iloc[-1])
             ma60 = float(c.rolling(60).mean().iloc[-1])
@@ -204,46 +207,52 @@ else:
             atr = sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14
             atr = float(atr)
             bias = float(((price - ma60) / ma60) * 100)
-            coeff = float(price / ma20)
             
             inst = get_institutional_data(code)
             
-            # --- AI 決策引擎計分 ---
+            # --- AI 決策引擎 2.0 (階梯式計分與動能檢核) ---
             ai_score = 0
-            # S1 籌碼面 (30%)
-            step1_pass1 = inst['days'] >= 3
-            step1_pass2 = inst['avg_ratio'] >= 15.0
-            if step1_pass1: ai_score += 15
-            if step1_pass2: ai_score += 15
-            step1_pass = step1_pass1 and step1_pass2
             
-            # S2 技術指標 (30%)
-            step2_pass1 = (k > d)
-            step2_pass2 = (rsi > 50)
-            if step2_pass1: ai_score += 15
-            if step2_pass2: ai_score += 15
-            step2_pass = step2_pass1 and step2_pass2
+            # S1 籌碼面 (滿分 30分) - 導入階梯式給分
+            if inst['days'] >= 3: ai_score += 15
+            elif inst['days'] == 2: ai_score += 10
+            elif inst['days'] == 1: ai_score += 5
             
-            # S3 趨勢與防禦 (40%)
-            step3_pass1 = price > ma20
-            step3_pass2 = price <= (ma20 * 1.03)
-            if step3_pass1: ai_score += 20
-            if step3_pass1 and step3_pass2: ai_score += 20
-            step3_pass = step3_pass1 and step3_pass2
+            if inst['avg_ratio'] >= 15.0: ai_score += 15
+            elif inst['avg_ratio'] >= 10.0: ai_score += 10
+            elif inst['avg_ratio'] >= 5.0: ai_score += 5
+                
+            # S2 技術指標 (滿分 30分) - 導入量能檢核
+            if k > d: ai_score += 10
+            if rsi > 50: ai_score += 10
+            if volume > vol_ma5: ai_score += 10  # 新增：量能突破
             
+            # S3 趨勢與防禦 (滿分 40分) - 導入多頭排列保護
+            if price > ma20: ai_score += 15
+            if price <= (ma20 * 1.03): ai_score += 15
+            if ma10 > ma20 and ma20 > ma60: ai_score += 10 # 新增：多頭排列
+            
+            # 確保分數不超過 100
+            ai_score = min(ai_score, 100)
+            
+            # 終極過濾：是否完全達標最核心的進場條件
+            step1_pass = inst['days'] >= 3 and inst['avg_ratio'] >= 15.0
+            step2_pass = k > d and rsi > 50 and volume > vol_ma5
+            step3_pass = price > ma20 and price <= (ma20 * 1.03)
             sop_ready = step1_pass and step2_pass and step3_pass
             
             atr_stop_price = cost - (atr * 2) if cost > 0 else 0
             take_profit_price = cost * 1.10 if cost > 0 else 0
             
+            # --- 手機版 UI 極簡化狀態文字 ---
             if cost > 0 and price <= atr_stop_price:
-                final_status = "🔴 已破停損"
+                final_status = "🔴 破損"
             elif price < ma20 * 0.95:
-                final_status = "🔴 嚴重破線"
+                final_status = "🔴 破線"
             elif sop_ready:
-                final_status = "🟢 允許進場"
+                final_status = "🟢 進場"
             else:
-                final_status = "🟡 觀望等待"
+                final_status = "🟡 觀望"
             
             suggested_shares = 0
             if atr > 0:
@@ -251,7 +260,6 @@ else:
                 max_affordable_shares = int(cap / price)
                 suggested_shares = min(raw_shares, max_affordable_shares)
             
-            sop_str = f"S1:{'✅' if step1_pass else '❌'} | S2:{'✅' if step2_pass else '❌'} | S3:{'✅' if step3_pass else '❌'}"
             risk_str = f"{atr_stop_price:.1f} / {take_profit_price:.1f}" if cost > 0 else "- / -"
             
             summary_data.append({
@@ -260,16 +268,14 @@ else:
                 "現價": round(price, 2), 
                 "成本": round(cost, 2),
                 "AI分數": ai_score,
-                "進場SOP檢核": sop_str,
                 "風控點(損/利)": risk_str,
-                "建議部位": f"{suggested_shares} 股" if final_status == "🟢 允許進場" else "-",
                 "終極判定": final_status
             })
             
             card_data.append({
-                "code": code, "name": name, "cost": cost, "price": price, "volume": volume,
+                "code": code, "name": name, "cost": cost, "price": price, "volume": volume, "vol_ma5": vol_ma5,
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi,
-                "atr": atr, "bias": bias, "coeff": coeff, "inst": inst,
+                "atr": atr, "bias": bias, "inst": inst,
                 "cap": cap, "risk_pct": risk_pct, "risk_amount": risk_amount,
                 "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares,
@@ -282,7 +288,6 @@ else:
     # --- V2.0 戰情儀表板 (Dashboard) ---
     if summary_data:
         df_summary = pd.DataFrame(summary_data)
-        # 依 AI 分數由高至低排序
         df_summary = df_summary.sort_values(by="AI分數", ascending=False).reset_index(drop=True)
         
         st.markdown("### 🎯 盤前決策儀表板")
@@ -293,48 +298,49 @@ else:
         
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric(label="🏆 最佳標的", value=f"{best_stock['名稱']} ({best_stock['代號']})", delta=f"AI 戰力: {best_stock['AI分數']} 分")
+            st.metric(label="🏆 最佳標的", value=f"{best_stock['名稱']} ({best_stock['代號']})", delta=f"戰力: {best_stock['AI分數']} 分")
         with c2:
-            st.metric(label="⚠️ 最弱勢警告", value=f"{worst_stock['名稱']} ({worst_stock['代號']})", delta=f"AI 戰力: {worst_stock['AI分數']} 分", delta_color="inverse")
+            st.metric(label="⚠️ 弱勢警告", value=f"{worst_stock['名稱']} ({worst_stock['代號']})", delta=f"戰力: {worst_stock['AI分數']} 分", delta_color="inverse")
         with c3:
-            st.metric(label="🟢 高分潛力檔數", value=f"{ready_count} 檔", delta="可啟動資金佈局" if ready_count > 0 else "大盤偏弱，耐心等待", delta_color="normal" if ready_count > 0 else "off")
+            st.metric(label="🟢 潛力檔數", value=f"{ready_count} 檔", delta="可佈局" if ready_count > 0 else "耐心等待", delta_color="normal" if ready_count > 0 else "off")
             
-        st.divider()
-        
-        st.markdown("### 📊 AI 總表與雷達清單")
-        st.dataframe(df_summary, use_container_width=True, hide_index=True)
         st.divider()
 
     # --- 繪製個別完整診斷卡片 ---
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
     
+    st.markdown("### 📊 AI 深度解析清單")
     for data in card_data:
         with st.container(border=True):
-            st.subheader(f"{data['name']} ({data['code']}) - AI 分數: {data['ai_score']} / 100")
+            # 引入戰力條設計，直觀顯示 AI 分數
+            st.markdown(f"#### {data['name']} ({data['code']}) - 綜合戰力：{data['ai_score']} 分")
+            st.progress(data['ai_score'] / 100)
             
             if data['cost'] > 0: 
                 if data['price'] <= data['atr_stop_price']:
-                    st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破停損 ({data['atr_stop_price']:.2f})！請執行紀律。")
+                    st.error(f"🚨 **風控警報**：現價 ({data['price']:.2f}) 已跌破停損 ({data['atr_stop_price']:.2f})！")
                 
                 if data['price'] >= data['take_profit_price']:
                     st.success(f"🎉 **停利提醒**：現價 ({data['price']:.2f}) 已達 10% 波段目標 ({data['take_profit_price']:.2f})！")
             
             col_a, col_b, col_c, col_d = st.columns(4)
             col_a.metric("現價", f"{data['price']:.2f}")
-            col_b.metric("法人動能", f"{data['inst']['trend']}")
-            col_c.metric("最終判定", data['final_status'])
-            col_d.metric("建議部位", f"{data['shares']} 股" if data['final_status'] == "🟢 允許進場" else "等待訊號")
+            col_b.metric("法人", f"{data['inst']['trend']}")
+            # 使用精簡字串解決截斷問題
+            col_c.metric("判定", data['final_status'])
+            col_d.metric("部位", f"{data['shares']} 股" if data['final_status'] == "🟢 進場" else "-")
             
-            st.markdown("##### 📋 嚴格進場 SOP 檢核")
-            st.markdown(f"- **Step 1 (30分)**: 法人連買 ≥ 3 天 且 主力佔比 > 15% ➔ {'✅' if data['step1'] else '❌'}")
-            st.markdown(f"- **Step 2 (30分)**: KD 向上且 RSI > 50 ➔ {'✅' if data['step2'] else '❌'}")
-            st.markdown(f"- **Step 3 (40分)**: 收盤價站上 MA20 且乖離 < 3% ➔ {'✅' if data['step3'] else '❌'}")
+            st.markdown("##### 🔬 戰力因子拆解")
+            st.markdown(f"- **S1 籌碼動能**: 法人買超天數與比例 {'🟢' if data['inst']['days'] > 0 else '⚪'} ")
+            st.markdown(f"- **S2 技術量能**: KD向上 / RSI>50 / 放量 {'🟢' if data['step2'] else '⚪'} ")
+            st.markdown(f"- **S3 趨勢防護**: MA20防守 / 多頭排列 {'🟢' if data['step3'] else '⚪'} ")
             
             buy_zone_bottom = data['ma20']
             buy_zone_top = data['ma20'] * 1.03
             st.info(f"🎯 **打擊防守區間 (20MA 突破)**：{buy_zone_bottom:.2f} ~ {buy_zone_top:.2f} 元")
             
             with st.expander("🚦 查看底層技術數據與風控點"):
-                st.write(f"**成交量**: {data['volume']:,.0f} | **MA10**: {data['ma10']:.1f} | **MA20**: {data['ma20']:.1f} | **MA60**: {data['ma60']:.1f}")
-                st.write(f"**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f} | **MACD**: {data['macd']:.3f}")
+                st.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}")
+                st.write(f"**MA10**: {data['ma10']:.1f} | **MA20**: {data['ma20']:.1f} | **MA60**: {data['ma60']:.1f}")
+                st.write(f"**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
                 st.write(f"**基準 ATR 停損**: {data['atr_stop_price']:.1f} | **10% 停利**: {data['take_profit_price']:.1f}")
