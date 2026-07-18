@@ -7,7 +7,7 @@ import numpy as np
 import requests
 import datetime
 
-st.set_page_config(layout="wide", page_title="TaiStock V2 進階決策系統")
+st.set_page_config(layout="wide", page_title="TaiStock V2.5 全自動紀律決策系統")
 
 # --- 1. 報價與技術資料抓取 ---
 @st.cache_data(ttl=300) 
@@ -140,7 +140,6 @@ def save_portfolio(data):
     with open('portfolio.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# 新增：歷史紀錄讀寫功能
 def load_history():
     if not os.path.exists('history.json'): return {}
     with open('history.json', 'r', encoding='utf-8') as f:
@@ -179,14 +178,13 @@ with st.sidebar:
         if del_code in portfolio:
             del portfolio[del_code]
             save_portfolio(portfolio)
-            # 同步清除歷史紀錄
             if del_code in system_history:
                 del system_history[del_code]
                 save_history(system_history)
             st.rerun()
 
 # --- 5. 主面板運算 ---
-st.title("⚡ TaiStock V2 進階決策系統")
+st.title("⚡ TaiStock V2.5 全自動紀律決策系統")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號！")
@@ -242,46 +240,70 @@ else:
             
             inst = get_institutional_data(code)
             
-            ai_score = 0
-            if inst['days'] >= 3: ai_score += 15
-            elif inst['days'] == 2: ai_score += 10
-            elif inst['days'] == 1: ai_score += 5
-            
-            if inst['avg_ratio'] >= 15.0: ai_score += 15
-            elif inst['avg_ratio'] >= 10.0: ai_score += 10
-            elif inst['avg_ratio'] >= 5.0: ai_score += 5
-                
-            if k > d: ai_score += 10
-            if rsi > 50: ai_score += 10
-            if volume > vol_ma5: ai_score += 10
-            
-            if price > ma20: ai_score += 15
-            if price <= (ma20 * 1.03): ai_score += 15
-            is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
-            if is_bull_aligned: ai_score += 10 
-            
-            ai_score = min(ai_score, 100)
-            
-            step1_pass = inst['days'] >= 3 and inst['avg_ratio'] >= 15.0
-            step2_pass = k > d and rsi > 50 and volume > vol_ma5
-            step3_pass = price > ma20 and price <= (ma20 * 1.03)
-            sop_ready = step1_pass and step2_pass and step3_pass
-            
             atr_stop_price = cost - (atr * 2) if cost > 0 else 0
             take_profit_price = cost * 1.10 if cost > 0 else 0
             
-            if cost > 0 and price <= atr_stop_price: final_status = "🔴 破損"
-            elif price < ma20 * 0.95: final_status = "🔴 破線"
-            elif sop_ready: final_status = "🟢 進場"
-            else: final_status = "🟡 觀望"
-
-            if final_status == "🟢 進場": ai_explanation = f"技術面已站穩月線防守區，且多方指標齊聚，配合法人籌碼優勢 ({inst['trend']})，建議可依風控比例啟動首批試單。"
-            elif final_status == "🔴 破線": ai_explanation = "股價已跌破 20MA (月線) 關鍵防守區，短線趨勢轉弱，建議優先收回資金、退場觀望。"
-            elif final_status == "🔴 破損": ai_explanation = f"已觸發 ATR 基準停損警戒線 ({atr_stop_price:.1f})，請務必嚴格執行停損紀律，鎖住單筆虧損風險。"
+            # ===== V2.5 核心戰力公式 (40/30/15/15) =====
+            # 1. 法人動能 (40分)
+            score_inst = min(inst['days'] * 5, 20)
+            accumulated_amount = inst['accumulated_shares'] * price
+            if accumulated_amount >= 3000000000: score_inst += 20
+            elif accumulated_amount >= 1000000000: score_inst += 10
+            elif accumulated_amount >= 500000000: score_inst += 5
+            
+            # 2. 技術面共振 (30分)
+            score_tech = 0
+            if k > d: score_tech += 10
+            if rsi > 50: score_tech += 10
+            if price > ma20: score_tech += 10
+            
+            # 3. 量能強度 (15分)
+            score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
+            
+            # 4. 風控狀態 (15分)
+            score_risk = 0
+            if cost > 0:
+                if price > atr_stop_price:
+                    score_risk += 10
+                    if price >= take_profit_price: 
+                        score_risk += 5
+                    elif price >= cost * 1.05: 
+                        score_risk += 5
             else:
-                if ai_score >= 70: ai_explanation = f"綜合戰力偏高 ({ai_score}分)，法人籌碼已見進駐，惟技術面 SOP 尚未完全達標，建議密切盯盤等待突破契機。"
-                elif is_bull_aligned: ai_explanation = "目前均線維持多頭排列，但短期缺乏強勁籌碼或量能推升，呈現區間震盪整理，建議保持耐心等待。"
-                else: ai_explanation = "籌碼動能與技術面均未見明顯反轉跡象，處於弱勢或整理格局，目前不宜貿然進場。"
+                score_risk = 15 # 若未設定成本，預設滿分
+                
+            ai_score = int(score_inst + score_tech + score_vol + score_risk)
+            
+            # 若跌破停損 -> 戰力直接歸零
+            if cost > 0 and price <= atr_stop_price:
+                ai_score = 0
+            ai_score = min(ai_score, 100)
+            # ============================================
+
+            is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
+            step1_pass = inst['days'] >= 3 or accumulated_amount >= 1000000000
+            step2_pass = k > d and rsi > 50 and volume > vol_ma5
+            step3_pass = price > ma20 and is_bull_aligned
+            
+            # --- 雙向提醒判定 ---
+            if cost > 0 and price <= atr_stop_price: 
+                final_status = "🔴 破損"
+                ai_explanation = f"🚨 已觸發基準停損 ({atr_stop_price:.1f})，戰力歸零，務必嚴格執行紀律退場。"
+            elif cost > 0 and price >= take_profit_price:
+                final_status = "🟢 達標"
+                ai_explanation = f"🎉 股價已達波段停利目標 ({take_profit_price:.1f})，建議分批獲利了結。"
+            elif cost > 0 and price >= cost * 1.05:
+                final_status = "🟡 接近停利"
+                ai_explanation = f"⚠️ 獲利已拉開空間，接近停利目標，可考慮將停損點上調至成本價確保不敗。"
+            elif price < ma20 * 0.95: 
+                final_status = "🔴 破線"
+                ai_explanation = "股價跌破月線防守區，短線趨勢轉弱，建議優先收回資金觀望。"
+            elif ai_score >= 70: 
+                final_status = "🟢 進場"
+                ai_explanation = f"🚀 綜合戰力極強 ({ai_score}分)，法人與技術指標共振，為當日優質潛力標的。"
+            else: 
+                final_status = "🟡 觀望"
+                ai_explanation = f"⏳ 綜合戰力 {ai_score} 分，條件尚未完全齊備，建議密切盯盤等待突破契機。"
             
             suggested_shares = min(int(risk_amount / atr), int(cap / price)) if atr > 0 else 0
             
@@ -292,7 +314,6 @@ else:
             elif price < ma60 and ma20 < ma60: tags.append("❄️弱勢空頭")
             if not tags: tags.append("⏳區間震盪")
             
-            # --- 寫入每日記憶體 ---
             if code not in system_history:
                 system_history[code] = {}
             system_history[code][today_str] = {
@@ -300,7 +321,6 @@ else:
                 "status": final_status,
                 "price": price
             }
-            # 確保檔案不會無限制膨脹，只保留最近 10 天的資料
             if len(system_history[code]) > 10:
                 oldest_date = sorted(system_history[code].keys())[0]
                 del system_history[code][oldest_date]
@@ -326,27 +346,24 @@ else:
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
-    # 迴圈結束，統一儲存歷史軌跡
     save_history(system_history)
             
-    # --- 戰情儀表板 ---
     if summary_data:
         df_summary = pd.DataFrame(summary_data).sort_values(by="AI分數", ascending=False).reset_index(drop=True)
         st.markdown("### 🎯 盤前決策儀表板")
         c1, c2, c3 = st.columns(3)
         with c1: st.metric("🏆 最佳標的", f"{df_summary.iloc[0]['名稱']}", f"戰力: {df_summary.iloc[0]['AI分數']}分")
         with c2: st.metric("⚠️ 弱勢警告", f"{df_summary.iloc[-1]['名稱']}", f"戰力: {df_summary.iloc[-1]['AI分數']}分", delta_color="inverse")
-        with c3: st.metric("🟢 潛力檔數", f"{len(df_summary[df_summary['AI分數']>=80])} 檔", "可佈局" if len(df_summary[df_summary['AI分數']>=80]) > 0 else "耐心等待", delta_color="normal" if len(df_summary[df_summary['AI分數']>=80]) > 0 else "off")
+        with c3: st.metric("🟢 潛力檔數", f"{len(df_summary[df_summary['AI分數']>=70])} 檔", "可佈局" if len(df_summary[df_summary['AI分數']>=70]) > 0 else "耐心等待", delta_color="normal" if len(df_summary[df_summary['AI分數']>=70]) > 0 else "off")
         st.divider()
 
-    # --- Phase 3: AI 深度解析清單 (包含決策時間軸) ---
     st.markdown("### 📊 AI 深度解析清單")
     
+    # 依照新分數進行嚴格排序
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
     
     for data in card_data:
         with st.container(border=True):
-            # 計算與昨日分數的差異，提供視覺回饋
             hist_records = system_history.get(data['code'], {})
             sorted_dates = sorted(hist_records.keys(), reverse=True)
             delta_str = ""
@@ -358,12 +375,19 @@ else:
                 else: delta_str = " (➖ 持平)"
 
             st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])} {delta_str}")
+            
+            # --- SOP 檢核直接整合於清單總表 ---
+            st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：籌碼 {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
+            
             st.progress(data['ai_score'] / 100)
             
+            # 雙向提醒 Alert
             if data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
                 st.error(f"🚨 風控警報：已跌破停損 ({data['atr_stop_price']:.2f})！")
             elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
                 st.success(f"🎉 停利提醒：已達波段目標 ({data['take_profit_price']:.2f})！")
+            elif data['cost'] > 0 and data['price'] >= data['cost'] * 1.05:
+                st.warning(f"🟡 接近停利：目前獲利空間已拉開，請留意出場時機。")
             
             col_a, col_b, col_c, col_d = st.columns(4)
             col_a.metric("現價", f"{data['price']:.2f}")
@@ -380,13 +404,12 @@ else:
             
             st.write("") 
             
-            # --- 擴充 Tabs：加入決策時間軸 ---
             tab1, tab2, tab3, tab4 = st.tabs(["⚙️ SOP與籌碼", "📉 技術數據", "🛡️ 風控點位", "⏳ 決策時間軸"])
             
             with tab1:
                 st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
                 st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
-                st.markdown(f"- **S1 籌碼**: 法人買超與比例 {'🟢' if data['inst']['days']>0 else '⚪'}")
+                st.markdown(f"- **S1 籌碼**: 法人買超與比例 {'🟢' if data['step1'] else '⚪'}")
                 st.markdown(f"- **S2 量能**: KD向上 / RSI>50 / 放量 {'🟢' if data['step2'] else '⚪'}")
                 st.markdown(f"- **S3 趨勢**: MA20防守 / 多頭排列 {'🟢' if data['step3'] else '⚪'}")
                 
@@ -404,17 +427,13 @@ else:
                 st.write(f"**10% 波段停利**: {data['take_profit_price']:.1f}")
                 
             with tab4:
-                # --- 動態渲染歷史軌跡 ---
                 st.markdown("##### 📅 近期戰力與決策軌跡")
                 if len(sorted_dates) == 0:
                     st.write("尚無歷史資料，系統將自今日起開始記錄。")
                 else:
-                    for d in sorted_dates[:5]: # 顯示最近 5 天
+                    for d in sorted_dates[:5]: 
                         h_score = hist_records[d]['score']
                         h_status = hist_records[d]['status']
                         h_price = hist_records[d].get('price', 0)
-                        
-                        # 依據分數給予不同顏色的視覺提示
-                        score_badge = "🟢" if h_score >= 80 else ("🟡" if h_score >= 50 else "🔴")
-                        
+                        score_badge = "🟢" if h_score >= 70 else ("🟡" if h_score >= 40 else "🔴")
                         st.markdown(f"- **{d}**：戰力 {h_score} 分 {score_badge} | 判定：{h_status} | 收盤價：{h_price:.2f}")
