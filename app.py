@@ -9,6 +9,26 @@ import datetime
 
 st.set_page_config(layout="wide", page_title="TaiStock V2.6 全自動紀律決策系統 (台美雙軌)")
 
+# ===== UI 視覺與字體優化模組 =====
+st.markdown("""
+<style>
+/* 強制縮小指標數值與標籤的字體，適應手機版面，並強制允許換行以防截斷 */
+[data-testid="stMetricValue"] {
+    font-size: 18px !important;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 13px !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+}
+/* 縮小標題間距，讓畫面更緊湊 */
+.block-container {
+    padding-top: 2rem !important;
+    padding-bottom: 2rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --- 1. 報價與技術資料抓取 ---
 @st.cache_data(ttl=300) 
 def fetch_stock_data(code):
