@@ -330,13 +330,22 @@ else:
             elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
                 st.success(f"🎉 停利提醒：已達波段目標 ({data['take_profit_price']:.2f})！")
             
-            # --- 擴充為 5 欄位，加入成本顯示 ---
-            col_a, col_b, col_c, col_d, col_e = st.columns(5)
+            # --- 恢復 4 欄位，並將成本設計為標籤放在現價下方 ---
+            col_a, col_b, col_c, col_d = st.columns(4)
             col_a.metric("現價", f"{data['price']:.2f}")
-            col_b.metric("成本", f"{data['cost']:.2f}" if data['cost'] > 0 else "-")
-            col_c.metric("總法人", f"{data['inst']['trend']}")
-            col_d.metric("判定", data['final_status'])
-            col_e.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
+            
+            # 使用 HTML/CSS 縮排向上推，並建立質感標籤
+            cost_str = f"{data['cost']:.2f}" if data['cost'] > 0 else "-"
+            col_a.markdown(
+                f"<div style='margin-top: -15px;'><span style='font-size: 0.85em; color: #94a3b8; background-color: #334155; padding: 2px 6px; border-radius: 4px;'>成本 {cost_str}</span></div>", 
+                unsafe_allow_html=True
+            )
+            
+            col_b.metric("總法人", f"{data['inst']['trend']}")
+            col_c.metric("判定", data['final_status'])
+            col_d.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
+            
+            st.write("") # 增加微小間距避免擠壓下方 Tabs
             
             tab1, tab2, tab3 = st.tabs(["⚙️ SOP與籌碼", "📉 技術數據", "🛡️ 風控點位"])
             
