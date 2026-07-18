@@ -259,10 +259,24 @@ else:
             elif price < ma20 * 0.95: final_status = "🔴 破線"
             elif sop_ready: final_status = "🟢 進場"
             else: final_status = "🟡 觀望"
+
+            # --- Phase 2: 白話文 AI 決策解釋邏輯 ---
+            if final_status == "🟢 進場":
+                ai_explanation = f"技術面已站穩月線防守區，且多方指標齊聚，配合法人籌碼優勢 ({inst['trend']})，建議可依風控比例啟動首批試單。"
+            elif final_status == "🔴 破線":
+                ai_explanation = "股價已跌破 20MA (月線) 關鍵防守區，短線趨勢轉弱，建議優先收回資金、退場觀望。"
+            elif final_status == "🔴 破損":
+                ai_explanation = f"已觸發 ATR 基準停損警戒線 ({atr_stop_price:.1f})，請務必嚴格執行停損紀律，鎖住單筆虧損風險。"
+            else:
+                if ai_score >= 70:
+                    ai_explanation = f"綜合戰力偏高 ({ai_score}分)，法人籌碼已見進駐，惟技術面 SOP 尚未完全達標，建議密切盯盤等待突破契機。"
+                elif is_bull_aligned:
+                    ai_explanation = "目前均線維持多頭排列，但短期缺乏強勁籌碼或量能推升，呈現區間震盪整理，建議保持耐心等待。"
+                else:
+                    ai_explanation = "籌碼動能與技術面均未見明顯反轉跡象，處於弱勢或整理格局，目前不宜貿然進場。"
             
             suggested_shares = min(int(risk_amount / atr), int(cap / price)) if atr > 0 else 0
             
-            # --- Phase 2: AI 股性貼標邏輯 ---
             tags = []
             if inst.get('t_days', 0) >= 3: tags.append("🔥投信作帳")
             if inst.get('f_days', 0) >= 3: tags.append("🌊外資波段")
@@ -284,7 +298,8 @@ else:
                 "cap": cap, "risk_amount": risk_amount,
                 "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares,
-                "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price
+                "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
+                "ai_explanation": ai_explanation
             })
             
         except Exception as e:
@@ -300,10 +315,9 @@ else:
         with c3: st.metric("🟢 潛力檔數", f"{len(df_summary[df_summary['AI分數']>=80])} 檔", "可佈局" if len(df_summary[df_summary['AI分數']>=80]) > 0 else "耐心等待", delta_color="normal" if len(df_summary[df_summary['AI分數']>=80]) > 0 else "off")
         st.divider()
 
-    # --- Phase 2: AI 深度解析清單 (Tabs 模組化與分數排序) ---
+    # --- Phase 2: AI 深度解析清單 ---
     st.markdown("### 📊 AI 深度解析清單")
     
-    # 新增排序邏輯：確保清單嚴格依照 AI 分數由高到低排列
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
     
     for data in card_data:
@@ -322,10 +336,12 @@ else:
             col_c.metric("判定", data['final_status'])
             col_d.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
             
-            # --- 導入 Tabs 分流高密度資訊 ---
             tab1, tab2, tab3 = st.tabs(["⚙️ SOP與籌碼", "📉 技術數據", "🛡️ 風控點位"])
             
             with tab1:
+                # --- 寫入白話文 AI 決策解釋 ---
+                st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
+                
                 st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
                 st.markdown(f"- **S1 籌碼**: 法人買超與比例 {'🟢' if data['inst']['days']>0 else '⚪'}")
                 st.markdown(f"- **S2 量能**: KD向上 / RSI>50 / 放量 {'🟢' if data['step2'] else '⚪'}")
