@@ -330,16 +330,18 @@ else:
             elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
                 st.success(f"🎉 停利提醒：已達波段目標 ({data['take_profit_price']:.2f})！")
             
-            col_a, col_b, col_c, col_d = st.columns(4)
+            # --- 擴充為 5 欄位，加入成本顯示 ---
+            col_a, col_b, col_c, col_d, col_e = st.columns(5)
             col_a.metric("現價", f"{data['price']:.2f}")
-            col_b.metric("總法人", f"{data['inst']['trend']}")
-            col_c.metric("判定", data['final_status'])
-            col_d.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
+            col_b.metric("成本", f"{data['cost']:.2f}" if data['cost'] > 0 else "-")
+            col_c.metric("總法人", f"{data['inst']['trend']}")
+            col_d.metric("判定", data['final_status'])
+            col_e.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
             
             tab1, tab2, tab3 = st.tabs(["⚙️ SOP與籌碼", "📉 技術數據", "🛡️ 風控點位"])
             
             with tab1:
-                # --- 寫入白話文 AI 決策解釋 ---
+                # --- 白話文 AI 決策解釋 ---
                 st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
                 
                 st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
