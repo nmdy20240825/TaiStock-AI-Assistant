@@ -7,7 +7,7 @@ import numpy as np
 import requests
 import datetime
 
-st.set_page_config(layout="wide", page_title="TaiStock V2.6 雙軌全自動紀律決策系統")
+st.set_page_config(layout="wide", page_title="TaiStock V2.6 全自動紀律決策系統 (台美雙軌)")
 
 # --- 1. 報價與技術資料抓取 ---
 @st.cache_data(ttl=300) 
@@ -193,6 +193,80 @@ with st.sidebar:
                 save_history(system_history)
             st.rerun()
 
+# --- 獨立渲染卡片函數 (維持 100% 完整解析) ---
+def render_stock_card(data, system_history):
+    with st.container(border=True):
+        hist_records = system_history.get(data['code'], {})
+        sorted_dates = sorted(hist_records.keys(), reverse=True)
+        delta_str = ""
+        if len(sorted_dates) > 1:
+            yesterday_score = hist_records[sorted_dates[1]]['score']
+            diff = data['ai_score'] - yesterday_score
+            if diff > 0: delta_str = f" (🔺+{diff})"
+            elif diff < 0: delta_str = f" (🔻{diff})"
+            else: delta_str = " (➖ 持平)"
+
+        st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])} {delta_str}")
+        
+        s1_name = "動能" if data['is_us'] else "籌碼"
+        st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{s1_name} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
+        
+        st.progress(data['ai_score'] / 100)
+        
+        if data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
+            st.error(f"🚨 風控警報：已跌破停損 ({data['atr_stop_price']:.2f})！")
+        elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
+            st.success(f"🎉 停利提醒：已達波段目標 ({data['take_profit_price']:.2f})！")
+        elif data['cost'] > 0 and data['price'] >= data['cost'] * 1.05:
+            st.warning(f"🟡 接近停利：目前獲利空間已拉開，請留意出場時機。")
+        
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("現價", f"{data['price']:.2f}")
+        
+        cost_str = f"{data['cost']:.2f}" if data['cost'] > 0 else "-"
+        col_a.markdown(
+            f"<div style='margin-top: -15px;'><span style='font-size: 0.85em; color: #94a3b8; background-color: #334155; padding: 2px 6px; border-radius: 4px;'>成本 {cost_str}</span></div>", 
+            unsafe_allow_html=True
+        )
+        
+        trend_display = data['inst']['trend'] if not data['is_us'] else "美股免看籌碼"
+        col_b.metric("主力/長線", trend_display)
+        col_c.metric("判定", data['final_status'])
+        col_d.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
+        
+        st.write("") 
+        
+        tab_c1, tab_c2, tab_c3, tab_c4 = st.tabs(["⚙️ SOP與核心", "📉 技術數據", "🛡️ 風控點位", "⏳ 決策時間軸"])
+        
+        with tab_c1:
+            st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
+            if not data['is_us']:
+                st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
+                st.markdown(f"- **S1 籌碼**: 法人買超與比例 {'🟢' if data['step1'] else '⚪'}")
+            else:
+                st.markdown(f"- **S1 動能**: 季線之上且 MACD 翻正 {'🟢' if data['step1'] else '⚪'}")
+            st.markdown(f"- **S2 量能**: KD向上 / RSI>50 / 放量 {'🟢' if data['step2'] else '⚪'}")
+            st.markdown(f"- **S3 趨勢**: MA20防守 / 多頭排列 {'🟢' if data['step3'] else '⚪'}")
+            
+        with tab_c2:
+            c_t1, c_t2 = st.columns(2)
+            c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}")
+            c_t1.write(f"**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
+            c_t2.write(f"**MA10**: {data['ma10']:.2f} | **MA20**: {data['ma20']:.2f}")
+            c_t2.write(f"**MA60**: {data['ma60']:.2f} | **季線乖離**: {data['bias']:.2f}%")
+            
+        with tab_c3:
+            st.write(f"**設定成本**: {data['cost']:.2f}")
+            st.write(f"**ATR 波動防禦 (停損)**: {data['atr_stop_price']:.2f} (ATR: {data['atr']:.2f})")
+            st.write(f"**波段動能目標 (停利)**: {data['take_profit_price']:.2f}")
+            st.write(f"**建議投入資金/股數**: {data['risk_amount']:,.0f} 元 / {data['shares']} 股")
+            
+        with tab_c4:
+            st.write("近期決策軌跡:")
+            for dt in sorted_dates[:5]:
+                st.write(f"- {dt}: {hist_records[dt]['status']} (戰力: {hist_records[dt]['score']})")
+
+
 # --- 5. 主面板運算 ---
 st.title("⚡ TaiStock V2.6 全自動紀律決策系統 (台美雙軌)")
 
@@ -257,18 +331,16 @@ else:
             
             # ===== V2.6 雙軌核心戰力公式 =====
             if not is_us_stock:
-                # 台股：嚴格遵循 V2.5 籌碼邏輯
                 score_inst = min(inst['days'] * 5, 20)
                 accumulated_amount = inst['accumulated_shares'] * price
                 if accumulated_amount >= 3000000000: score_inst += 20
                 elif accumulated_amount >= 1000000000: score_inst += 10
                 elif accumulated_amount >= 500000000: score_inst += 5
             else:
-                # 美股：無籌碼，改由「長線動能與趨勢」補足 40 分權重
                 score_inst = 0
-                if price > ma60: score_inst += 20  # 季線之上
-                if macd > 0: score_inst += 10      # MACD 翻正
-                if 0 < bias < 20: score_inst += 10 # 乖離率健康且強勢
+                if price > ma60: score_inst += 20  
+                if macd > 0: score_inst += 10      
+                if 0 < bias < 20: score_inst += 10 
                 
             score_tech = 0
             if k > d: score_tech += 10
@@ -292,7 +364,6 @@ else:
             
             is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
             
-            # 檢核條件針對美股動態微調
             if is_us_stock:
                 step1_pass = price > ma60 and macd > 0
             else:
@@ -413,77 +484,22 @@ else:
     
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
     
-    for data in card_data:
-        with st.container(border=True):
-            hist_records = system_history.get(data['code'], {})
-            sorted_dates = sorted(hist_records.keys(), reverse=True)
-            delta_str = ""
-            if len(sorted_dates) > 1:
-                yesterday_score = hist_records[sorted_dates[1]]['score']
-                diff = data['ai_score'] - yesterday_score
-                if diff > 0: delta_str = f" (🔺+{diff})"
-                elif diff < 0: delta_str = f" (🔻{diff})"
-                else: delta_str = " (➖ 持平)"
+    # 建立市場隔離分頁
+    tab_tw, tab_us = st.tabs(["🇹🇼 台股主力陣列 (籌碼監控)", "🇺🇸 美股科技巨頭 (動能監控)"])
+    
+    with tab_tw:
+        tw_cards = [d for d in card_data if not d['is_us']]
+        if not tw_cards:
+            st.info("目前無台股持股紀錄。")
+        for data in tw_cards:
+            render_stock_card(data, system_history)
 
-            st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])} {delta_str}")
-            
-            s1_name = "動能" if data['is_us'] else "籌碼"
-            st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{s1_name} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
-            
-            st.progress(data['ai_score'] / 100)
-            
-            if data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
-                st.error(f"🚨 風控警報：已跌破停損 ({data['atr_stop_price']:.2f})！")
-            elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
-                st.success(f"🎉 停利提醒：已達波段目標 ({data['take_profit_price']:.2f})！")
-            elif data['cost'] > 0 and data['price'] >= data['cost'] * 1.05:
-                st.warning(f"🟡 接近停利：目前獲利空間已拉開，請留意出場時機。")
-            
-            col_a, col_b, col_c, col_d = st.columns(4)
-            col_a.metric("現價", f"{data['price']:.2f}")
-            
-            cost_str = f"{data['cost']:.2f}" if data['cost'] > 0 else "-"
-            col_a.markdown(
-                f"<div style='margin-top: -15px;'><span style='font-size: 0.85em; color: #94a3b8; background-color: #334155; padding: 2px 6px; border-radius: 4px;'>成本 {cost_str}</span></div>", 
-                unsafe_allow_html=True
-            )
-            
-            trend_display = data['inst']['trend'] if not data['is_us'] else "美股免看籌碼"
-            col_b.metric("主力/長線", trend_display)
-            col_c.metric("判定", data['final_status'])
-            col_d.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
-            
-            st.write("") 
-            
-            tab1, tab2, tab3, tab4 = st.tabs(["⚙️ SOP與核心", "📉 技術數據", "🛡️ 風控點位", "⏳ 決策時間軸"])
-            
-            with tab1:
-                st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
-                if not data['is_us']:
-                    st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
-                    st.markdown(f"- **S1 籌碼**: 法人買超與比例 {'🟢' if data['step1'] else '⚪'}")
-                else:
-                    st.markdown(f"- **S1 動能**: 季線之上且 MACD 翻正 {'🟢' if data['step1'] else '⚪'}")
-                st.markdown(f"- **S2 量能**: KD向上 / RSI>50 / 放量 {'🟢' if data['step2'] else '⚪'}")
-                st.markdown(f"- **S3 趨勢**: MA20防守 / 多頭排列 {'🟢' if data['step3'] else '⚪'}")
-                
-            with tab2:
-                c_t1, c_t2 = st.columns(2)
-                c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}")
-                c_t1.write(f"**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
-                c_t2.write(f"**MA10**: {data['ma10']:.2f} | **MA20**: {data['ma20']:.2f}")
-                c_t2.write(f"**MA60**: {data['ma60']:.2f} | **季線乖離**: {data['bias']:.2f}%")
-                
-            with tab3:
-                st.write(f"**設定成本**: {data['cost']:.2f}")
-                st.write(f"**ATR 波動防禦 (停損)**: {data['atr_stop_price']:.2f} (ATR: {data['atr']:.2f})")
-                st.write(f"**波段動能目標 (停利)**: {data['take_profit_price']:.2f}")
-                st.write(f"**建議投入資金/股數**: {data['risk_amount']:,.0f} 元 / {data['shares']} 股")
-                
-            with tab4:
-                st.write("近期決策軌跡:")
-                for dt in sorted_dates[:5]:
-                    st.write(f"- {dt}: {hist_records[dt]['status']} (戰力: {hist_records[dt]['score']})")
+    with tab_us:
+        us_cards = [d for d in card_data if d['is_us']]
+        if not us_cards:
+            st.info("目前無美股持股紀錄。")
+        for data in us_cards:
+            render_stock_card(data, system_history)
 
 if __name__ == "__main__":
     pass
