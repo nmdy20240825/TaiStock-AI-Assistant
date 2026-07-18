@@ -13,7 +13,6 @@ st.set_page_config(layout="wide", page_title="TaiStock V2.6 全自動紀律決�
 @st.cache_data(ttl=300) 
 def fetch_stock_data(code):
     try:
-        # 自動判斷美股 (純英文字母，如 NVDA, TSM, AAPL)
         if code.isalpha() or code.endswith('.US'):
             ticker = code.replace('.US', '')
             return yf.download(ticker, period="6mo", progress=False)
@@ -39,7 +38,6 @@ def get_institutional_data(code):
         "f_days": 0, "t_days": 0
     }
     
-    # 若為美股，直接回傳預設值，不浪費時間 call API
     if code.isalpha() or code.endswith('.US'):
         default_res["trend"] = "美股無籌碼"
         return default_res
@@ -193,7 +191,7 @@ with st.sidebar:
                 save_history(system_history)
             st.rerun()
 
-# --- 獨立渲染卡片函數 (維持 100% 完整解析) ---
+# --- 獨立渲染卡片函數 ---
 def render_stock_card(data, system_history):
     with st.container(border=True):
         hist_records = system_history.get(data['code'], {})
@@ -213,11 +211,11 @@ def render_stock_card(data, system_history):
         
         st.progress(data['ai_score'] / 100)
         
-        if data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
-            st.error(f"🚨 風控警報：已跌破停損 ({data['atr_stop_price']:.2f})！")
-        elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
-            st.success(f"🎉 停利提醒：已達波段目標 ({data['take_profit_price']:.2f})！")
-        elif data['cost'] > 0 and data['price'] >= data['cost'] * 1.05:
+        if data['final_status'] == "🔥 利潤奔跑":
+            st.success(f"🚀 動態防守啟動！獲利已拉開，防守點上調至月線 ({data['atr_stop_price']:.2f})，不破不賣。")
+        elif data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
+            st.error(f"🚨 風控警報：已跌破防守線 ({data['atr_stop_price']:.2f})！")
+        elif data['cost'] > 0 and data['price'] >= data['cost'] * 1.05 and data['final_status'] != "🔥 利潤奔跑":
             st.warning(f"🟡 接近停利：目前獲利空間已拉開，請留意出場時機。")
         
         col_a, col_b, col_c, col_d = st.columns(4)
@@ -257,8 +255,8 @@ def render_stock_card(data, system_history):
             
         with tab_c3:
             st.write(f"**設定成本**: {data['cost']:.2f}")
-            st.write(f"**ATR 波動防禦 (停損)**: {data['atr_stop_price']:.2f} (ATR: {data['atr']:.2f})")
-            st.write(f"**波段動能目標 (停利)**: {data['take_profit_price']:.2f}")
+            st.write(f"**動態防守/停損**: {data['atr_stop_price']:.2f}")
+            st.write(f"**波段動能目標**: {data['take_profit_price']:.2f}")
             st.write(f"**建議投入資金/股數**: {data['risk_amount']:,.0f} 元 / {data['shares']} 股")
             
         with tab_c4:
@@ -324,8 +322,15 @@ else:
             
             inst = get_institutional_data(code)
             
-            atr_stop_price = cost - (atr * 2) if cost > 0 else 0
-            take_profit_price = cost * 1.10 if cost > 0 else 0
+            # ===== 動態防守線模組 =====
+            if cost > 0 and price > cost * 1.10:
+                # 獲利超過 10% 時啟動：防守線直接上調至月線 (MA20) 或成本價取高者
+                atr_stop_price = max(cost, ma20)
+                take_profit_price = cost * 2.0  # 將靜態停利目標拉高到翻倍
+            else:
+                # 獲利未達 10% 時：維持原始 ATR 波動停損
+                atr_stop_price = cost - (atr * 2) if cost > 0 else 0
+                take_profit_price = cost * 1.10 if cost > 0 else 0
             
             is_us_stock = code.isalpha() or code.endswith('.US')
             
@@ -372,15 +377,20 @@ else:
             step2_pass = k > d and rsi > 50 and volume > vol_ma5
             step3_pass = price > ma20 and is_bull_aligned
             
+            # ===== 狀態判定模組 (導入利潤奔跑) =====
             if cost > 0 and price <= atr_stop_price: 
-                final_status = "🔴 破損"
-                ai_explanation = f"🚨 已觸發基準停損 ({atr_stop_price:.1f})，戰力歸零，務必嚴格執行紀律退場。"
-            elif cost > 0 and price >= take_profit_price:
-                final_status = "🟢 達標"
-                ai_explanation = f"🎉 股價已達波段停利目標 ({take_profit_price:.1f})，建議分批獲利了結。"
+                if price > cost:
+                    final_status = "🔵 停利退場"
+                    ai_explanation = f"🛡️ 股價跌破動態防守線 ({atr_stop_price:.1f})，已成功鎖住波段利潤，請紀律退場。"
+                else:
+                    final_status = "🔴 破損"
+                    ai_explanation = f"🚨 已觸發基準停損 ({atr_stop_price:.1f})，戰力歸零，務必嚴格執行紀律退場。"
+            elif cost > 0 and price >= cost * 1.10:
+                final_status = "🔥 利潤奔跑"
+                ai_explanation = f"🚀 獲利已超過 10%！已啟動動態防守，目前防守點為月線 ({atr_stop_price:.1f})，不破不賣。"
             elif cost > 0 and price >= cost * 1.05:
                 final_status = "🟡 接近停利"
-                ai_explanation = f"⚠️ 獲利已拉開空間，接近停利目標，可考慮將停損點上調至成本價確保不敗。"
+                ai_explanation = f"⚠️ 獲利已拉開空間，建議將停損點上調至成本價確保不敗。"
             elif price < ma20 * 0.95: 
                 final_status = "🔴 破線"
                 ai_explanation = "股價跌破月線防守區，短線趨勢轉弱，建議優先收回資金觀望。"
@@ -457,9 +467,13 @@ else:
             
             for data in card_data:
                 if data['final_status'] == "🔴 破損":
-                    action_sell.append(f"🚨 **停損退場**：{data['name']} ({data['code']}) 現價 {data['price']} 跌破防守點 {data['atr_stop_price']:.1f}，收回資金。")
+                    action_sell.append(f"🚨 **停損退場**：{data['name']} ({data['code']}) 現價 {data['price']:.2f} 跌破防守點 {data['atr_stop_price']:.1f}，收回資金。")
+                elif data['final_status'] == "🔵 停利退場":
+                    action_sell.append(f"🛡️ **紀律停利**：{data['name']} ({data['code']}) 現價 {data['price']:.2f} 跌破動態防守線 {data['atr_stop_price']:.1f}，鎖住利潤。")
                 elif data['final_status'] == "🟢 達標":
                     action_sell.append(f"🎉 **獲利了結**：{data['name']} ({data['code']}) 達波段目標 {data['take_profit_price']:.1f}，執行分批停利。")
+                elif data['final_status'] == "🔥 利潤奔跑":
+                    action_watch.append(f"🚀 **獲利續抱**：{data['name']} ({data['code']}) 啟動動態防守，月線 {data['atr_stop_price']:.1f} 不破不賣！")
                 elif data['final_status'] == "🟢 進場":
                     action_buy.append(f"🎯 **進場佈局**：{data['name']} ({data['code']}) 戰力達 {data['ai_score']} 分，建議部位：{data['shares']} 股。")
                 elif data['final_status'] == "🟡 接近停利":
@@ -484,7 +498,6 @@ else:
     
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
     
-    # 建立市場隔離分頁
     tab_tw, tab_us = st.tabs(["🇹🇼 台股主力陣列 (籌碼監控)", "🇺🇸 美股科技巨頭 (動能監控)"])
     
     with tab_tw:
