@@ -47,7 +47,8 @@ def get_institutional_data(code):
         
         default_res = {
             "buy_sell": 0, "days": 0, "trend": "資料不足", "avg_ratio": 0, 
-            "accumulated_shares": 0, "foreign_trend": "無", "trust_trend": "無"
+            "accumulated_shares": 0, "foreign_trend": "無資料", "trust_trend": "無資料",
+            "f_days": 0, "t_days": 0
         }
         
         if data.get("msg") != "success" or not data.get("data") or stock_data.empty:
@@ -59,9 +60,9 @@ def get_institutional_data(code):
         # 總和計算
         daily_net = df_inst.groupby('date')['net_buy'].sum().sort_index(ascending=False)
         
-        # 拆解外資與投信
-        foreign_mask = df_inst['name'].str.contains('外資', na=False)
-        trust_mask = df_inst['name'].str.contains('投信', na=False)
+        # 拆解外資與投信 (導入中英文雙重辨識容錯)
+        foreign_mask = df_inst['name'].str.contains('外資|Foreign', case=False, na=False)
+        trust_mask = df_inst['name'].str.contains('投信|Investment', case=False, na=False)
         
         df_foreign = df_inst[foreign_mask].groupby('date')['net_buy'].sum().sort_index(ascending=False)
         df_trust = df_inst[trust_mask].groupby('date')['net_buy'].sum().sort_index(ascending=False)
@@ -299,8 +300,12 @@ else:
         with c3: st.metric("🟢 潛力檔數", f"{len(df_summary[df_summary['AI分數']>=80])} 檔", "可佈局" if len(df_summary[df_summary['AI分數']>=80]) > 0 else "耐心等待", delta_color="normal" if len(df_summary[df_summary['AI分數']>=80]) > 0 else "off")
         st.divider()
 
-    # --- Phase 2: AI 深度解析清單 (Tabs 模組化) ---
+    # --- Phase 2: AI 深度解析清單 (Tabs 模組化與分數排序) ---
     st.markdown("### 📊 AI 深度解析清單")
+    
+    # 新增排序邏輯：確保清單嚴格依照 AI 分數由高到低排列
+    card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
+    
     for data in card_data:
         with st.container(border=True):
             st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])}")
