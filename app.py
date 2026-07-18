@@ -243,49 +243,38 @@ else:
             atr_stop_price = cost - (atr * 2) if cost > 0 else 0
             take_profit_price = cost * 1.10 if cost > 0 else 0
             
-            # ===== V2.5 核心戰力公式 (40/30/15/15) =====
-            # 1. 法人動能 (40分)
+            # ===== V2.5 核心戰力公式 =====
             score_inst = min(inst['days'] * 5, 20)
             accumulated_amount = inst['accumulated_shares'] * price
             if accumulated_amount >= 3000000000: score_inst += 20
             elif accumulated_amount >= 1000000000: score_inst += 10
             elif accumulated_amount >= 500000000: score_inst += 5
             
-            # 2. 技術面共振 (30分)
             score_tech = 0
             if k > d: score_tech += 10
             if rsi > 50: score_tech += 10
             if price > ma20: score_tech += 10
             
-            # 3. 量能強度 (15分)
             score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
             
-            # 4. 風控狀態 (15分)
             score_risk = 0
             if cost > 0:
                 if price > atr_stop_price:
                     score_risk += 10
-                    if price >= take_profit_price: 
-                        score_risk += 5
-                    elif price >= cost * 1.05: 
-                        score_risk += 5
+                    if price >= take_profit_price: score_risk += 5
+                    elif price >= cost * 1.05: score_risk += 5
             else:
-                score_risk = 15 # 若未設定成本，預設滿分
+                score_risk = 15 
                 
             ai_score = int(score_inst + score_tech + score_vol + score_risk)
-            
-            # 若跌破停損 -> 戰力直接歸零
-            if cost > 0 and price <= atr_stop_price:
-                ai_score = 0
+            if cost > 0 and price <= atr_stop_price: ai_score = 0
             ai_score = min(ai_score, 100)
-            # ============================================
-
+            
             is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
             step1_pass = inst['days'] >= 3 or accumulated_amount >= 1000000000
             step2_pass = k > d and rsi > 50 and volume > vol_ma5
             step3_pass = price > ma20 and is_bull_aligned
             
-            # --- 雙向提醒判定 ---
             if cost > 0 and price <= atr_stop_price: 
                 final_status = "🔴 破損"
                 ai_explanation = f"🚨 已觸發基準停損 ({atr_stop_price:.1f})，戰力歸零，務必嚴格執行紀律退場。"
@@ -357,9 +346,41 @@ else:
         with c3: st.metric("🟢 潛力檔數", f"{len(df_summary[df_summary['AI分數']>=70])} 檔", "可佈局" if len(df_summary[df_summary['AI分數']>=70]) > 0 else "耐心等待", delta_color="normal" if len(df_summary[df_summary['AI分數']>=70]) > 0 else "off")
         st.divider()
 
+    # --- 新增：每日紀律檢核清單 (SOP) ---
+    if card_data:
+        st.markdown("### ✅ 每日紀律檢核清單 (SOP)")
+        with st.expander("展開今日操作任務", expanded=True):
+            action_sell = [] 
+            action_buy = [] 
+            action_watch = [] 
+            
+            for data in card_data:
+                if data['final_status'] == "🔴 破損":
+                    action_sell.append(f"🚨 **停損退場**：{data['name']} ({data['code']}) 現價 {data['price']} 跌破防守點 {data['atr_stop_price']:.1f}，收回資金。")
+                elif data['final_status'] == "🟢 達標":
+                    action_sell.append(f"🎉 **獲利了結**：{data['name']} ({data['code']}) 達波段目標 {data['take_profit_price']:.1f}，執行分批停利。")
+                elif data['final_status'] == "🟢 進場":
+                    action_buy.append(f"🎯 **進場佈局**：{data['name']} ({data['code']}) 戰力達 {data['ai_score']} 分，建議部位：{data['shares']} 股。")
+                elif data['final_status'] == "🟡 接近停利":
+                    action_watch.append(f"⚠️ **防守上調**：{data['name']} ({data['code']}) 獲利脫離成本，將停損設為成本價。")
+                elif data['final_status'] == "🔴 破線":
+                    action_watch.append(f"📉 **弱勢預警**：{data['name']} ({data['code']}) 跌破月線，確認是否減碼。")
+
+            st.markdown("#### 🟥 優先執行 (風控與停利)")
+            if not action_sell: st.write("✅ 今日無急迫停損/停利需求")
+            for i, task in enumerate(action_sell): st.checkbox(task, key=f"sell_{i}")
+            
+            st.markdown("#### 🟩 佈局清單 (高勝率機會)")
+            if not action_buy: st.write("⏸️ 今日無符合標準的進場標的，耐心等待")
+            for i, task in enumerate(action_buy): st.checkbox(task, key=f"buy_{i}")
+            
+            st.markdown("#### 🟨 觀察追蹤 (防守與調整)")
+            if not action_watch: st.write("👀 目前無特別需要調整的持股")
+            for i, task in enumerate(action_watch): st.checkbox(task, key=f"watch_{i}")
+        st.divider()
+
     st.markdown("### 📊 AI 深度解析清單")
     
-    # 依照新分數進行嚴格排序
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
     
     for data in card_data:
@@ -376,12 +397,10 @@ else:
 
             st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])} {delta_str}")
             
-            # --- SOP 檢核直接整合於清單總表 ---
             st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：籌碼 {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
             
             st.progress(data['ai_score'] / 100)
             
-            # 雙向提醒 Alert
             if data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
                 st.error(f"🚨 風控警報：已跌破停損 ({data['atr_stop_price']:.2f})！")
             elif data['cost'] > 0 and data['price'] >= data['take_profit_price']:
