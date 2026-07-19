@@ -7,7 +7,7 @@ import numpy as np
 import requests
 import datetime
 
-st.set_page_config(layout="wide", page_title="TaiStock V2.7-P1 全自動紀律決策系統")
+st.set_page_config(layout="wide", page_title="TaiStock V2.7-P2 全自動紀律決策系統")
 
 # ===== UI 視覺與字體優化模組 =====
 st.markdown("""
@@ -25,6 +25,14 @@ st.markdown("""
 .block-container {
     padding-top: 2rem !important;
     padding-bottom: 2rem !important;
+}
+/* 增強 AI 建議清單的排版 */
+.ai-advice-box {
+    background-color: #1e293b;
+    padding: 15px;
+    border-radius: 8px;
+    border-left: 5px solid #3b82f6;
+    margin-bottom: 15px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -217,7 +225,7 @@ def render_stock_card(data, system_history):
         hist_records = system_history.get(data['code'], {})
         sorted_dates = sorted(hist_records.keys(), reverse=True)
         delta_str = ""
-        # 歷史變化追蹤 (Phase 1 升級)
+        # 歷史變化追蹤
         if len(sorted_dates) > 1:
             yesterday_score = hist_records[sorted_dates[1]]['score']
             diff = data['ai_score'] - yesterday_score
@@ -232,13 +240,6 @@ def render_stock_card(data, system_history):
         
         st.progress(data['ai_score'] / 100)
         
-        if data['final_status'] == "🔥 利潤奔跑":
-            st.success(f"🚀 動態防守啟動！獲利已拉開，防守點上調至月線 ({data['atr_stop_price']:.2f})，不破不賣。")
-        elif data['cost'] > 0 and data['price'] <= data['atr_stop_price']:
-            st.error(f"🚨 風控警報：已跌破防守線 ({data['atr_stop_price']:.2f})！")
-        elif data['cost'] > 0 and data['price'] >= data['cost'] * 1.05 and data['final_status'] != "🔥 利潤奔跑":
-            st.warning(f"🟡 接近停利：目前獲利空間已拉開，請留意出場時機。")
-        
         col_a, col_b, col_c, col_d = st.columns(4)
         col_a.metric("現價", f"{data['price']:.2f}")
         
@@ -248,19 +249,27 @@ def render_stock_card(data, system_history):
             unsafe_allow_html=True
         )
         
-        trend_display = data['inst']['trend'] if not data['is_us'] else "美股免看籌碼"
-        col_b.metric("主力/長線", trend_display)
+        # 多空分水嶺 (Phase 2 升級：直接顯示於卡片主視覺)
+        pivot_color = "normal" if data['pivot_status'] == "🟢 站上" else "inverse"
+        col_b.metric("多空分水嶺", f"{data['pivot_point']:.2f}", data['pivot_status'], delta_color=pivot_color)
+        
         col_c.metric("判定", data['final_status'])
         col_d.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
         
         st.write("") 
         
-        tab_c1, tab_c2, tab_c3, tab_c4 = st.tabs(["⚙️ SOP與核心", "📉 技術數據", "🛡️ 風控點位", "⏳ 決策時間軸"])
+        tab_c1, tab_c2, tab_c3, tab_c4 = st.tabs(["⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "⏳ 決策時間軸"])
         
         with tab_c1:
-            st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
+            # 具體可執行的 AI 結論與信心 (Phase 2 升級)
+            advice_html = f"""
+            <div class='ai-advice-box'>
+                <div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>
+                {''.join([f"<div style='margin-bottom: 4px;'>{item}</div>" for item in data['ai_advice']])}
+            </div>
+            """
+            st.markdown(advice_html, unsafe_allow_html=True)
             
-            # AI 分數拆解 (Phase 1 升級)
             st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
             st.code(f"籌碼/長線: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
 
@@ -327,6 +336,13 @@ else:
             volume = float(v.iloc[-1])
             vol_ma5 = float(v.rolling(5).mean().iloc[-1])
             
+            # 多空分水嶺計算 (Phase 2: Pivot Point = 前高+前低+前收 / 3)
+            if len(h) >= 2:
+                pivot_point = (float(h.iloc[-2]) + float(l.iloc[-2]) + float(c.iloc[-2])) / 3
+            else:
+                pivot_point = price
+            pivot_status = "🟢 站上" if price > pivot_point else "🔴 未站上"
+
             ma10 = float(c.rolling(10).mean().iloc[-1])
             ma20 = float(c.rolling(20).mean().iloc[-1])
             ma60 = float(c.rolling(60).mean().iloc[-1])
@@ -348,7 +364,6 @@ else:
             
             inst = get_institutional_data(code)
             
-            # ===== 動態防守線模組 =====
             if cost > 0 and price > cost * 1.10:
                 atr_stop_price = max(cost, ma20)
                 take_profit_price = cost * 2.0  
@@ -358,7 +373,6 @@ else:
             
             is_us_stock = code.isalpha() or code.endswith('.US')
             
-            # ===== 戰力拆解與計算 (Phase 1 紀錄) =====
             if not is_us_stock:
                 score_inst = min(inst['days'] * 5, 20)
                 accumulated_amount = inst['accumulated_shares'] * price
@@ -393,6 +407,12 @@ else:
             
             is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
             
+            # 決策信心計算 (Phase 2)
+            confidence_base = ai_score * 0.8
+            if is_bull_aligned: confidence_base += 10
+            if price > pivot_point: confidence_base += 5
+            confidence = min(99, max(10, int(confidence_base)))
+
             if is_us_stock:
                 step1_pass = price > ma60 and macd > 0
             else:
@@ -401,29 +421,65 @@ else:
             step2_pass = k > d and rsi > 50 and volume > vol_ma5
             step3_pass = price > ma20 and is_bull_aligned
             
-            # ===== 狀態判定模組 =====
+            # ===== 具體 AI 結論與行動清單 (Phase 2 升級) =====
+            ai_advice = []
             if cost > 0 and price <= atr_stop_price: 
                 if price > cost:
                     final_status = "🔵 停利退場"
-                    ai_explanation = f"🛡️ 股價跌破動態防守線 ({atr_stop_price:.1f})，已成功鎖住波段利潤，請紀律退場。"
+                    ai_advice = [
+                        "✓ 建議：立即執行紀律停利",
+                        f"✓ 依據：股價跌破動態防守線 ({atr_stop_price:.1f})",
+                        "✓ 狀態：已成功鎖住波段利潤，全數收回資金",
+                        f"🎯 決策信心：{confidence}%"
+                    ]
                 else:
                     final_status = "🔴 破損"
-                    ai_explanation = f"🚨 已觸發基準停損 ({atr_stop_price:.1f})，戰力歸零，務必嚴格執行紀律退場。"
+                    ai_advice = [
+                        "✓ 建議：執行基準停損，絕不凹單",
+                        f"✓ 依據：觸發初始防守點 ({atr_stop_price:.1f})",
+                        "✓ 狀態：戰力歸零，優先保護本金",
+                        f"🎯 決策信心：{confidence}%"
+                    ]
             elif cost > 0 and price >= cost * 1.10:
                 final_status = "🔥 利潤奔跑"
-                ai_explanation = f"🚀 獲利已超過 10%！已啟動動態防守，目前防守點為月線 ({atr_stop_price:.1f})，不破不賣。"
+                ai_advice = [
+                        "✓ 建議：獲利續抱，不預設高點",
+                        f"✓ 依據：已啟動動態防守，目前防守點上調至月線 ({atr_stop_price:.1f})",
+                        "✓ 狀態：獲利脫離成本區超過 10%",
+                        f"🎯 決策信心：{confidence}% (趨勢保護中)"
+                    ]
             elif cost > 0 and price >= cost * 1.05:
                 final_status = "🟡 接近停利"
-                ai_explanation = f"⚠️ 獲利已拉開空間，建議將停損點上調至成本價確保不敗。"
+                ai_advice = [
+                        "✓ 建議：將停損點無條件上調至「成本價」",
+                        "✓ 依據：獲利空間已拉開，確保這筆交易立於不敗",
+                        "✓ 狀態：耐心等待達標或轉勢",
+                        f"🎯 決策信心：{confidence}%"
+                    ]
             elif price < ma20 * 0.95: 
                 final_status = "🔴 破線"
-                ai_explanation = "股價跌破月線防守區，短線趨勢轉弱，建議優先收回資金觀望。"
+                ai_advice = [
+                        "✓ 建議：考慮預防性減碼或空手觀望",
+                        "✓ 依據：股價明顯跌破月線防守區，短線趨勢轉弱",
+                        "✓ 狀態：避開資金閒置風險",
+                        f"🎯 決策信心：{100 - confidence}% (偏空防守)"
+                    ]
             elif ai_score >= 70: 
                 final_status = "🟢 進場"
-                ai_explanation = f"🚀 綜合戰力極強 ({ai_score}分)，各項指標共振，為當日優質潛力標的。"
+                ai_advice = [
+                        f"✓ 建議：可分批進場佈局，預計投入 {risk_amount:,.0f} 元",
+                        "✓ 依據：綜合戰力強勢，各項指標發生共振",
+                        f"✓ 狀態：防守線預設為 {atr_stop_price:.1f}",
+                        f"🎯 決策信心：{confidence}% (極高勝率)"
+                    ]
             else: 
                 final_status = "🟡 觀望"
-                ai_explanation = f"⏳ 綜合戰力 {ai_score} 分，條件尚未完全齊備，建議密切盯盤等待突破契機。"
+                ai_advice = [
+                        "✓ 建議：保持空手，密切盯盤等待",
+                        "✓ 依據：條件尚未完全齊備，動能不足",
+                        "✓ 狀態：將標的保留在觀察清單中",
+                        f"🎯 決策信心：{confidence}%"
+                    ]
             
             suggested_shares = min(int(risk_amount / atr), int(cap / price)) if atr > 0 else 0
             
@@ -463,9 +519,9 @@ else:
                 "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares,
                 "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
-                "ai_explanation": ai_explanation,
+                "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status,
                 "is_us": is_us_stock,
-                "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk # 傳遞拆解分數
+                "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk 
             })
             
         except Exception as e:
@@ -473,7 +529,7 @@ else:
             
     save_history(system_history)
 
-    # ===== 持股健康度總覽 (Phase 1 升級) =====
+    # ===== 持股健康度總覽 =====
     if summary_data:
         health_green = len([d for d in summary_data if "進場" in d['判定'] or "奔跑" in d['判定']])
         health_yellow = len([d for d in summary_data if "觀望" in d['判定'] or "接近" in d['判定']])
