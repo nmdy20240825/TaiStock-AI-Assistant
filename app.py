@@ -7,7 +7,7 @@ import numpy as np
 import requests
 import datetime
 
-st.set_page_config(layout="wide", page_title="TaiStock V2.6 全自動紀律決策系統 (台美雙軌)")
+st.set_page_config(layout="wide", page_title="TaiStock V2.7-P1 全自動紀律決策系統")
 
 # ===== UI 視覺與字體優化模組 =====
 st.markdown("""
@@ -217,14 +217,15 @@ def render_stock_card(data, system_history):
         hist_records = system_history.get(data['code'], {})
         sorted_dates = sorted(hist_records.keys(), reverse=True)
         delta_str = ""
+        # 歷史變化追蹤 (Phase 1 升級)
         if len(sorted_dates) > 1:
             yesterday_score = hist_records[sorted_dates[1]]['score']
             diff = data['ai_score'] - yesterday_score
-            if diff > 0: delta_str = f" (🔺+{diff})"
-            elif diff < 0: delta_str = f" (🔻{diff})"
-            else: delta_str = " (➖ 持平)"
+            if diff > 0: delta_str = f" <span style='color: #4ade80;'>(🔺+{diff})</span>"
+            elif diff < 0: delta_str = f" <span style='color: #f87171;'>(🔻{diff})</span>"
+            else: delta_str = " <span style='color: #94a3b8;'>(➖ 持平)</span>"
 
-        st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])} {delta_str}")
+        st.markdown(f"#### {data['name']} ({data['code']}) - {' '.join(data['tags'][:2])}{delta_str}", unsafe_allow_html=True)
         
         s1_name = "動能" if data['is_us'] else "籌碼"
         st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{s1_name} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
@@ -258,6 +259,11 @@ def render_stock_card(data, system_history):
         
         with tab_c1:
             st.info(f"**🤖 AI 總結**：{data['ai_explanation']}")
+            
+            # AI 分數拆解 (Phase 1 升級)
+            st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
+            st.code(f"籌碼/長線: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
+
             if not data['is_us']:
                 st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
                 st.markdown(f"- **S1 籌碼**: 法人買超與比例 {'🟢' if data['step1'] else '⚪'}")
@@ -286,7 +292,7 @@ def render_stock_card(data, system_history):
 
 
 # --- 5. 主面板運算 ---
-st.title("⚡ TaiStock V2.6 全自動紀律決策系統 (台美雙軌)")
+st.title("⚡ TaiStock V2.7 全自動紀律決策系統")
 
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號！")
@@ -344,17 +350,15 @@ else:
             
             # ===== 動態防守線模組 =====
             if cost > 0 and price > cost * 1.10:
-                # 獲利超過 10% 時啟動：防守線直接上調至月線 (MA20) 或成本價取高者
                 atr_stop_price = max(cost, ma20)
-                take_profit_price = cost * 2.0  # 將靜態停利目標拉高到翻倍
+                take_profit_price = cost * 2.0  
             else:
-                # 獲利未達 10% 時：維持原始 ATR 波動停損
                 atr_stop_price = cost - (atr * 2) if cost > 0 else 0
                 take_profit_price = cost * 1.10 if cost > 0 else 0
             
             is_us_stock = code.isalpha() or code.endswith('.US')
             
-            # ===== V2.6 雙軌核心戰力公式 =====
+            # ===== 戰力拆解與計算 (Phase 1 紀錄) =====
             if not is_us_stock:
                 score_inst = min(inst['days'] * 5, 20)
                 accumulated_amount = inst['accumulated_shares'] * price
@@ -397,7 +401,7 @@ else:
             step2_pass = k > d and rsi > 50 and volume > vol_ma5
             step3_pass = price > ma20 and is_bull_aligned
             
-            # ===== 狀態判定模組 (導入利潤奔跑) =====
+            # ===== 狀態判定模組 =====
             if cost > 0 and price <= atr_stop_price: 
                 if price > cost:
                     final_status = "🔵 停利退場"
@@ -460,13 +464,27 @@ else:
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares,
                 "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
                 "ai_explanation": ai_explanation,
-                "is_us": is_us_stock
+                "is_us": is_us_stock,
+                "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk # 傳遞拆解分數
             })
             
         except Exception as e:
             st.error(f"分析 {code} 發生錯誤: {e}")
             
     save_history(system_history)
+
+    # ===== 持股健康度總覽 (Phase 1 升級) =====
+    if summary_data:
+        health_green = len([d for d in summary_data if "進場" in d['判定'] or "奔跑" in d['判定']])
+        health_yellow = len([d for d in summary_data if "觀望" in d['判定'] or "接近" in d['判定']])
+        health_red = len([d for d in summary_data if "破" in d['判定'] or "退場" in d['判定']])
+        
+        st.markdown("### 🌟 持股健康度總覽")
+        hc1, hc2, hc3 = st.columns(3)
+        hc1.metric("🟢 優勢/奔跑 (強勢)", f"{health_green} 檔")
+        hc2.metric("🟡 觀望/警戒 (震盪)", f"{health_yellow} 檔")
+        hc3.metric("🔴 破線/停損 (弱勢)", f"{health_red} 檔")
+        st.divider()
             
     if summary_data:
         df_summary = pd.DataFrame(summary_data).sort_values(by="AI分數", ascending=False).reset_index(drop=True)
