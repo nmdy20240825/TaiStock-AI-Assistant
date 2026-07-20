@@ -104,7 +104,6 @@ def get_institutional_data(code):
 
 # --- 4. 檔案與設定 ---
 def load_portfolio():
-    # 預設資料已改為字典格式，確保具備 status 欄位
     default = {
         "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active"}, 
         "2317": {"name": "鴻海", "cost": 210.0, "cap": 20000, "risk": 5.0, "status": "Active"}, 
@@ -114,7 +113,6 @@ def load_portfolio():
     with open('portfolio.json', 'r', encoding='utf-8') as f:
         try: 
             data = json.load(f)
-            # 【新功能 1】自動格式兼容：將舊版陣列自動轉為新版字典格式，避免 JSON 解析報錯
             for k, v in data.items():
                 if isinstance(v, list):
                     name = v[0] if len(v) > 0 else ""
@@ -150,8 +148,11 @@ with st.sidebar:
         if st.form_submit_button("更新設定"):
             if new_code:
                 fetch_stock_data.clear(); get_institutional_data.clear()
-                # 儲存為新的字典格式，加入 status 狀態
+                # 保留可能的 break_date
+                existing_break_date = portfolio.get(new_code, {}).get('break_date') if isinstance(portfolio.get(new_code), dict) else None
                 portfolio[new_code] = {"name": new_name, "cost": new_cost, "cap": new_cap, "risk": new_risk, "status": "Active"}
+                if existing_break_date:
+                    portfolio[new_code]['break_date'] = existing_break_date
                 save_portfolio(portfolio)
                 st.rerun()
     del_code = st.selectbox("刪除持股", [""] + list(portfolio.keys()))
@@ -174,9 +175,9 @@ def render_stock_card(data, system_history, portfolio_data):
             elif diff < 0: delta_str = f" <span style='color: #f87171;'>(🔻{diff})</span>"
             else: delta_str = " <span style='color: #94a3b8;'>(➖ 持平)</span>"
             
-        # 【新功能 2】自動判斷是否破線，並在標題加入🚨破線標示
-        is_broken = data['final_status'] in ["🔴 破損", "🔴 破線"]
-        broken_label = " <span style='color: red;'>[🚨破線]</span>" if is_broken else ""
+        # 判斷是否破線或虧損，加入🚨標示
+        is_broken = data['final_status'] in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]
+        broken_label = " <span style='color: red;'>[🚨預警]</span>" if is_broken else ""
 
         st.markdown(f"#### {data['name']} ({data['code']}){broken_label} - {' '.join(data['tags'][:2])}{delta_str}", unsafe_allow_html=True)
         st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{'動能' if data['is_us'] else '籌碼'} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
@@ -190,11 +191,14 @@ def render_stock_card(data, system_history, portfolio_data):
         
         with col_d:
             st.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
-            # 【新功能 3】一鍵出清歸檔按鈕
-            if st.button("🚀 出清歸檔", key=f"close_{data['code']}"):
-                portfolio_data[data['code']]['status'] = "Closed"
-                save_portfolio(portfolio_data)
-                st.rerun()
+            # 【完美修正】：手動歸檔按鈕僅在需退場或虧損時顯示，消弭語意衝突
+            if data['final_status'] in ["🔵 停利退場", "🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]:
+                if st.button("📦 手動歸檔 (已結算)", key=f"close_{data['code']}"):
+                    portfolio_data[data['code']]['status'] = "Closed"
+                    if 'break_date' in portfolio_data[data['code']]:
+                        del portfolio_data[data['code']]['break_date']
+                    save_portfolio(portfolio_data)
+                    st.rerun()
         
         st.write("") 
         tab_c1, tab_c2, tab_c3, tab_c4 = st.tabs(["⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "📈 決策時間軸"])
@@ -212,7 +216,6 @@ def render_stock_card(data, system_history, portfolio_data):
         with tab_c3:
             st.write(f"**設定成本**: {data['cost']:.2f}\n**動態防守/停損**: {data['atr_stop_price']:.2f}\n**波段動能目標**: {data['take_profit_price']:.2f}")
         with tab_c4:
-            # ===== Phase 3.5 決策時間軸視覺化 =====
             if len(sorted_dates) > 1:
                 chart_data = pd.DataFrame([{"Date": d, "Score": hist_records[d]['score']} for d in sorted_dates[:10]]).set_index("Date").sort_index()
                 st.write("**📈 近期戰力動能曲線**")
@@ -249,7 +252,6 @@ else:
     summary_data, card_data = [], []
 
     for code, info in list(portfolio.items()):
-        # 兼容字典格式並過濾已結算個股
         if isinstance(info, dict):
             if info.get('status') == 'Closed': continue
             name, cost, cap, risk_pct = info.get('name', ''), info.get('cost', 0.0), info.get('cap', 20000.0), info.get('risk', 5.0)
@@ -304,9 +306,14 @@ else:
             step2_pass, step3_pass = (k > d and rsi > 50 and volume > vol_ma5), (price > ma20 and is_bull_aligned)
             
             ai_advice = []
+            
+            # 【完美修正】：絕對成本防禦，覆蓋所有技術面樂觀訊號
             if cost > 0 and price <= atr_stop_price: 
                 final_status = "🔵 停利退場" if price > cost else "🔴 破損"
                 ai_advice = [f"✓ 建議：{'立即執行紀律停利' if price > cost else '執行基準停損，絕不凹單'}", f"✓ 依據：股價跌破防守線 ({atr_stop_price:.1f})", "✓ 狀態：收回資金保護本金", f"🎯 決策信心：{confidence}%"]
+            elif cost > 0 and price < cost:
+                final_status = "⚠️ 帳面虧損"
+                ai_advice = ["✓ 建議：注意資金控管，跌破防守線前最後警戒", f"✓ 依據：現價跌破設定成本 ({cost:.2f})", "✓ 狀態：已產生實質帳面虧損，紀律優先", f"🎯 決策信心：0% (防禦狀態)"]
             elif cost > 0 and price >= cost * 1.10:
                 final_status = "🔥 利潤奔跑"
                 ai_advice = ["✓ 建議：獲利續抱，不預設高點", f"✓ 依據：防守點上調至月線 ({atr_stop_price:.1f})", "✓ 狀態：獲利超過 10%", f"🎯 決策信心：{confidence}% (趨勢保護)"]
@@ -325,6 +332,16 @@ else:
                 
             if macro_warning: ai_advice.append(f"<span style='color: #fbbf24;'>{macro_warning}</span>")
             suggested_shares = min(int(risk_amount / atr), int(cap / price)) if atr > 0 else 0
+            
+            # 【完美修正】：實作破線時間戳記寫入與清除
+            if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]:
+                if isinstance(portfolio[code], dict) and 'break_date' not in portfolio[code]:
+                    portfolio[code]['break_date'] = today_str
+                    save_portfolio(portfolio)
+            else:
+                if isinstance(portfolio[code], dict) and 'break_date' in portfolio[code]:
+                    del portfolio[code]['break_date']
+                    save_portfolio(portfolio)
             
             tags = ["🦅美股科技" if is_us_stock else ("🔥投信作帳" if inst.get('t_days', 0) >= 3 else "🌊外資波段")]
             if is_bull_aligned and price > ma20: tags.append("🚀多頭起漲")
@@ -350,17 +367,16 @@ else:
     if summary_data:
         health_green = len([d for d in summary_data if "進場" in d['判定'] or "奔跑" in d['判定']])
         health_yellow = len([d for d in summary_data if "觀望" in d['判定'] or "接近" in d['判定']])
-        health_red = len([d for d in summary_data if "破" in d['判定'] or "退場" in d['判定']])
+        health_red = len([d for d in summary_data if "破" in d['判定'] or "虧損" in d['判定'] or "退場" in d['判定']])
         
         st.markdown("### 🌟 持股健康度總覽")
         hc1, hc2, hc3 = st.columns(3)
         hc1.metric("🟢 優勢/奔跑 (強勢)", f"{health_green} 檔")
         hc2.metric("🟡 觀望/警戒 (震盪)", f"{health_yellow} 檔")
-        hc3.metric("🔴 破線/停損 (弱勢)", f"{health_red} 檔")
+        hc3.metric("🔴 破線/虧損 (弱勢)", f"{health_red} 檔")
         st.divider()
             
     if summary_data:
-        # ===== Phase 3.5 戰力分數排序 (Top 3 潛力股) =====
         df_summary = pd.DataFrame(summary_data).sort_values(by="AI分數", ascending=False).reset_index(drop=True)
         st.markdown("### 🏆 戰力排行榜 (Top 3 潛力股)")
         top_cols = st.columns(3)
@@ -371,16 +387,34 @@ else:
 
     if card_data:
         st.markdown("### ✅ 每日紀律檢核清單 (SOP)")
+        
+        # 【完美修正】：破線天數最高級別警告 (保留操作彈性不鎖定)
+        overtime_broken = []
+        for c, info in portfolio.items():
+            if isinstance(info, dict) and info.get('status') != 'Closed':
+                b_date_str = info.get('break_date')
+                if b_date_str:
+                    try:
+                        b_date = datetime.datetime.strptime(b_date_str, "%Y-%m-%d")
+                        diff_days = (datetime.datetime.now() - b_date).days
+                        if diff_days >= 3:
+                            overtime_broken.append(f"{info.get('name', c)} (已破線/虧損 {diff_days} 天)")
+                    except: pass
+        
+        if overtime_broken:
+            st.error(f"🚨 **【最高紀律警報】** 以下持股已破線或虧損超過 3 天未處理，請立即執行手動歸檔或停損退場：\n\n" + "、".join(overtime_broken), icon="🚨")
+        
         with st.expander("展開今日操作任務", expanded=True):
             action_sell, action_buy, action_watch = [], [], []
             for data in card_data:
                 if data['final_status'] == "🔴 破損": action_sell.append(f"🚨 **停損退場**：{data['name']} 現價 {data['price']:.2f} 跌破防守點 {data['atr_stop_price']:.1f}。")
                 elif data['final_status'] == "🔵 停利退場": action_sell.append(f"🛡️ **紀律停利**：{data['name']} 現價 {data['price']:.2f} 跌破動態防守 {data['atr_stop_price']:.1f}。")
+                elif data['final_status'] == "⚠️ 帳面虧損": action_sell.append(f"⚠️ **帳面虧損**：{data['name']} 現價 {data['price']:.2f} 已跌破設定成本，請審慎評估。")
                 elif data['final_status'] == "🟢 達標": action_sell.append(f"🎉 **獲利了結**：{data['name']} 達波段目標 {data['take_profit_price']:.1f}。")
                 elif data['final_status'] == "🔥 利潤奔跑": action_watch.append(f"🚀 **獲利續抱**：{data['name']} 月線 {data['atr_stop_price']:.1f} 不破不賣！")
                 elif data['final_status'] == "🟢 進場": action_buy.append(f"🎯 **進場佈局**：{data['name']} 戰力達 {data['ai_score']} 分，建議部位：{data['shares']} 股。")
                 elif data['final_status'] == "🟡 接近停利": action_watch.append(f"⚠️ **防守上調**：{data['name']} 獲利脫離成本，停損設為成本價。")
-                elif data['final_status'] == "🔴 破線": action_watch.append(f"📉 **弱勢預警**：{data['name']} 跌破月線。")
+                elif data['final_status'] == "🔴 破線": action_watch.append(f"📉 **弱勢預警**：{data['name']} 跌破月線防守區。")
 
             st.markdown("#### 🟥 優先執行 (風控與停利)")
             if not action_sell: st.write("✅ 今日無急迫停損/停利需求")
