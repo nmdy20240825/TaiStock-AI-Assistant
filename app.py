@@ -237,6 +237,8 @@ def render_stock_card(data, system_history, portfolio_data):
             st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
             st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
             st.code(f"籌碼/長線: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
+            if data.get('score_forced_zero'):
+                st.warning("⚠️ 已觸發停損防禦機制：現價已跌破防守線，系統強制將總分歸零（不採計上方拆解分數加總），優先保護本金。", icon="⚠️")
             if not data['is_us']:
                 st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
         with tab_c2:
@@ -325,7 +327,8 @@ else:
             score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
             score_risk = (10 if price > atr_stop_price else 0) + (5 if price >= take_profit_price or price >= cost * 1.05 else 0) if cost > 0 else 15
 
-            ai_score = 0 if (cost > 0 and price <= atr_stop_price) else min(int(score_inst + score_tech + score_vol + score_risk), 100)
+            score_forced_zero = bool(cost > 0 and price <= atr_stop_price)
+            ai_score = 0 if score_forced_zero else min(int(score_inst + score_tech + score_vol + score_risk), 100)
             is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
             confidence_base = ai_score * 0.8 + (10 if is_bull_aligned else 0) + (5 if price > pivot_point else 0)
 
@@ -400,7 +403,7 @@ else:
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi, "atr": atr, "bias": bias, "inst": inst, "tags": tags,
                 "cap": cap, "risk_amount": risk_amount, "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares, "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
-                "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk
+                "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero
             })
         except Exception as e: st.error(f"分析 {code} 發生錯誤: {e}")
 
