@@ -90,9 +90,16 @@ def get_institutional_data(code):
         resp = requests.get(url, params=parameter, timeout=5)
         data = resp.json()
 
-        ticker = f"{code}.TW" if not code.endswith(('.TW', '.TWO')) else code
-        stock_data = yf.download(ticker, period="1mo", progress=False)
-        if data.get("msg") != "success" or not data.get("data") or stock_data.empty: return default_res
+        # 【V2.9.2 修正】原版永遠只試 .TW，上櫃股票（如 3324、1595）會抓不到報價、
+        # 導致 stock_data 是空的，整段籌碼資料被誤判為「無資料」。改成跟 fetch_stock_data 一樣，
+        # 先試 .TW，抓不到再試 .TWO。
+        if code.endswith(('.TW', '.TWO')):
+            stock_data = yf.download(code, period="1mo", progress=False)
+        else:
+            stock_data = yf.download(f"{code}.TW", period="1mo", progress=False)
+            if stock_data is None or stock_data.empty:
+                stock_data = yf.download(f"{code}.TWO", period="1mo", progress=False)
+        if data.get("msg") != "success" or not data.get("data") or stock_data is None or stock_data.empty: return default_res
 
         df_inst = pd.DataFrame(data["data"])
         df_inst['net_buy'] = df_inst['buy'] - df_inst['sell']
@@ -314,7 +321,7 @@ def render_stock_card(data, system_history, portfolio_data):
         with tab_c2:
             c_t1, c_t2 = st.columns(2)
             c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}\n**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
-            c_t2.write(f"**MA20**: {data['ma20']:.2f} | **MA60**: {data['ma60']:.2f}\n**季線乖離**: {data['bias']:.2f}%")
+            c_t2.write(f"**MA20**: {data['ma20']:.2f} | **MA60**: {data['ma60']:.2f}\n**MACD(DIF)**: {data['macd']:.2f} | **季線乖離**: {data['bias']:.2f}%")
         with tab_c3:
             st.write(f"**設定成本**: {data['cost']:.2f}\n**動態防守/停損**: {data['atr_stop_price']:.2f}\n**波段動能目標**: {data['take_profit_price']:.2f}")
         with tab_c4:
