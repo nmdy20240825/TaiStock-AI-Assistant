@@ -1,3 +1,5 @@
 streamlit
 requests
 yfinance
+gspread
+google-auth
