@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import json
-import os
 import numpy as np
 import requests
 import datetime
@@ -135,40 +133,112 @@ def get_institutional_data(code):
     except Exception:
         return default_res
 
-# --- 4. 檔案與設定 ---
+# --- 4. 資料存取（V2.9.1：改用 Google Sheets 當雲端資料庫，取代本機 json 檔）---
+import gspread
+from google.oauth2.service_account import Credentials
+
+GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+PORTFOLIO_HEADERS = ["code", "name", "cost", "cap", "risk", "status", "break_date"]
+HISTORY_HEADERS = ["code", "date", "score", "status", "price"]
+
+DEFAULT_PORTFOLIO = {
+    "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active"},
+    "2317": {"name": "鴻海", "cost": 210.0, "cap": 20000, "risk": 5.0, "status": "Active"},
+    "NVDA": {"name": "輝達", "cost": 125.0, "cap": 20000, "risk": 5.0, "status": "Active"}
+}
+
+@st.cache_resource
+def get_gsheet_client():
+    """建立與 Google Sheets 的連線（憑證讀取自 st.secrets['gcp_service_account']）。"""
+    creds_info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_info, scopes=GSHEET_SCOPES)
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def get_spreadsheet():
+    client = get_gsheet_client()
+    return client.open_by_key(st.secrets["gsheet"]["sheet_id"])
+
+def get_worksheet(name, headers):
+    """取得指定分頁；若試算表裡還沒有這個分頁，就自動建立並寫入表頭。"""
+    ss = get_spreadsheet()
+    try:
+        ws = ss.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=name, rows=200, cols=len(headers))
+        ws.append_row(headers)
+    return ws
+
 def load_portfolio():
-    default = {
-        "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active"},
-        "2317": {"name": "鴻海", "cost": 210.0, "cap": 20000, "risk": 5.0, "status": "Active"},
-        "NVDA": {"name": "輝達", "cost": 125.0, "cap": 20000, "risk": 5.0, "status": "Active"}
-    }
-    if not os.path.exists('portfolio.json'): return default
-    with open('portfolio.json', 'r', encoding='utf-8') as f:
-        try:
-            data = json.load(f)
-            for k, v in data.items():
-                if isinstance(v, list):
-                    name = v[0] if len(v) > 0 else ""
-                    cost = v[1] if len(v) > 1 else 0.0
-                    cap = v[2] if len(v) > 2 else 20000.0
-                    risk = v[3] if len(v) > 3 else 5.0
-                    data[k] = {"name": name, "cost": cost, "cap": cap, "risk": risk, "status": "Active"}
-                elif isinstance(v, dict) and "status" not in v:
-                    v["status"] = "Active"
-            return data
-        except Exception: return default
+    try:
+        ws = get_worksheet("portfolio", PORTFOLIO_HEADERS)
+        records = ws.get_all_records()
+        if not records:
+            # 第一次使用、分頁是空的：把預設持股寫進去，讓 Google Sheet 成為資料的起點
+            rows = [[code, info["name"], info["cost"], info["cap"], info["risk"], info["status"], ""] for code, info in DEFAULT_PORTFOLIO.items()]
+            ws.append_rows(rows)
+            return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
+        data = {}
+        for row in records:
+            code = str(row.get("code", "")).strip()
+            if not code: continue
+            entry = {
+                "name": row.get("name", ""),
+                "cost": float(row.get("cost") or 0.0),
+                "cap": float(row.get("cap") or 20000.0),
+                "risk": float(row.get("risk") or 5.0),
+                "status": row.get("status") or "Active",
+            }
+            break_date = str(row.get("break_date", "")).strip()
+            if break_date:
+                entry["break_date"] = break_date
+            data[code] = entry
+        return data
+    except Exception as e:
+        st.error(f"⚠️ 讀取 Google Sheet 持股資料失敗，暫時使用內建預設值：{e}")
+        return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
 
 def save_portfolio(data):
-    with open('portfolio.json', 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=4)
+    try:
+        ws = get_worksheet("portfolio", PORTFOLIO_HEADERS)
+        ws.clear()
+        rows = [PORTFOLIO_HEADERS]
+        for code, info in data.items():
+            rows.append([code, info.get("name", ""), info.get("cost", 0.0), info.get("cap", 20000.0), info.get("risk", 5.0), info.get("status", "Active"), info.get("break_date", "")])
+        ws.update(rows)
+    except Exception as e:
+        st.error(f"⚠️ 寫入 Google Sheet 持股資料失敗：{e}")
 
 def load_history():
-    if not os.path.exists('history.json'): return {}
-    with open('history.json', 'r', encoding='utf-8') as f:
-        try: return json.load(f)
-        except Exception: return {}
+    try:
+        ws = get_worksheet("history", HISTORY_HEADERS)
+        records = ws.get_all_records()
+        data = {}
+        for row in records:
+            code = str(row.get("code", "")).strip()
+            date = str(row.get("date", "")).strip()
+            if not code or not date: continue
+            data.setdefault(code, {})[date] = {
+                "score": int(float(row.get("score") or 0)),
+                "status": row.get("status", ""),
+                "price": float(row.get("price") or 0.0),
+            }
+        return data
+    except Exception as e:
+        st.error(f"⚠️ 讀取 Google Sheet 歷史資料失敗：{e}")
+        return {}
 
 def save_history(data):
-    with open('history.json', 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=4)
+    try:
+        ws = get_worksheet("history", HISTORY_HEADERS)
+        ws.clear()
+        rows = [HISTORY_HEADERS]
+        for code, records in data.items():
+            for date, rec in records.items():
+                rows.append([code, date, rec.get("score", 0), rec.get("status", ""), rec.get("price", 0.0)])
+        ws.update(rows)
+    except Exception as e:
+        st.error(f"⚠️ 寫入 Google Sheet 歷史資料失敗：{e}")
 
 portfolio, system_history, today_str = load_portfolio(), load_history(), datetime.datetime.now().strftime("%Y-%m-%d")
 
