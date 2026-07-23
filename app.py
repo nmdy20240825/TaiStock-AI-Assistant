@@ -321,8 +321,9 @@ def render_stock_card(data, system_history, portfolio_data):
             st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
             st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
             st.code(f"籌碼/長線: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
-            # 【V2.9.4 新增】四個子分數各自的滿分不同（40/30/15/15），額外用進度條圖形化呈現，
-            # 方便一眼看出每個子項「離滿分還差多少」，不用自己心算百分比。
+            # 【V2.9.5 修正】改用小方塊組成的迷你進度條（而非整條拉滿寬度的 st.progress），
+            # 視覺上更接近「一排小方塊」的樣式，且寬度只跟着方塊數走、不會佔滿整個畫面寬度。
+            _bar_rows = []
             for _label, _val, _max in [
                 ("籌碼/長線", data['score_inst'], 40),
                 ("趨勢技術", data['score_tech'], 30),
@@ -330,8 +331,18 @@ def render_stock_card(data, system_history, portfolio_data):
                 ("風控狀態", data['score_risk'], 15),
             ]:
                 _safe_val = 0 if (_val is None or (isinstance(_val, float) and _val != _val)) else _val
-                st.caption(f"{_label}：{_safe_val:.0f} / {_max}")
-                st.progress(max(0.0, min(1.0, _safe_val / _max)))
+                _ratio = 0.0 if _max == 0 else max(0.0, min(1.0, _safe_val / _max))
+                _segments = 10
+                _filled = round(_ratio * _segments)
+                _bar = "▰" * _filled + "▱" * (_segments - _filled)
+                _bar_rows.append(
+                    f"<div style='margin-bottom:10px;'>"
+                    f"<span style='color:#cbd5e1; font-size:0.85em;'>{_label}</span><br>"
+                    f"<span style='letter-spacing:2px; font-size:1.1em; color:#60a5fa;'>{_bar}</span> "
+                    f"<span style='color:#94a3b8; font-size:0.85em;'>{_safe_val:.0f} / {_max}</span>"
+                    f"</div>"
+                )
+            st.markdown("".join(_bar_rows), unsafe_allow_html=True)
             if data.get('score_forced_zero'):
                 st.warning("⚠️ 已觸發停損防禦機制：現價已跌破防守線，系統強制將總分歸零（不採計上方拆解分數加總），優先保護本金。", icon="⚠️")
             if not data['is_us']:
