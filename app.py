@@ -242,7 +242,12 @@ def save_history(data):
         rows = [HISTORY_HEADERS]
         for code, records in data.items():
             for date, rec in records.items():
-                rows.append([code, date, rec.get("score", 0), rec.get("status", ""), rec.get("price", 0.0)])
+                score = rec.get("score", 0)
+                price = rec.get("price", 0.0)
+                # NaN 不是合法的 JSON 值，寫入 Google Sheet 會整批失敗；這裡保險起見再過濾一次
+                if score is None or (isinstance(score, float) and score != score): score = 0
+                if price is None or (isinstance(price, float) and price != price): price = 0.0
+                rows.append([code, date, score, rec.get("status", ""), price])
         ws.update(rows)
     except Exception as e:
         st.error(f"⚠️ 寫入 Google Sheet 歷史資料失敗：{e}")
@@ -289,7 +294,9 @@ def render_stock_card(data, system_history, portfolio_data):
 
         st.markdown(f"#### {data['name']} ({data['code']}){broken_label} - {' '.join(data['tags'][:2])}{delta_str}", unsafe_allow_html=True)
         st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{'動能' if data['is_us'] else '籌碼'} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
-        st.progress(data['ai_score'] / 100)
+        _safe_score = data['ai_score']
+        if _safe_score is None or (isinstance(_safe_score, float) and _safe_score != _safe_score): _safe_score = 0
+        st.progress(max(0, min(100, _safe_score)) / 100)
 
         col_a, col_b, col_c, col_d = st.columns(4)
         col_a.metric("現價", f"{data['price']:.2f}")
@@ -314,6 +321,17 @@ def render_stock_card(data, system_history, portfolio_data):
             st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
             st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
             st.code(f"籌碼/長線: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
+            # 【V2.9.4 新增】四個子分數各自的滿分不同（40/30/15/15），額外用進度條圖形化呈現，
+            # 方便一眼看出每個子項「離滿分還差多少」，不用自己心算百分比。
+            for _label, _val, _max in [
+                ("籌碼/長線", data['score_inst'], 40),
+                ("趨勢技術", data['score_tech'], 30),
+                ("量能指標", data['score_vol'], 15),
+                ("風控狀態", data['score_risk'], 15),
+            ]:
+                _safe_val = 0 if (_val is None or (isinstance(_val, float) and _val != _val)) else _val
+                st.caption(f"{_label}：{_safe_val:.0f} / {_max}")
+                st.progress(max(0.0, min(1.0, _safe_val / _max)))
             if data.get('score_forced_zero'):
                 st.warning("⚠️ 已觸發停損防禦機制：現價已跌破防守線，系統強制將總分歸零（不採計上方拆解分數加總），優先保護本金。", icon="⚠️")
             if not data['is_us']:
@@ -393,6 +411,16 @@ else:
             rsi = float(100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001)))))
             atr = float(sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14)
             bias = float(((price - ma60) / ma60) * 100)
+
+            # 【V2.9.3 修正】yfinance 偶爾會回傳不完整的資料（例如最後一根K棒缺值），
+            # 導致 price/ma/k/d/rsi/atr 等任一數值變成 NaN。NaN 沒被擋下來的話會一路
+            # 傳到 st.progress()（讓整個分頁當機）跟 Google Sheet 寫入（NaN 不是合法 JSON，
+            # 寫入會直接失敗）。這裡先做一次「健檢」，任何一項是 NaN 就跳過這檔股票，
+            # 等下一次重新抓資料時如果正常了，會自動恢復顯示。
+            _core_values = [price, volume, vol_ma5, pivot_point, ma10, ma20, ma60, macd, k, d, rsi, atr, bias]
+            if any(pd.isna(v) for v in _core_values):
+                st.warning(f"⚠️ {name or code} 本次抓到的資料不完整（yfinance 回傳缺值），已跳過這次分析，下次重新整理應會恢復正常。")
+                continue
 
             inst = get_institutional_data(code)
             atr_stop_price = max(cost, ma20) if (cost > 0 and price > cost * 1.10) else (cost - (atr * 2) if cost > 0 else 0)
