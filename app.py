@@ -4,6 +4,7 @@ import yfinance as yf
 import numpy as np
 import requests
 import datetime
+import plotly.graph_objects as go
 
 st.set_page_config(layout="wide", page_title="TaiStock V2.9 全自動紀律決策系統")
 
@@ -44,6 +45,32 @@ def calc_macd(c, fast=12, slow=26):
     ema_fast = c.ewm(span=fast, adjust=False).mean()
     ema_slow = c.ewm(span=slow, adjust=False).mean()
     return float(ema_fast.iloc[-1] - ema_slow.iloc[-1])
+
+def compute_signal_backtest(history):
+    """
+    【V2.10 新增】依累積的歷史記錄，回測各判定狀態「後續」的平均報酬與勝率。
+    做法：對每一檔股票，把「較早那筆記錄的價格」拿去跟「該股目前累積歷史中最新一筆的價格」比較，
+    算出報酬率，再依「較早那筆的判定狀態」分組統計。
+    受限於 history 目前每檔股票只保留最近10筆記錄，樣本數會隨使用天數增加而變多，
+    不是嚴謹的長期回測，但足夠用來觀察「這套 SOP 過去發出的訊號，後續大致準不準」。
+    """
+    stats = {}  # 判定狀態 -> 報酬率(%) 清單
+    for code, records in history.items():
+        dates_sorted = sorted(records.keys())
+        if len(dates_sorted) < 2:
+            continue
+        latest_price = records[dates_sorted[-1]].get('price', 0)
+        if not latest_price:
+            continue
+        for d in dates_sorted[:-1]:
+            entry = records[d]
+            status = entry.get('status', '')
+            entry_price = entry.get('price', 0)
+            if not status or not entry_price:
+                continue
+            ret_pct = (latest_price - entry_price) / entry_price * 100
+            stats.setdefault(status, []).append(ret_pct)
+    return stats
 
 # --- 1. 大盤宏觀環境抓取 ---
 @st.cache_data(ttl=1800)
@@ -145,13 +172,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-PORTFOLIO_HEADERS = ["code", "name", "cost", "cap", "risk", "status", "break_date"]
+PORTFOLIO_HEADERS = ["code", "name", "cost", "cap", "risk", "status", "break_date", "qty"]
 HISTORY_HEADERS = ["code", "date", "score", "status", "price"]
 
 DEFAULT_PORTFOLIO = {
-    "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active"},
-    "2317": {"name": "鴻海", "cost": 210.0, "cap": 20000, "risk": 5.0, "status": "Active"},
-    "NVDA": {"name": "輝達", "cost": 125.0, "cap": 20000, "risk": 5.0, "status": "Active"}
+    "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active", "qty": 0},
+    "2317": {"name": "鴻海", "cost": 210.0, "cap": 20000, "risk": 5.0, "status": "Active", "qty": 0},
+    "NVDA": {"name": "輝達", "cost": 125.0, "cap": 20000, "risk": 5.0, "status": "Active", "qty": 0}
 }
 
 @st.cache_resource
@@ -182,7 +209,7 @@ def load_portfolio():
         records = ws.get_all_records()
         if not records:
             # 第一次使用、分頁是空的：把預設持股寫進去，讓 Google Sheet 成為資料的起點
-            rows = [[code, info["name"], info["cost"], info["cap"], info["risk"], info["status"], ""] for code, info in DEFAULT_PORTFOLIO.items()]
+            rows = [[code, info["name"], info["cost"], info["cap"], info["risk"], info["status"], "", info.get("qty", 0)] for code, info in DEFAULT_PORTFOLIO.items()]
             ws.append_rows(rows)
             return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
         data = {}
@@ -195,6 +222,8 @@ def load_portfolio():
                 "cap": float(row.get("cap") or 20000.0),
                 "risk": float(row.get("risk") or 5.0),
                 "status": row.get("status") or "Active",
+                # 舊的 Google Sheet 分頁可能還沒有 qty 這欄，讀不到就當作 0（代表沒有在追蹤實際股數）
+                "qty": float(row.get("qty") or 0.0),
             }
             break_date = str(row.get("break_date", "")).strip()
             if break_date:
@@ -211,7 +240,7 @@ def save_portfolio(data):
         ws.clear()
         rows = [PORTFOLIO_HEADERS]
         for code, info in data.items():
-            rows.append([code, info.get("name", ""), info.get("cost", 0.0), info.get("cap", 20000.0), info.get("risk", 5.0), info.get("status", "Active"), info.get("break_date", "")])
+            rows.append([code, info.get("name", ""), info.get("cost", 0.0), info.get("cap", 20000.0), info.get("risk", 5.0), info.get("status", "Active"), info.get("break_date", ""), info.get("qty", 0.0)])
         ws.update(rows)
     except Exception as e:
         st.error(f"⚠️ 寫入 Google Sheet 持股資料失敗：{e}")
@@ -260,11 +289,12 @@ with st.sidebar:
     with st.form("add_stock"):
         new_code = st.text_input("代號 (台股數字 / 美股字母)")
         new_name, new_cost, new_cap, new_risk = st.text_input("名稱 (可留白)"), st.number_input("成本價", value=100.0, step=0.1), st.number_input("分配資金", value=20000, step=5000), st.number_input("單筆風險 (%)", value=5.0, step=0.1)
+        new_qty = st.number_input("持有股數 (選填，0＝純訊號監控，不計入總損益)", value=0, step=1, min_value=0)
         if st.form_submit_button("更新設定"):
             if new_code:
                 fetch_stock_data.clear(); get_institutional_data.clear()
                 existing_break_date = portfolio.get(new_code, {}).get('break_date') if isinstance(portfolio.get(new_code), dict) else None
-                portfolio[new_code] = {"name": new_name, "cost": new_cost, "cap": new_cap, "risk": new_risk, "status": "Active"}
+                portfolio[new_code] = {"name": new_name, "cost": new_cost, "cap": new_cap, "risk": new_risk, "status": "Active", "qty": new_qty}
                 if existing_break_date:
                     portfolio[new_code]['break_date'] = existing_break_date
                 save_portfolio(portfolio)
@@ -275,6 +305,40 @@ with st.sidebar:
         save_portfolio(portfolio)
         if del_code in system_history: del system_history[del_code]; save_history(system_history)
         st.rerun()
+
+    st.divider()
+    st.subheader("📤 匯出 / 📥 匯入持股清單 (CSV)")
+    _export_rows = [
+        {"code": code, "name": info.get("name", ""), "cost": info.get("cost", 0.0), "cap": info.get("cap", 20000.0),
+         "risk": info.get("risk", 5.0), "qty": info.get("qty", 0.0), "status": info.get("status", "Active")}
+        for code, info in portfolio.items()
+    ]
+    _csv_bytes = pd.DataFrame(_export_rows).to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📤 匯出目前持股清單", _csv_bytes, file_name="taistock_持股清單.csv", mime="text/csv")
+
+    _uploaded_csv = st.file_uploader("📥 匯入持股清單 CSV", type=["csv"], help="欄位需包含 code, name, cost, cap, risk；qty、status 選填")
+    if _uploaded_csv is not None:
+        try:
+            _df_import = pd.read_csv(_uploaded_csv)
+            st.caption(f"讀到 {len(_df_import)} 筆資料，確認無誤後按下方按鈕匯入（會覆蓋畫面上同代號的既有設定）")
+            if st.button("✅ 確認匯入"):
+                for _, _row in _df_import.iterrows():
+                    _imp_code = str(_row.get("code", "")).strip()
+                    if not _imp_code or _imp_code == "nan": continue
+                    portfolio[_imp_code] = {
+                        "name": "" if pd.isna(_row.get("name", "")) else str(_row.get("name", "")),
+                        "cost": float(_row.get("cost", 0) or 0),
+                        "cap": float(_row.get("cap", 20000) or 20000),
+                        "risk": float(_row.get("risk", 5.0) or 5.0),
+                        "qty": float(_row.get("qty", 0) or 0),
+                        "status": "Active" if pd.isna(_row.get("status", "Active")) else str(_row.get("status", "Active")),
+                    }
+                fetch_stock_data.clear(); get_institutional_data.clear()
+                save_portfolio(portfolio)
+                st.success(f"已匯入 {len(_df_import)} 筆設定")
+                st.rerun()
+        except Exception as e:
+            st.error(f"⚠️ CSV 格式讀取失敗，請確認欄位名稱是否正確：{e}")
 
 # --- 卡片渲染邏輯 ---
 def render_stock_card(data, system_history, portfolio_data):
@@ -305,7 +369,7 @@ def render_stock_card(data, system_history, portfolio_data):
         col_c.metric("判定", data['final_status'])
 
         with col_d:
-            st.metric("部位", f"{data['shares']}股" if data['final_status'] == "🟢 進場" else "-")
+            st.metric("部位", f"{data['shares_adjusted']}股" if data['final_status'] == "🟢 進場" else "-")
             if data['final_status'] in ["🔵 停利退場", "🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]:
                 if st.button("📦 手動歸檔 (已結算)", key=f"close_{data['code']}"):
                     portfolio_data[data['code']]['status'] = "Closed"
@@ -351,8 +415,44 @@ def render_stock_card(data, system_history, portfolio_data):
             c_t1, c_t2 = st.columns(2)
             c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}\n**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
             c_t2.write(f"**MA20**: {data['ma20']:.2f} | **MA60**: {data['ma60']:.2f}\n**MACD(DIF)**: {data['macd']:.2f} | **季線乖離**: {data['bias']:.2f}%")
+            # 【V2.10 新增①】自動畫K線圖：直接用已經抓過（有快取）的價量資料畫蠟燭圖疊 MA20/MA60，
+            # 不用另外跳去看 TradingView。台股慣例紅漲綠跌，跟西方常見的紅跌綠漲相反，這裡有特別標明。
+            st.markdown("**📉 K線走勢圖（近60日，紅漲綠跌）**")
+            try:
+                _chart_df = fetch_stock_data(data['code'])
+                if _chart_df is not None and not _chart_df.empty and len(_chart_df) >= 20:
+                    _cc, _hh, _ll, _oo = _chart_df['Close'].squeeze(), _chart_df['High'].squeeze(), _chart_df['Low'].squeeze(), _chart_df['Open'].squeeze()
+                    if isinstance(_cc, pd.DataFrame): _cc, _hh, _ll, _oo = _cc.iloc[:, 0], _hh.iloc[:, 0], _ll.iloc[:, 0], _oo.iloc[:, 0]
+                    _ma20_line = _cc.rolling(20).mean()
+                    _ma60_line = _cc.rolling(60).mean()
+                    _n = min(60, len(_chart_df))
+                    _fig = go.Figure(data=[go.Candlestick(
+                        x=_chart_df.index[-_n:], open=_oo.iloc[-_n:], high=_hh.iloc[-_n:], low=_ll.iloc[-_n:], close=_cc.iloc[-_n:],
+                        increasing_line_color='#f87171', decreasing_line_color='#4ade80', name="K線",
+                    )])
+                    _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_ma20_line.iloc[-_n:], line=dict(color='#facc15', width=1), name="MA20"))
+                    _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_ma60_line.iloc[-_n:], line=dict(color='#60a5fa', width=1), name="MA60"))
+                    _fig.update_layout(
+                        height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_rangeslider_visible=False,
+                        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                    )
+                    st.plotly_chart(_fig, use_container_width=True, key=f"kchart_{data['code']}")
+                else:
+                    st.caption("資料不足，暫時無法畫出K線圖。")
+            except Exception as _chart_err:
+                st.caption(f"K線圖暫時無法載入：{_chart_err}")
         with tab_c3:
             st.write(f"**設定成本**: {data['cost']:.2f}\n**動態防守/停損**: {data['atr_stop_price']:.2f}\n**波段動能目標**: {data['take_profit_price']:.2f}")
+            # 【V2.10 新增④】波段剩餘空間%：現價距離波段目標價還有多少百分比的路要走，
+            # 用「(目標價-現價) ÷ (目標價-成本)」換算成 0~100% 的剩餘空間，不用自己心算。
+            _cost, _price, _target = data['cost'], data['price'], data['take_profit_price']
+            if _cost > 0 and _target > _cost:
+                if _price >= _target:
+                    st.caption("🎯 波段剩餘空間：已達成或超越目標價")
+                else:
+                    _remaining_pct = max(0.0, min(100.0, (_target - _price) / (_target - _cost) * 100))
+                    st.caption(f"🎯 波段剩餘空間：還有 {_remaining_pct:.1f}%（距離目標價 {_target - _price:.2f} 元）")
         with tab_c4:
             if len(sorted_dates) > 1:
                 chart_data = pd.DataFrame([{"Date": d, "Score": hist_records[d]['score']} for d in sorted_dates[:10]]).set_index("Date").sort_index()
@@ -494,6 +594,15 @@ else:
                 ai_advice.append(f"<span style='color: #fbbf24;'>{w}</span>")
             suggested_shares = min(int(risk_amount / atr), int(cap / price)) if atr > 0 else 0
 
+            # 【V2.10 新增】AI 倉位建議：依「決策信心」分級，把原本單純用 ATR 算出來的建議股數，
+            # 再乘上一個信心對應的倉位比例，讓建議部位更貼近「信心越低、部位越小」的實際下單邏輯。
+            if confidence >= 80: position_pct, position_label = 1.0, "100%（可分批布局）"
+            elif confidence >= 60: position_pct, position_label = 0.6, "60%（可小量試單）"
+            elif confidence >= 40: position_pct, position_label = 0.2, "20%（僅觀察，避免重倉）"
+            else: position_pct, position_label = 0.0, "0%（不建議進場）"
+            suggested_shares_adjusted = int(suggested_shares * position_pct)
+            ai_advice.append(f"💰 建議倉位比例：{position_label}")
+
             if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]:
                 if isinstance(portfolio[code], dict) and 'break_date' not in portfolio[code]:
                     portfolio[code]['break_date'] = today_str
@@ -518,12 +627,25 @@ else:
                 "code": code, "name": name, "cost": cost, "price": price, "volume": volume, "vol_ma5": vol_ma5,
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi, "atr": atr, "bias": bias, "inst": inst, "tags": tags,
                 "cap": cap, "risk_amount": risk_amount, "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
-                "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares, "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
+                "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares, "shares_adjusted": suggested_shares_adjusted, "position_label": position_label,
+                "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
                 "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero
             })
         except Exception as e: st.error(f"分析 {code} 發生錯誤: {e}")
 
     save_history(system_history)
+
+    # 【V2.10 新增②】AI 每日一句：從今天戰力最高的持股，自動拼一句話當作頭條，
+    # 不用先看完整份排行榜跟卡片才知道「今天最值得注意的是哪一檔」。
+    if card_data:
+        _headline_top = max(card_data, key=lambda x: x['ai_score'])
+        if _headline_top['ai_score'] > 0:
+            _sub_scores = {"籌碼/長線動能": _headline_top['score_inst'], "趨勢技術": _headline_top['score_tech'], "量能表現": _headline_top['score_vol'], "風控狀態": _headline_top['score_risk']}
+            _top_sub_label = max(_sub_scores, key=_sub_scores.get)
+            _tag_str = "、".join(_headline_top['tags'][:2])
+            st.info(f"🧠 **AI 每日一句**：今天最值得留意的是 **{_headline_top['name']}（{_headline_top['code']}）**，戰力 {_headline_top['ai_score']} 分，判定「{_headline_top['final_status']}」。優勢主要來自「{_top_sub_label}」，標籤：{_tag_str}。")
+        else:
+            st.info("🧠 **AI 每日一句**：今天所有持股都沒有出現戰力突出的標的，建議耐心觀望，不用勉強找機會。")
 
     if summary_data:
         health_green = len([d for d in summary_data if "進場" in d['判定'] or "奔跑" in d['判定']])
@@ -535,6 +657,35 @@ else:
         hc1.metric("🟢 優勢/奔跑 (強勢)", f"{health_green} 檔")
         hc2.metric("🟡 觀望/警戒 (震盪)", f"{health_yellow} 檔")
         hc3.metric("🔴 破線/虧損 (弱勢)", f"{health_red} 檔")
+        st.divider()
+
+    # 【V2.10 新增】資產總覽：依側邊欄填寫的「持有股數」計算實際損益，
+    # 跟前面純粹的訊號分析不同，這裡只計入你有明確填寫股數（>0）的持股，
+    # 沒填股數的維持是「觀察/訊號監控」用途，不會被算進總損益。
+    if card_data:
+        st.markdown("### 💰 資產總覽（依持有股數計算）")
+        _valued_cards = [d for d in card_data if portfolio.get(d['code'], {}).get('qty', 0) > 0]
+        if not _valued_cards:
+            st.info("目前沒有任何持股填寫「持有股數」，所以無法計算實際總損益。到側邊欄的「持有股數」欄位填入你實際持有的股數（留 0 代表純訊號監控），這裡就會自動算出總投入成本、總市值與總損益。")
+        else:
+            _total_cost_amt = sum(d['cost'] * portfolio[d['code']].get('qty', 0) for d in _valued_cards)
+            _total_mkt_val = sum(d['price'] * portfolio[d['code']].get('qty', 0) for d in _valued_cards)
+            _total_pl = _total_mkt_val - _total_cost_amt
+            _total_pl_pct = (_total_pl / _total_cost_amt * 100) if _total_cost_amt > 0 else 0.0
+            ac1, ac2, ac3 = st.columns(3)
+            ac1.metric("總投入成本", f"{_total_cost_amt:,.0f}")
+            ac2.metric("目前總市值", f"{_total_mkt_val:,.0f}")
+            ac3.metric("總損益", f"{_total_pl:,.0f}", f"{_total_pl_pct:+.2f}%", delta_color="normal" if _total_pl >= 0 else "inverse")
+            with st.expander("展開各檔損益明細"):
+                _detail_rows = []
+                for d in _valued_cards:
+                    _qty = portfolio[d['code']].get('qty', 0)
+                    _pl = (d['price'] - d['cost']) * _qty
+                    _pl_pct = ((d['price'] - d['cost']) / d['cost'] * 100) if d['cost'] > 0 else 0.0
+                    _detail_rows.append({"代號": d['code'], "名稱": d['name'], "股數": _qty, "成本": round(d['cost'], 2),
+                                          "現價": round(d['price'], 2), "損益": round(_pl, 0), "損益%": round(_pl_pct, 2)})
+                _df_detail = pd.DataFrame(_detail_rows).sort_values("損益", ascending=False).reset_index(drop=True)
+                st.dataframe(_df_detail, use_container_width=True, hide_index=True)
         st.divider()
 
     if summary_data:
@@ -571,7 +722,7 @@ else:
                 elif data['final_status'] == "🔵 停利退場": action_sell.append(f"🛡️ **紀律停利**：{data['name']} 現價 {data['price']:.2f} 跌破動態防守 {data['atr_stop_price']:.1f}。")
                 elif data['final_status'] == "⚠️ 帳面虧損": action_sell.append(f"⚠️ **帳面虧損**：{data['name']} 現價 {data['price']:.2f} 已跌破設定成本，請審慎評估。")
                 elif data['final_status'] == "🔥 利潤奔跑": action_watch.append(f"🚀 **獲利續抱**：{data['name']} 月線 {data['atr_stop_price']:.1f} 不破不賣！")
-                elif data['final_status'] == "🟢 進場": action_buy.append(f"🎯 **進場佈局**：{data['name']} 戰力達 {data['ai_score']} 分，建議部位：{data['shares']} 股。")
+                elif data['final_status'] == "🟢 進場": action_buy.append(f"🎯 **進場佈局**：{data['name']} 戰力達 {data['ai_score']} 分，建議部位：{data['shares_adjusted']} 股（倉位比例 {data['position_label']}）。")
                 elif data['final_status'] == "🟡 接近停利": action_watch.append(f"⚠️ **防守上調**：{data['name']} 獲利脫離成本，停損設為成本價。")
                 elif data['final_status'] == "🔴 破線": action_watch.append(f"📉 **弱勢預警**：{data['name']} 跌破月線防守區。")
 
@@ -601,6 +752,21 @@ else:
         us_cards = [d for d in card_data if d['is_us']]
         if not us_cards: st.info("目前無美股持股紀錄。")
         for data in us_cards: render_stock_card(data, system_history, portfolio)
+
+    st.divider()
+    st.markdown("### 📈 訊號準確度回測（依累積歷史記錄統計）")
+    _bt_stats = compute_signal_backtest(system_history)
+    if not _bt_stats:
+        st.info("目前累積的歷史記錄還太少（至少要有同一檔股票連續兩天以上的記錄才能比較），先讓系統多跑幾天，這裡的統計會隨時間慢慢累積。")
+    else:
+        _bt_rows = []
+        for _status, _rets in _bt_stats.items():
+            _win_rate = sum(1 for r in _rets if r > 0) / len(_rets) * 100
+            _avg_ret = sum(_rets) / len(_rets)
+            _bt_rows.append({"判定狀態": _status, "樣本數": len(_rets), "後續平均報酬%": round(_avg_ret, 2), "上漲勝率%": round(_win_rate, 1)})
+        _df_bt = pd.DataFrame(_bt_rows).sort_values("後續平均報酬%", ascending=False).reset_index(drop=True)
+        st.dataframe(_df_bt, use_container_width=True, hide_index=True)
+        st.caption("「後續平均報酬」＝拿每筆歷史記錄當天的價格，對照同一檔股票目前歷史中最新一筆的價格計算漲跌幅，再依「當時的判定狀態」分組平均。樣本數會隨使用天數增加而增加；目前每檔股票最多保留最近10筆記錄，天數越久統計越有參考價值。")
 
 if __name__ == "__main__":
     pass
