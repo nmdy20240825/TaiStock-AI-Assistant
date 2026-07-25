@@ -18,6 +18,32 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- 0-0. 簡易密碼保護（V2.10.4 新增）---
+# 【重要】這只是「擋掉隨便知道網址就能看」的基本防護，不是正規帳號系統。
+# 密碼存在 Streamlit 的 Secrets 裡（st.secrets["app_password"]），不會寫進程式碼或 GitHub。
+def _check_password():
+    def _on_submit():
+        if st.session_state.get("_pw_input", "") == st.secrets.get("app_password", ""):
+            st.session_state["_pw_ok"] = True
+            st.session_state["_pw_input"] = ""
+        else:
+            st.session_state["_pw_ok"] = False
+
+    if st.session_state.get("_pw_ok", False):
+        return True
+
+    st.title("🔒 TaiStock 登入")
+    if "app_password" not in st.secrets:
+        st.error("⚠️ 尚未在 Streamlit Secrets 設定 app_password，暫時無法啟用密碼保護（目前對所有人開放）。")
+        return True  # 沒設定密碼時不擋，避免自己也被鎖在外面
+    st.text_input("請輸入密碼", type="password", key="_pw_input", on_change=_on_submit)
+    if st.session_state.get("_pw_ok") is False:
+        st.error("密碼錯誤，請再試一次。")
+    return False
+
+if not _check_password():
+    st.stop()
+
 # --- 0. 技術指標輔助函式（V2.9 修正版）---
 
 def calc_kd(h, l, c, period=9):
@@ -378,7 +404,13 @@ def render_stock_card(data, system_history, portfolio_data):
         is_broken = data['final_status'] in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]
         broken_label = " <span style='color: red;'>[🚨預警]</span>" if is_broken else ""
 
-        st.markdown(f"#### {data['name']} ({data['code']}){broken_label} - {' '.join(data['tags'][:2])}{delta_str}", unsafe_allow_html=True)
+        # 【V2.10.3 新增】觀察名單標籤：持有股數=0 代表這是純訊號監控（還沒有實際持股），
+        # 用一個藍色標籤直接標在標題上，不用另外開分頁，新手也能一眼分辨「這是我真的有買的」
+        # 還是「這只是我在看的」。
+        _qty_now = portfolio_data.get(data['code'], {}).get('qty', 0)
+        watch_label = " <span style='color: #60a5fa;'>[👁️觀察中]</span>" if _qty_now <= 0 else ""
+
+        st.markdown(f"#### {data['name']} ({data['code']}){broken_label}{watch_label} - {' '.join(data['tags'][:2])}{delta_str}", unsafe_allow_html=True)
         st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{'動能' if data['is_us'] else '籌碼'} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
         _safe_score = data['ai_score']
         if _safe_score is None or (isinstance(_safe_score, float) and _safe_score != _safe_score): _safe_score = 0
@@ -485,6 +517,7 @@ def render_stock_card(data, system_history, portfolio_data):
 
 # --- 6. 主程式執行 ---
 st.title("⚡ TaiStock V2.9 全自動決策系統")
+st.warning("⚠️ 本系統僅為個人化技術指標整理與紀律提醒工具，所有分數、判定、建議均由你自訂的公式與參數計算而成，**不構成任何投資建議**，過去的訊號表現也不保證未來結果。所有操作決策與風險，仍需由你自己判斷並承擔。")
 
 macro_data = fetch_macro_data()
 st.markdown("### 🌍 雙軌市場環境總覽")
@@ -617,6 +650,14 @@ else:
 
             for w in macro_warnings:
                 ai_advice.append(f"<span style='color: #fbbf24;'>{w}</span>")
+
+            # 【V2.10.5 新增】低流動性警示：5日均量過低代表買賣價差可能較大，
+            # 新手照系統建議股數直接下市價單，容易買貴或賣便宜。門檻是粗略經驗值，
+            # 不是嚴謹的流動性模型，僅供提醒留意，不同股本大小的股票基準本來就不同。
+            _low_liquidity_threshold = 200000
+            if vol_ma5 > 0 and vol_ma5 < _low_liquidity_threshold:
+                ai_advice.append(f"<span style='color: #fbbf24;'>⚠️ 流動性偏低：5日均量僅約 {vol_ma5:,.0f} 股，買賣價差可能較大，建議用限價單，避免市價單成交價偏離太多。</span>")
+
             suggested_shares = min(int(risk_amount / atr), int(cap / price)) if atr > 0 else 0
 
             # 【V2.10 新增】AI 倉位建議：依「決策信心」分級，把原本單純用 ATR 算出來的建議股數，
@@ -684,33 +725,67 @@ else:
         hc3.metric("🔴 破線/虧損 (弱勢)", f"{health_red} 檔")
         st.divider()
 
-    # 【V2.10 新增】資產總覽：依側邊欄填寫的「持有股數」計算實際損益，
-    # 跟前面純粹的訊號分析不同，這裡只計入你有明確填寫股數（>0）的持股，
-    # 沒填股數的維持是「觀察/訊號監控」用途，不會被算進總損益。
+    # 【V2.10.2 修正】資產總覽依幣別（台幣／美金）分開計算，原本會把美股(美金)跟台股(台幣)
+    # 直接加總，數字沒有意義；現在拆成兩組，各自算總投入成本、總市值、總損益。
     if card_data:
         st.markdown("### 💰 資產總覽（依持有股數計算）")
         _valued_cards = [d for d in card_data if portfolio.get(d['code'], {}).get('qty', 0) > 0]
         if not _valued_cards:
             st.info("目前沒有任何持股填寫「持有股數」，所以無法計算實際總損益。到側邊欄的「持有股數」欄位填入你實際持有的股數（留 0 代表純訊號監控），這裡就會自動算出總投入成本、總市值與總損益。")
         else:
-            _total_cost_amt = sum(d['cost'] * portfolio[d['code']].get('qty', 0) for d in _valued_cards)
-            _total_mkt_val = sum(d['price'] * portfolio[d['code']].get('qty', 0) for d in _valued_cards)
-            _total_pl = _total_mkt_val - _total_cost_amt
-            _total_pl_pct = (_total_pl / _total_cost_amt * 100) if _total_cost_amt > 0 else 0.0
-            ac1, ac2, ac3 = st.columns(3)
-            ac1.metric("總投入成本", f"{_total_cost_amt:,.0f}")
-            ac2.metric("目前總市值", f"{_total_mkt_val:,.0f}")
-            ac3.metric("總損益", f"{_total_pl:,.0f}", f"{_total_pl_pct:+.2f}%", delta_color="normal" if _total_pl >= 0 else "inverse")
-            with st.expander("展開各檔損益明細"):
-                _detail_rows = []
-                for d in _valued_cards:
-                    _qty = portfolio[d['code']].get('qty', 0)
-                    _pl = (d['price'] - d['cost']) * _qty
-                    _pl_pct = ((d['price'] - d['cost']) / d['cost'] * 100) if d['cost'] > 0 else 0.0
-                    _detail_rows.append({"代號": d['code'], "名稱": d['name'], "股數": _qty, "成本": round(d['cost'], 2),
-                                          "現價": round(d['price'], 2), "損益": round(_pl, 0), "損益%": round(_pl_pct, 2)})
-                _df_detail = pd.DataFrame(_detail_rows).sort_values("損益", ascending=False).reset_index(drop=True)
-                st.dataframe(_df_detail, use_container_width=True, hide_index=True)
+            def _render_asset_group(cards, currency_label, currency_symbol):
+                if not cards:
+                    return
+                st.markdown(f"**{currency_label}**")
+                _tc = sum(d['cost'] * portfolio[d['code']].get('qty', 0) for d in cards)
+                _tm = sum(d['price'] * portfolio[d['code']].get('qty', 0) for d in cards)
+                _tp = _tm - _tc
+                _tp_pct = (_tp / _tc * 100) if _tc > 0 else 0.0
+                ac1, ac2, ac3 = st.columns(3)
+                ac1.metric(f"總投入成本 ({currency_symbol})", f"{_tc:,.0f}")
+                ac2.metric(f"目前總市值 ({currency_symbol})", f"{_tm:,.0f}")
+                ac3.metric(f"總損益 ({currency_symbol})", f"{_tp:,.0f}", f"{_tp_pct:+.2f}%", delta_color="normal" if _tp >= 0 else "inverse")
+                with st.expander(f"展開 {currency_label} 各檔損益明細"):
+                    _rows = []
+                    for d in cards:
+                        _qty = portfolio[d['code']].get('qty', 0)
+                        _pl = (d['price'] - d['cost']) * _qty
+                        _pl_pct = ((d['price'] - d['cost']) / d['cost'] * 100) if d['cost'] > 0 else 0.0
+                        _rows.append({"代號": d['code'], "名稱": d['name'], "股數": _qty, "成本": round(d['cost'], 2),
+                                      "現價": round(d['price'], 2), "損益": round(_pl, 0), "損益%": round(_pl_pct, 2)})
+                    st.dataframe(pd.DataFrame(_rows).sort_values("損益", ascending=False).reset_index(drop=True), use_container_width=True, hide_index=True)
+
+            _render_asset_group([d for d in _valued_cards if not d['is_us']], "🇹🇼 台股資產（新台幣 TWD）", "TWD")
+            _render_asset_group([d for d in _valued_cards if d['is_us']], "🇺🇸 美股資產（美金 USD）", "USD")
+            st.caption("⚠️ 兩組數字幣別不同，不會加總在一起顯示；如果你想看合併後的台幣總資產，需要自己乘上當下匯率換算，系統目前沒有自動抓匯率。")
+        st.divider()
+
+    # 【V2.10.5 新增】新手風險檢查：把「單筆風險%」串起來看整體，並檢查標籤集中度。
+    # 這兩個檢查依賴的是你自己在側邊欄設定的分配資金/風險%，以及系統標籤，
+    # 分母是「所有 Active 持股規劃的分配資金加總」，不是你真正的總資產，算是概估值。
+    if card_data:
+        st.markdown("### 🛡️ 新手風險檢查")
+        _total_cap_plan = sum(d['cap'] for d in card_data)
+        _total_risk_plan = sum(d['risk_amount'] for d in card_data)
+        if _total_cap_plan > 0:
+            _risk_exposure_pct = _total_risk_plan / _total_cap_plan * 100
+            if _risk_exposure_pct >= 20:
+                st.error(f"🚨 整體風險曝露：{_risk_exposure_pct:.1f}%（把你所有持股設定的「分配資金 × 單筆風險%」加總，除以總分配資金）。這個比例偏高，代表如果所有持股同時觸發停損，虧損金額會佔你規劃資金相當大的比例，建議重新檢視各檔的單筆風險%設定。")
+            elif _risk_exposure_pct >= 10:
+                st.warning(f"⚠️ 整體風險曝露：{_risk_exposure_pct:.1f}%，中等偏高，建議留意不要再繼續加碼提高單筆風險%。")
+            else:
+                st.success(f"✅ 整體風險曝露：{_risk_exposure_pct:.1f}%，屬於相對保守的範圍。")
+            st.caption("這個數字是用你側邊欄設定的「分配資金」與「單筆風險%」概算出來的整體風險預算比例，不是你真實總資產的風險占比，僅供參考。")
+
+        _tag_counter = {}
+        for d in card_data:
+            for t in d['tags'][:1]:  # 只計第一個標籤（籌碼/動能屬性），第二個標籤是趨勢狀態，不適合拿來看集中度
+                _tag_counter[t] = _tag_counter.get(t, 0) + 1
+        if len(card_data) >= 3:
+            _dominant_tag, _dominant_count = max(_tag_counter.items(), key=lambda x: x[1])
+            _dominant_ratio = _dominant_count / len(card_data) * 100
+            if _dominant_ratio >= 60:
+                st.warning(f"⚠️ 標籤集中度偏高：你追蹤的 {len(card_data)} 檔股票裡，有 {_dominant_count} 檔（{_dominant_ratio:.0f}%）都屬於「{_dominant_tag}」這個屬性，這些股票的漲跌行為可能高度連動，不算真正分散。（此為依系統標籤概估，非正式產業分類）")
         st.divider()
 
     if summary_data:
@@ -766,16 +841,25 @@ else:
 
     st.markdown("### 📊 AI 深度解析清單")
     card_data = sorted(card_data, key=lambda x: x['ai_score'], reverse=True)
+
+    # 【V2.10.3 新增】顯示範圍篩選：清單一多，可以只看實際持股或只看觀察名單，
+    # 不用兩種混在一起逐一分辨標籤。
+    _view_filter = st.radio("顯示範圍", ["全部", "只看實際持股 💰", "只看觀察名單 👁️"], horizontal=True, key="view_filter")
+    if _view_filter == "只看實際持股 💰":
+        card_data = [d for d in card_data if portfolio.get(d['code'], {}).get('qty', 0) > 0]
+    elif _view_filter == "只看觀察名單 👁️":
+        card_data = [d for d in card_data if portfolio.get(d['code'], {}).get('qty', 0) <= 0]
+
     tab_tw, tab_us = st.tabs(["🇹🇼 台股主力陣列 (籌碼監控)", "🇺🇸 美股科技巨頭 (動能監控)"])
 
     with tab_tw:
         tw_cards = [d for d in card_data if not d['is_us']]
-        if not tw_cards: st.info("目前無台股持股紀錄。")
+        if not tw_cards: st.info("目前無符合篩選條件的台股。")
         for data in tw_cards: render_stock_card(data, system_history, portfolio)
 
     with tab_us:
         us_cards = [d for d in card_data if d['is_us']]
-        if not us_cards: st.info("目前無美股持股紀錄。")
+        if not us_cards: st.info("目前無符合篩選條件的美股。")
         for data in us_cards: render_stock_card(data, system_history, portfolio)
 
     st.divider()
