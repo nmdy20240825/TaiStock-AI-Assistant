@@ -91,14 +91,36 @@ def fetch_macro_data():
     return macro_status
 
 # --- 2. 報價與技術資料抓取 ---
+def _trim_trailing_nan_rows(df, max_trim=3, min_keep=60):
+    """
+    【V2.10.1 修正】Yahoo 的台股（TWSE/TPEx）資料源偶爾會在資料尾端多附一筆
+    「尚未結算/佔位用」的空列，整列 OHLC 都是 NaN——常發生在週末或跨時區查詢時，
+    而且是整個交易所的資料源問題，不是單一個股的問題，所以會一次影響所有台股，
+    但不影響美股（美股走的是另一條資料管線）。
+    這裡在抓完資料後，先把尾端這種空列去掉，讓後面的技術指標計算不會平白無故拿到 NaN，
+    導致整檔股票被 NaN 防呆機制跳過。最多只修剪 3 列，且不會修剪到低於 60 列，避免誤刪正常資料。
+    """
+    if df is None or df.empty or 'Close' not in df.columns:
+        return df
+    close_col = df['Close']
+    if isinstance(close_col, pd.DataFrame):
+        close_col = close_col.iloc[:, 0]
+    trim = 0
+    while trim < max_trim and len(df) - trim > min_keep and pd.isna(close_col.iloc[-1 - trim]):
+        trim += 1
+    return df.iloc[:-trim] if trim > 0 else df
+
 @st.cache_data(ttl=300)
 def fetch_stock_data(code):
     try:
-        if code.isalpha() or code.endswith('.US'): return yf.download(code.replace('.US', ''), period="6mo", progress=False)
-        if code.endswith('.TW') or code.endswith('.TWO'): return yf.download(code, period="6mo", progress=False)
-        df_tw = yf.download(f"{code}.TW", period="6mo", progress=False)
-        if df_tw is not None and not df_tw.empty and len(df_tw) > 0: return df_tw
-        return yf.download(f"{code}.TWO", period="6mo", progress=False)
+        if code.isalpha() or code.endswith('.US'):
+            df = yf.download(code.replace('.US', ''), period="6mo", progress=False)
+        elif code.endswith('.TW') or code.endswith('.TWO'):
+            df = yf.download(code, period="6mo", progress=False)
+        else:
+            df_tw = yf.download(f"{code}.TW", period="6mo", progress=False)
+            df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="6mo", progress=False)
+        return _trim_trailing_nan_rows(df)
     except Exception: return pd.DataFrame()
 
 # --- 3. 籌碼資料抓取 ---
@@ -523,14 +545,17 @@ else:
             atr = float(sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14)
             bias = float(((price - ma60) / ma60) * 100)
 
-            # 【V2.9.3 修正】yfinance 偶爾會回傳不完整的資料（例如最後一根K棒缺值），
+            # 【V2.9.3／V2.10.1 修正】yfinance 偶爾會回傳不完整的資料（例如最後一根K棒缺值），
             # 導致 price/ma/k/d/rsi/atr 等任一數值變成 NaN。NaN 沒被擋下來的話會一路
             # 傳到 st.progress()（讓整個分頁當機）跟 Google Sheet 寫入（NaN 不是合法 JSON，
             # 寫入會直接失敗）。這裡先做一次「健檢」，任何一項是 NaN 就跳過這檔股票，
-            # 等下一次重新抓資料時如果正常了，會自動恢復顯示。
-            _core_values = [price, volume, vol_ma5, pivot_point, ma10, ma20, ma60, macd, k, d, rsi, atr, bias]
-            if any(pd.isna(v) for v in _core_values):
-                st.warning(f"⚠️ {name or code} 本次抓到的資料不完整（yfinance 回傳缺值），已跳過這次分析，下次重新整理應會恢復正常。")
+            # 並且把是哪個欄位出問題列出來，方便下次追查是資料源哪裡不完整。
+            _core_named = {"現價": price, "成交量": volume, "5日均量": vol_ma5, "多空分水嶺": pivot_point,
+                           "MA10": ma10, "MA20": ma20, "MA60": ma60, "MACD": macd, "K": k, "D": d,
+                           "RSI": rsi, "ATR": atr, "季線乖離": bias}
+            _bad_fields = [k_name for k_name, v in _core_named.items() if pd.isna(v)]
+            if _bad_fields:
+                st.warning(f"⚠️ {name or code} 本次抓到的資料不完整（缺值欄位：{'、'.join(_bad_fields)}），已跳過這次分析，下次重新整理應會恢復正常。")
                 continue
 
             inst = get_institutional_data(code)
