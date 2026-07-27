@@ -667,7 +667,38 @@ else:
             elif confidence >= 40: position_pct, position_label = 0.2, "20%（僅觀察，避免重倉）"
             else: position_pct, position_label = 0.0, "0%（不建議進場）"
             suggested_shares_adjusted = int(suggested_shares * position_pct)
-            ai_advice.append(f"💰 建議倉位比例：{position_label}")
+            _held_qty = info.get('qty', 0) if isinstance(info, dict) else 0
+
+            if final_status == "🟢 進場" and _held_qty == 0:
+                # 這個比例只在「真的是進場訊號」且「手上還沒有這檔股票」時才有意義：
+                # 它是假設從零開始建倉的建議倉位。只要你已經持有（哪怕只有1股），
+                # 就改用下面的「加碼建議」邏輯，避免兩種建議同時出現造成混淆。
+                ai_advice.append(f"💰 建議倉位比例：{position_label}")
+
+            # 【V2.10.6 新增】加碼建議：專門給「手上已經有庫存」的人看，跟上面「建議倉位比例」
+            # （假設從零建倉）是互斥的兩件事——已持有時只會顯示這一段。設計上刻意做得保守，核心原則是：
+            # 絕不建議在虧損/警示狀態下加碼攤平（這是新手最常見的致命錯誤），
+            # 只有在「本來就賺錢、而且籌碼/量能/趨勢三燈同時確認、決策信心也夠高」時才會給加碼空間，
+            # 而且加碼股數會被你自己設定的「分配資金」上限鎖住，不會讓你越加越重倉。
+            if _held_qty > 0:
+                if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損", "🔵 停利退場"]:
+                    ai_advice.append("<span style='color: #f87171;'>❌ 不建議加碼：目前處於警示/停損停利狀態，加碼等於攤平虧損部位，違反紀律。</span>")
+                elif final_status not in ["🟢 進場", "🔥 利潤奔跑"]:
+                    ai_advice.append("⏸️ 暫不建議加碼：目前訊號不夠明確（觀望或接近停利階段），等待更清楚的多頭訊號再考慮。")
+                elif not (step1_pass and step2_pass and step3_pass):
+                    ai_advice.append("⏸️ 暫不建議加碼：SOP 三燈還沒有同時亮起（籌碼/量能/趨勢未同步確認）。")
+                elif confidence < 80:
+                    ai_advice.append(f"⏸️ 暫不建議加碼：決策信心僅 {confidence}%，還沒到高信心加碼的門檻（80%以上）。")
+                else:
+                    _current_value = _held_qty * price
+                    _remaining_room = max(0.0, cap - _current_value)
+                    _addon_shares = int(min(_remaining_room / price, suggested_shares_adjusted * 0.5)) if price > 0 else 0
+                    if _remaining_room <= 0:
+                        ai_advice.append("⏸️ 不建議加碼：目前持有市值已達到你設定的分配資金上限，加碼會超出原本的資金規劃。")
+                    elif _addon_shares > 0:
+                        ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%，資金額度內約可加碼 {_addon_shares} 股（不超過分配資金上限，且僅為原始建倉股數的一半，避免單押過重）。")
+                    else:
+                        ai_advice.append("⏸️ 資金額度所剩不多，加碼股數不足1股，暫不建議加碼。")
 
             if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]:
                 if isinstance(portfolio[code], dict) and 'break_date' not in portfolio[code]:
