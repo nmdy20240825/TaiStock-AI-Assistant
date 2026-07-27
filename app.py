@@ -597,7 +597,11 @@ else:
 
             is_us_stock = code.isalpha() or code.endswith('.US')
             score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0) if is_us_stock else min(inst['days'] * 5, 20) + (20 if inst['accumulated_shares'] * price >= 3000000000 else (10 if inst['accumulated_shares'] * price >= 1000000000 else 0))
-            score_tech = (10 if k > d else 0) + (10 if rsi > 50 else 0) + (10 if price > ma20 else 0)
+            # 【V2.10.7 修正】RSI>50 原本無條件+10分，但 RSI 極度過熱時（>80）已經是短線反轉風險區，
+            # 不該再算作「健康的偏多確認」，所以把這個加分的上限收窄到 50~80 之間；
+            # RSI 對趨勢分數的貢獻在 >80 時歸零，避免系統在超買區還持續給高分。
+            _rsi_bull_point = 10 if (rsi > 50 and rsi <= 80) else 0
+            score_tech = (10 if k > d else 0) + _rsi_bull_point + (10 if price > ma20 else 0)
             score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
             score_risk = (10 if price > atr_stop_price else 0) + (5 if price >= take_profit_price or price >= cost * 1.05 else 0) if cost > 0 else 15
 
@@ -650,6 +654,17 @@ else:
 
             for w in macro_warnings:
                 ai_advice.append(f"<span style='color: #fbbf24;'>{w}</span>")
+
+            # 【V2.10.7 新增】RSI 超買超賣警示：用台股較適合的 70/30 門檻（而非美股常用的80/20），
+            # 分「短線過熱/過冷」與「極度過熱/過冷」兩級，純粹是提醒性質，不影響上面已經算好的判定與分數。
+            if rsi > 80:
+                ai_advice.append("<span style='color: #fbbf24;'>⚠️ RSI已達極度過熱（{:.1f}，>80），短線反轉機率較高，不適合追高，若已持有可考慮分批獲利了結。</span>".format(rsi))
+            elif rsi > 70:
+                ai_advice.append("<span style='color: #fbbf24;'>⚠️ RSI偏向短線過熱（{:.1f}，>70），若已持有可留意分批獲利了結，避免此時追價。</span>".format(rsi))
+            elif rsi < 20:
+                ai_advice.append("<span style='color: #60a5fa;'>ℹ️ RSI已達極度過冷（{:.1f}，<20），短線反彈機率較高，但不建議貿然殺低出場。</span>".format(rsi))
+            elif rsi < 30:
+                ai_advice.append("<span style='color: #60a5fa;'>ℹ️ RSI偏向短線過冷（{:.1f}，<30），可開始留意是否有反彈買點，仍需搭配其他指標確認。</span>".format(rsi))
 
             # 【V2.10.5 新增】低流動性警示：5日均量過低代表買賣價差可能較大，
             # 新手照系統建議股數直接下市價單，容易買貴或賣便宜。門檻是粗略經驗值，
