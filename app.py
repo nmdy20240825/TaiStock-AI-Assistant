@@ -885,6 +885,21 @@ else:
             top_cols[i].metric(f"{emoji} {row['名稱']} ({row['代號']})", f"{row['現價']:.2f}", f"戰力: {row['AI分數']}分", delta_color="normal" if row['AI分數']>=70 else "off")
         st.divider()
 
+    # 【V2.10.9 新增】AI 等待清單：找出目前判定為🟡觀望、但分數已經接近70分進場門檻的股票，
+    # 只顯示「還差幾分」這種能從現有資料算出來的具體事實，不編造「預估幾天內達標」這類無法可靠預測的內容。
+    if card_data:
+        _waiting = sorted(
+            [d for d in card_data if d['final_status'] == "🟡 觀望" and d['ai_score'] >= 50],
+            key=lambda x: x['ai_score'], reverse=True
+        )
+        if _waiting:
+            st.markdown("### ⏳ AI 等待清單（快接近進場門檻）")
+            for d in _waiting[:5]:
+                _gap = 70 - d['ai_score']
+                st.write(f"**{d['name']} ({d['code']})** — 目前戰力 {d['ai_score']} 分，距離進場門檻（70分）還差 **{_gap} 分**")
+            st.caption("這裡只列出目前判定為🟡觀望、分數已≥50的股票，依分數高到低排序，最多顯示5檔。純粹反映「現在」的分數差距，不代表之後一定會達標，也不預測需要幾天。")
+            st.divider()
+
     if card_data:
         st.markdown("### ✅ 每日紀律檢核清單 (SOP)")
 
