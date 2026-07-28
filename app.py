@@ -892,13 +892,15 @@ else:
             [d for d in card_data if d['final_status'] == "🟡 觀望" and d['ai_score'] >= 50],
             key=lambda x: x['ai_score'], reverse=True
         )
+        st.markdown("### ⏳ AI 等待清單（快接近進場門檻）")
         if _waiting:
-            st.markdown("### ⏳ AI 等待清單（快接近進場門檻）")
             for d in _waiting[:5]:
                 _gap = 70 - d['ai_score']
                 st.write(f"**{d['name']} ({d['code']})** — 目前戰力 {d['ai_score']} 分，距離進場門檻（70分）還差 **{_gap} 分**")
             st.caption("這裡只列出目前判定為🟡觀望、分數已≥50的股票，依分數高到低排序，最多顯示5檔。純粹反映「現在」的分數差距，不代表之後一定會達標，也不預測需要幾天。")
-            st.divider()
+        else:
+            st.info("目前沒有任何股票落在「🟡觀望且分數≥50」的區間，等待清單暫時是空的。")
+        st.divider()
 
     if card_data:
         st.markdown("### ✅ 每日紀律檢核清單 (SOP)")
