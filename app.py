@@ -106,12 +106,16 @@ def fetch_macro_data():
     for key, symbol in tickers.items():
         try:
             df = yf.download(symbol, period="3mo", progress=False)
-            if not df.empty:
+            df = _trim_trailing_nan_rows(df)  # 同樣防範 Yahoo 尾端佔位空列的問題
+            if df is not None and not df.empty:
                 c_series = df['Close'].squeeze()
                 if isinstance(c_series, pd.DataFrame): c_series = c_series.iloc[:, 0]
                 c = float(c_series.iloc[-1])
                 ma20 = float(c_series.rolling(20).mean().iloc[-1])
-                macro_status[key] = {'price': c, 'ma20': ma20, 'trend': '🟢 多頭' if c > ma20 else '🔴 空頭'}
+                # 【V2.10.8 新增】記錄這筆資料實際對應的交易日期，讓畫面上能顯示「資料日期」，
+                # 使用者才能自己判斷這是不是最新資料，而不是完全信任一個數字。
+                _asof = df.index[-1]
+                macro_status[key] = {'price': c, 'ma20': ma20, 'trend': '🟢 多頭' if c > ma20 else '🔴 空頭', 'asof': _asof}
         except Exception:
             macro_status[key] = None
     return macro_status
@@ -507,6 +511,16 @@ def render_stock_card(data, system_history, portfolio_data):
                 else:
                     _remaining_pct = max(0.0, min(100.0, (_target - _price) / (_target - _cost) * 100))
                     st.caption(f"🎯 波段剩餘空間：還有 {_remaining_pct:.1f}%（距離目標價 {_target - _price:.2f} 元）")
+
+            # 【V2.10.8 新增】風報比 R值 = 報酬空間 ÷ 風險空間，專業交易常見的基本篩選門檻：
+            # R < 1 代表賺賠空間比例不划算；1~1.5 普通；≥1.5 才算是有吸引力的賠率結構。
+            _r = data.get('risk_reward_ratio')
+            if _r is not None:
+                _r_icon = "🟢" if _r >= 1.5 else ("🟡" if _r >= 1 else "🔴")
+                _r_note = "（賠率結構不錯）" if _r >= 1.5 else ("（普通，可接受）" if _r >= 1 else "（偏低，賺賠不成比例）")
+                st.caption(f"{_r_icon} 風報比 R = {_r:.2f} {_r_note}")
+            else:
+                st.caption("⚪ 風報比：目前無法計算（可能是尚未設定成本，或風險/報酬空間為零）")
         with tab_c4:
             if len(sorted_dates) > 1:
                 chart_data = pd.DataFrame([{"Date": d, "Score": hist_records[d]['score']} for d in sorted_dates[:10]]).set_index("Date").sort_index()
@@ -523,12 +537,31 @@ macro_data = fetch_macro_data()
 st.markdown("### 🌍 雙軌市場環境總覽")
 m_col1, m_col2, m_col3 = st.columns(3)
 
+def _render_macro_asof(col, asof):
+    # 【V2.10.8 新增】顯示資料實際對應的交易日期，並在資料超過3天沒更新時跳出警示，
+    # 讓使用者自己能判斷「這數字是不是卡住了」，不用只能憑感覺猜。
+    if asof is None:
+        return
+    _asof_ts = pd.Timestamp(asof)
+    if _asof_ts.tzinfo is not None:
+        _asof_ts = _asof_ts.tz_localize(None)
+    _days_old = (pd.Timestamp(datetime.datetime.now()) - _asof_ts).days
+    _date_str = _asof_ts.strftime("%Y-%m-%d")
+    if _days_old > 3:
+        col.caption(f"⚠️ 資料日期：{_date_str}（{_days_old}天前，可能不是最新資料，建議留意）")
+    else:
+        col.caption(f"資料日期：{_date_str}")
+
 tw_trend = macro_data.get('TW', {})
-if tw_trend: m_col1.metric("🇹🇼 台股加權 (大盤方向)", f"{tw_trend['price']:,.0f}", tw_trend['trend'], delta_color="normal" if "多頭" in tw_trend['trend'] else "inverse")
+if tw_trend:
+    m_col1.metric("🇹🇼 台股加權 (大盤方向)", f"{tw_trend['price']:,.0f}", tw_trend['trend'], delta_color="normal" if "多頭" in tw_trend['trend'] else "inverse")
+    _render_macro_asof(m_col1, tw_trend.get('asof'))
 else: m_col1.metric("🇹🇼 台股加權", "連線中...")
 
 us_trend = macro_data.get('US', {})
-if us_trend: m_col2.metric("🇺🇸 那斯達克 (科技風向)", f"{us_trend['price']:,.0f}", us_trend['trend'], delta_color="normal" if "多頭" in us_trend['trend'] else "inverse")
+if us_trend:
+    m_col2.metric("🇺🇸 那斯達克 (科技風向)", f"{us_trend['price']:,.0f}", us_trend['trend'], delta_color="normal" if "多頭" in us_trend['trend'] else "inverse")
+    _render_macro_asof(m_col2, us_trend.get('asof'))
 else: m_col2.metric("🇺🇸 那斯達克", "連線中...")
 
 vix_trend = macro_data.get('VIX', {})
@@ -536,6 +569,7 @@ if vix_trend:
     v_val = vix_trend['price']
     v_status, v_color = ("🚨 極度恐慌", "inverse") if v_val >= 25 else (("⚠️ 波動加劇", "off") if v_val >= 20 else ("🟢 環境穩定", "normal"))
     m_col3.metric("📉 VIX 恐慌指數", f"{v_val:.2f}", v_status, delta_color=v_color)
+    _render_macro_asof(m_col3, vix_trend.get('asof'))
 else: m_col3.metric("📉 VIX 恐慌指數", "連線中...")
 st.divider()
 
@@ -595,6 +629,12 @@ else:
             atr_stop_price = max(cost, ma20) if (cost > 0 and price > cost * 1.10) else (cost - (atr * 2) if cost > 0 else 0)
             take_profit_price = cost * 2.0 if (cost > 0 and price > cost * 1.10) else (cost * 1.10 if cost > 0 else 0)
 
+            # 【V2.10.8 新增】風報比 R值：報酬空間 ÷ 風險空間。這是專業交易最基本、但先前系統沒算的一環——
+            # 就算 SOP 三燈全亮、AI分數再高，如果賺賠空間比例本身不划算（R<1），這筆交易的賠率結構就是差的。
+            _risk_dist = price - atr_stop_price
+            _reward_dist = take_profit_price - price
+            risk_reward_ratio = (_reward_dist / _risk_dist) if (cost > 0 and _risk_dist > 0 and _reward_dist > 0) else None
+
             is_us_stock = code.isalpha() or code.endswith('.US')
             score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0) if is_us_stock else min(inst['days'] * 5, 20) + (20 if inst['accumulated_shares'] * price >= 3000000000 else (10 if inst['accumulated_shares'] * price >= 1000000000 else 0))
             # 【V2.10.7 修正】RSI>50 原本無條件+10分，但 RSI 極度過熱時（>80）已經是短線反轉風險區，
@@ -648,6 +688,8 @@ else:
             elif ai_score >= 70:
                 final_status = "🟢 進場"
                 ai_advice = [f"✓ 建議：可分批進場，防守線 {atr_stop_price:.1f}", "✓ 依據：綜合戰力強勢共振", f"🎯 決策信心：{confidence}%"]
+                if risk_reward_ratio is not None and risk_reward_ratio < 1:
+                    ai_advice.append(f"<span style='color: #f87171;'>⚠️ 風報比偏低（R={risk_reward_ratio:.2f}）：報酬空間比風險空間還小，就算分數達標，賠率結構也不划算，建議謹慎評估。</span>")
             else:
                 final_status = "🟡 觀望"
                 ai_advice = ["✓ 建議：保持空手盯盤", "✓ 依據：動能不足", f"🎯 決策信心：{confidence}%"]
@@ -741,7 +783,7 @@ else:
                 "cap": cap, "risk_amount": risk_amount, "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares, "shares_adjusted": suggested_shares_adjusted, "position_label": position_label,
                 "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
-                "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero
+                "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero, "risk_reward_ratio": risk_reward_ratio
             })
         except Exception as e: st.error(f"分析 {code} 發生錯誤: {e}")
 
