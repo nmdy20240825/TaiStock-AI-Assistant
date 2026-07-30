@@ -427,7 +427,14 @@ def render_stock_card(data, system_history, portfolio_data):
         col_c.metric("判定", data['final_status'])
 
         with col_d:
-            st.metric("部位", f"{data['shares_adjusted']}股" if data['final_status'] == "🟢 進場" else "-")
+            # 【V2.10.10 修正】原本只要判定是🟢進場就顯示「建倉建議股數」，沒檢查是否已持有，
+            # 導致跟下方「加碼建議」文字互相矛盾（一邊說暫不建議加碼，一邊卻在部位欄顯示一個大數字）。
+            # 現在改成：已持有時只顯示核准的加碼股數（沒核准就是「-」），空手時才顯示建倉建議股數。
+            if data.get('held_qty', 0) > 0:
+                _position_display = f"+{data['addon_shares_approved']}股（加碼）" if data.get('addon_shares_approved', 0) > 0 else "-"
+            else:
+                _position_display = f"{data['shares_adjusted']}股" if data['final_status'] == "🟢 進場" else "-"
+            st.metric("部位", _position_display)
             if data['final_status'] in ["🔵 停利退場", "🔴 破損", "🔴 破線", "⚠️ 帳面虧損"]:
                 if st.button("📦 手動歸檔 (已結算)", key=f"close_{data['code']}"):
                     portfolio_data[data['code']]['status'] = "Closed"
@@ -737,6 +744,7 @@ else:
             # 絕不建議在虧損/警示狀態下加碼攤平（這是新手最常見的致命錯誤），
             # 只有在「本來就賺錢、而且籌碼/量能/趨勢三燈同時確認、決策信心也夠高」時才會給加碼空間，
             # 而且加碼股數會被你自己設定的「分配資金」上限鎖住，不會讓你越加越重倉。
+            addon_shares_approved = 0
             if _held_qty > 0:
                 if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損", "🔵 停利退場"]:
                     ai_advice.append("<span style='color: #f87171;'>❌ 不建議加碼：目前處於警示/停損停利狀態，加碼等於攤平虧損部位，違反紀律。</span>")
@@ -753,6 +761,7 @@ else:
                     if _remaining_room <= 0:
                         ai_advice.append("⏸️ 不建議加碼：目前持有市值已達到你設定的分配資金上限，加碼會超出原本的資金規劃。")
                     elif _addon_shares > 0:
+                        addon_shares_approved = _addon_shares
                         ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%，資金額度內約可加碼 {_addon_shares} 股（不超過分配資金上限，且僅為原始建倉股數的一半，避免單押過重）。")
                     else:
                         ai_advice.append("⏸️ 資金額度所剩不多，加碼股數不足1股，暫不建議加碼。")
@@ -782,6 +791,7 @@ else:
                 "ma10": ma10, "ma20": ma20, "ma60": ma60, "macd": macd, "k": k, "d": d, "rsi": rsi, "atr": atr, "bias": bias, "inst": inst, "tags": tags,
                 "cap": cap, "risk_amount": risk_amount, "step1": step1_pass, "step2": step2_pass, "step3": step3_pass,
                 "ai_score": ai_score, "final_status": final_status, "shares": suggested_shares, "shares_adjusted": suggested_shares_adjusted, "position_label": position_label,
+                "held_qty": _held_qty, "addon_shares_approved": addon_shares_approved,
                 "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
                 "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero, "risk_reward_ratio": risk_reward_ratio
             })
@@ -927,7 +937,13 @@ else:
                 elif data['final_status'] == "🔵 停利退場": action_sell.append(f"🛡️ **紀律停利**：{data['name']} 現價 {data['price']:.2f} 跌破動態防守 {data['atr_stop_price']:.1f}。")
                 elif data['final_status'] == "⚠️ 帳面虧損": action_sell.append(f"⚠️ **帳面虧損**：{data['name']} 現價 {data['price']:.2f} 已跌破設定成本，請審慎評估。")
                 elif data['final_status'] == "🔥 利潤奔跑": action_watch.append(f"🚀 **獲利續抱**：{data['name']} 月線 {data['atr_stop_price']:.1f} 不破不賣！")
-                elif data['final_status'] == "🟢 進場": action_buy.append(f"🎯 **進場佈局**：{data['name']} 戰力達 {data['ai_score']} 分，建議部位：{data['shares_adjusted']} 股（倉位比例 {data['position_label']}）。")
+                elif data['final_status'] == "🟢 進場":
+                    if data.get('held_qty', 0) > 0:
+                        if data.get('addon_shares_approved', 0) > 0:
+                            action_watch.append(f"📈 **可考慮加碼**：{data['name']} 已持有中，資金額度內約可加碼 {data['addon_shares_approved']} 股。")
+                        # 已持有但未核准加碼時，這檔股票的「🟢進場」狀態對你來說不是新機會，不重複顯示在佈局清單
+                    else:
+                        action_buy.append(f"🎯 **進場佈局**：{data['name']} 戰力達 {data['ai_score']} 分，建議部位：{data['shares_adjusted']} 股（倉位比例 {data['position_label']}）。")
                 elif data['final_status'] == "🟡 接近停利": action_watch.append(f"⚠️ **防守上調**：{data['name']} 獲利脫離成本，停損設為成本價。")
                 elif data['final_status'] == "🔴 破線": action_watch.append(f"📉 **弱勢預警**：{data['name']} 跌破月線防守區。")
 
