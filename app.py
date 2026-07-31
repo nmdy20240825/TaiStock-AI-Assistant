@@ -392,6 +392,24 @@ with st.sidebar:
         except Exception as e:
             st.error(f"⚠️ CSV 格式讀取失敗，請確認欄位名稱是否正確：{e}")
 
+    st.divider()
+    st.subheader("⏸️ 暫停分析（長期持有）/ ▶️ 恢復分析")
+    st.caption("暫停後不會出現在每日分析清單、健康度統計、排行榜、SOP清單裡，但仍會計入資產總覽的損益（如果有填持有股數）。")
+    _active_codes = [c for c, i in portfolio.items() if isinstance(i, dict) and i.get('status', 'Active') == 'Active']
+    _paused_codes = [c for c, i in portfolio.items() if isinstance(i, dict) and i.get('status') == 'Paused']
+
+    _pause_target = st.selectbox("選擇要暫停分析的股票", [""] + _active_codes, key="pause_select")
+    if st.button("⏸️ 暫停分析") and _pause_target:
+        portfolio[_pause_target]['status'] = 'Paused'
+        save_portfolio(portfolio)
+        st.rerun()
+
+    _resume_target = st.selectbox("選擇要恢復分析的股票", [""] + _paused_codes, key="resume_select")
+    if st.button("▶️ 恢復每日分析") and _resume_target:
+        portfolio[_resume_target]['status'] = 'Active'
+        save_portfolio(portfolio)
+        st.rerun()
+
 # --- 卡片渲染邏輯 ---
 def render_stock_card(data, system_history, portfolio_data):
     with st.container(border=True):
@@ -583,12 +601,31 @@ st.divider()
 if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號！")
 else:
-    summary_data, card_data = [], []
+    summary_data, card_data, paused_data = [], [], []
 
     for code, info in list(portfolio.items()):
         if isinstance(info, dict):
-            if info.get('status') == 'Closed': continue
+            _status = info.get('status', 'Active')
+            if _status == 'Closed': continue
             name, cost, cap, risk_pct = info.get('name', ''), info.get('cost', 0.0), info.get('cap', 20000.0), info.get('risk', 5.0)
+            if _status == 'Paused':
+                # 【V2.10.11 新增】暫停分析（長期持有）：跳過完整的技術指標/AI分數計算，
+                # 不出現在每日分析清單、健康度統計、排行榜、SOP清單裡，也不消耗額外的籌碼資料API額度，
+                # 但如果有填持有股數，仍然抓一次現價，讓「資產總覽」的總損益能繼續反映這筆部位，不會悄悄消失。
+                _qty_paused = info.get('qty', 0)
+                if _qty_paused > 0:
+                    try:
+                        _pdf = fetch_stock_data(code)
+                        if _pdf is not None and not _pdf.empty:
+                            _pc = _pdf['Close'].squeeze()
+                            if isinstance(_pc, pd.DataFrame): _pc = _pc.iloc[:, 0]
+                            _pprice = float(_pc.iloc[-1])
+                            if not pd.isna(_pprice):
+                                paused_data.append({'code': code, 'name': name, 'cost': cost, 'price': _pprice, 'qty': _qty_paused,
+                                                     'is_us': code.isalpha() or code.endswith('.US')})
+                    except Exception:
+                        pass
+                continue
         else:
             name, cost, cap, risk_pct = info if len(info) == 4 else (info[0], info[1], 20000.0, 5.0)
 
@@ -825,9 +862,11 @@ else:
 
     # 【V2.10.2 修正】資產總覽依幣別（台幣／美金）分開計算，原本會把美股(美金)跟台股(台幣)
     # 直接加總，數字沒有意義；現在拆成兩組，各自算總投入成本、總市值、總損益。
-    if card_data:
+    # 【V2.10.11 新增】暫停分析中的長期持有（paused_data）也會併入計算，避免歸檔/暫停後
+    # 這筆部位的損益悄悄從總覽消失，讓數字不再反映真實資產狀況。
+    if card_data or paused_data:
         st.markdown("### 💰 資產總覽（依持有股數計算）")
-        _valued_cards = [d for d in card_data if portfolio.get(d['code'], {}).get('qty', 0) > 0]
+        _valued_cards = [d for d in card_data if portfolio.get(d['code'], {}).get('qty', 0) > 0] + paused_data
         if not _valued_cards:
             st.info("目前沒有任何持股填寫「持有股數」，所以無法計算實際總損益。到側邊欄的「持有股數」欄位填入你實際持有的股數（留 0 代表純訊號監控），這裡就會自動算出總投入成本、總市值與總損益。")
         else:
@@ -849,12 +888,16 @@ else:
                         _qty = portfolio[d['code']].get('qty', 0)
                         _pl = (d['price'] - d['cost']) * _qty
                         _pl_pct = ((d['price'] - d['cost']) / d['cost'] * 100) if d['cost'] > 0 else 0.0
-                        _rows.append({"代號": d['code'], "名稱": d['name'], "股數": _qty, "成本": round(d['cost'], 2),
+                        _is_paused = portfolio.get(d['code'], {}).get('status') == 'Paused'
+                        _display_name = ("⏸️ " if _is_paused else "") + d['name']
+                        _rows.append({"代號": d['code'], "名稱": _display_name, "股數": _qty, "成本": round(d['cost'], 2),
                                       "現價": round(d['price'], 2), "損益": round(_pl, 0), "損益%": round(_pl_pct, 2)})
                     st.dataframe(pd.DataFrame(_rows).sort_values("損益", ascending=False).reset_index(drop=True), use_container_width=True, hide_index=True)
 
             _render_asset_group([d for d in _valued_cards if not d['is_us']], "🇹🇼 台股資產（新台幣 TWD）", "TWD")
             _render_asset_group([d for d in _valued_cards if d['is_us']], "🇺🇸 美股資產（美金 USD）", "USD")
+            if paused_data:
+                st.caption("⏸️ 標記的股票是「暫停分析／長期持有」狀態，明細表裡看得到但不會出現在每日分析清單、健康度統計、排行榜裡。")
             st.caption("⚠️ 兩組數字幣別不同，不會加總在一起顯示；如果你想看合併後的台幣總資產，需要自己乘上當下匯率換算，系統目前沒有自動抓匯率。")
         st.divider()
 
