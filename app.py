@@ -498,21 +498,31 @@ def render_stock_card(data, system_history, portfolio_data):
             c_t1, c_t2 = st.columns(2)
             c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}\n**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
             c_t2.write(f"**MA20**: {data['ma20']:.2f} | **MA60**: {data['ma60']:.2f}\n**MACD(DIF)**: {data['macd']:.2f} | **季線乖離**: {data['bias']:.2f}%")
-            # 【V2.10 新增①】自動畫K線圖：直接用已經抓過（有快取）的價量資料畫蠟燭圖疊 MA20/MA60，
-            # 不用另外跳去看 TradingView。台股慣例紅漲綠跌，跟西方常見的紅跌綠漲相反，這裡有特別標明。
+            # 【V2.10 新增①／V2.10.12 新增】自動畫K線圖：疊上 MA10/MA20/MA60 跟布林軌道。
+            # MA10 是因為系統的「多頭排列」判斷本來就是看 MA10>MA20>MA60，把它畫出來才能親眼核對；
+            # 布林軌道（MA20±2倍標準差）則是把「RSI超買超賣」文字提醒的概念視覺化，貼上軌=過熱、貼下軌=過冷，
+            # 軌道寬窄變化也能看出最近是盤整還是變動劇烈。台股慣例紅漲綠跌，跟西方常見的紅跌綠漲相反，這裡有特別標明。
             st.markdown("**📉 K線走勢圖（近60日，紅漲綠跌）**")
             try:
                 _chart_df = fetch_stock_data(data['code'])
                 if _chart_df is not None and not _chart_df.empty and len(_chart_df) >= 20:
                     _cc, _hh, _ll, _oo = _chart_df['Close'].squeeze(), _chart_df['High'].squeeze(), _chart_df['Low'].squeeze(), _chart_df['Open'].squeeze()
                     if isinstance(_cc, pd.DataFrame): _cc, _hh, _ll, _oo = _cc.iloc[:, 0], _hh.iloc[:, 0], _ll.iloc[:, 0], _oo.iloc[:, 0]
+                    _ma10_line = _cc.rolling(10).mean()
                     _ma20_line = _cc.rolling(20).mean()
                     _ma60_line = _cc.rolling(60).mean()
+                    _boll_std = _cc.rolling(20).std()
+                    _boll_upper = _ma20_line + 2 * _boll_std
+                    _boll_lower = _ma20_line - 2 * _boll_std
                     _n = min(60, len(_chart_df))
                     _fig = go.Figure(data=[go.Candlestick(
                         x=_chart_df.index[-_n:], open=_oo.iloc[-_n:], high=_hh.iloc[-_n:], low=_ll.iloc[-_n:], close=_cc.iloc[-_n:],
                         increasing_line_color='#f87171', decreasing_line_color='#4ade80', name="K線",
                     )])
+                    _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_boll_upper.iloc[-_n:], line=dict(color='#94a3b8', width=1, dash='dot'), name="布林上軌"))
+                    _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_boll_lower.iloc[-_n:], line=dict(color='#94a3b8', width=1, dash='dot'), name="布林下軌",
+                                               fill='tonexty', fillcolor='rgba(148, 163, 184, 0.08)'))
+                    _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_ma10_line.iloc[-_n:], line=dict(color='#c084fc', width=1), name="MA10"))
                     _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_ma20_line.iloc[-_n:], line=dict(color='#facc15', width=1), name="MA20"))
                     _fig.add_trace(go.Scatter(x=_chart_df.index[-_n:], y=_ma60_line.iloc[-_n:], line=dict(color='#60a5fa', width=1), name="MA60"))
                     _fig.update_layout(
