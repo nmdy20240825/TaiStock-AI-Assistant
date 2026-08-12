@@ -665,6 +665,8 @@ else:
             rsi = float(100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001)))))
             atr = float(sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-13, 0)]) / 14)
             bias = float(((price - ma60) / ma60) * 100)
+            # 【V2.11 修正②】布林上軌：用於跟 RSI 超買訊號交叉確認，不進計分公式，純粹是文字警示用。
+            boll_upper = float((c.rolling(20).mean() + 2 * c.rolling(20).std()).iloc[-1])
 
             # 【V2.9.3／V2.10.1 修正】yfinance 偶爾會回傳不完整的資料（例如最後一根K棒缺值），
             # 導致 price/ma/k/d/rsi/atr 等任一數值變成 NaN。NaN 沒被擋下來的話會一路
@@ -673,15 +675,25 @@ else:
             # 並且把是哪個欄位出問題列出來，方便下次追查是資料源哪裡不完整。
             _core_named = {"現價": price, "成交量": volume, "5日均量": vol_ma5, "多空分水嶺": pivot_point,
                            "MA10": ma10, "MA20": ma20, "MA60": ma60, "MACD": macd, "K": k, "D": d,
-                           "RSI": rsi, "ATR": atr, "季線乖離": bias}
+                           "RSI": rsi, "ATR": atr, "季線乖離": bias, "布林上軌": boll_upper}
             _bad_fields = [k_name for k_name, v in _core_named.items() if pd.isna(v)]
             if _bad_fields:
                 st.warning(f"⚠️ {name or code} 本次抓到的資料不完整（缺值欄位：{'、'.join(_bad_fields)}），已跳過這次分析，下次重新整理應會恢復正常。")
                 continue
 
             inst = get_institutional_data(code)
-            atr_stop_price = max(cost, ma20) if (cost > 0 and price > cost * 1.10) else (cost - (atr * 2) if cost > 0 else 0)
-            take_profit_price = cost * 2.0 if (cost > 0 and price > cost * 1.10) else (cost * 1.10 if cost > 0 else 0)
+            # 【V2.11 修正①】原本獲利>10%時目標價固定是 成本×2.0，股票漲翻倍以上就會被自己的漲幅追過去，
+            # 導致「波段剩餘空間」永遠顯示已達標、風報比R值失去意義（TSM那種長期大波段股票就是這樣）。
+            # 改成目標價跟著現價走：現價 + 3倍ATR，目標永遠在現價前方一段距離，R值/剩餘空間%會持續有意義。
+            if cost > 0 and price > cost * 1.10:
+                atr_stop_price = max(cost, ma20)
+                take_profit_price = price + 3 * atr
+            elif cost > 0:
+                atr_stop_price = cost - (atr * 2)
+                take_profit_price = cost * 1.10
+            else:
+                atr_stop_price = 0
+                take_profit_price = 0
 
             # 【V2.10.8 新增】風報比 R值：報酬空間 ÷ 風險空間。這是專業交易最基本、但先前系統沒算的一環——
             # 就算 SOP 三燈全亮、AI分數再高，如果賺賠空間比例本身不划算（R<1），這筆交易的賠率結構就是差的。
@@ -751,12 +763,21 @@ else:
             for w in macro_warnings:
                 ai_advice.append(f"<span style='color: #fbbf24;'>{w}</span>")
 
-            # 【V2.10.7 新增】RSI 超買超賣警示：用台股較適合的 70/30 門檻（而非美股常用的80/20），
+            # 【V2.10.7 新增／V2.11 修正②】RSI 超買超賣警示：用台股較適合的 70/30 門檻（而非美股常用的80/20），
             # 分「短線過熱/過冷」與「極度過熱/過冷」兩級，純粹是提醒性質，不影響上面已經算好的判定與分數。
+            # V2.11 加入布林上軌交叉確認：RSI過熱同時股價又觸及/突破布林上軌，代表兩個獨立訊號一起示警，
+            # 用更強烈的文字標示，但仍然只是提醒，不改動任何分數或判定。
+            _boll_touch = price >= boll_upper
             if rsi > 80:
-                ai_advice.append("<span style='color: #fbbf24;'>⚠️ RSI已達極度過熱（{:.1f}，>80），短線反轉機率較高，不適合追高，若已持有可考慮分批獲利了結。</span>".format(rsi))
+                if _boll_touch:
+                    ai_advice.append("<span style='color: #f87171;'>🚨 雙重過熱確認：RSI已達{:.1f}（>80）同時股價已觸及/突破布林上軌，短線反轉風險更高，強烈不建議此時追高。</span>".format(rsi))
+                else:
+                    ai_advice.append("<span style='color: #fbbf24;'>⚠️ RSI已達極度過熱（{:.1f}，>80），短線反轉機率較高，不適合追高，若已持有可考慮分批獲利了結。</span>".format(rsi))
             elif rsi > 70:
-                ai_advice.append("<span style='color: #fbbf24;'>⚠️ RSI偏向短線過熱（{:.1f}，>70），若已持有可留意分批獲利了結，避免此時追價。</span>".format(rsi))
+                if _boll_touch:
+                    ai_advice.append("<span style='color: #f87171;'>🚨 雙重過熱確認：RSI偏向過熱（{:.1f}，>70）同時股價已觸及/突破布林上軌，兩個訊號一起示警，若已持有建議留意分批獲利了結。</span>".format(rsi))
+                else:
+                    ai_advice.append("<span style='color: #fbbf24;'>⚠️ RSI偏向短線過熱（{:.1f}，>70），若已持有可留意分批獲利了結，避免此時追價。</span>".format(rsi))
             elif rsi < 20:
                 ai_advice.append("<span style='color: #60a5fa;'>ℹ️ RSI已達極度過冷（{:.1f}，<20），短線反彈機率較高，但不建議貿然殺低出場。</span>".format(rsi))
             elif rsi < 30:
@@ -786,11 +807,14 @@ else:
                 # 就改用下面的「加碼建議」邏輯，避免兩種建議同時出現造成混淆。
                 ai_advice.append(f"💰 建議倉位比例：{position_label}")
 
-            # 【V2.10.6 新增】加碼建議：專門給「手上已經有庫存」的人看，跟上面「建議倉位比例」
+            # 【V2.10.6 新增／V2.11 修正④】加碼建議：專門給「手上已經有庫存」的人看，跟上面「建議倉位比例」
             # （假設從零建倉）是互斥的兩件事——已持有時只會顯示這一段。設計上刻意做得保守，核心原則是：
             # 絕不建議在虧損/警示狀態下加碼攤平（這是新手最常見的致命錯誤），
             # 只有在「本來就賺錢、而且籌碼/量能/趨勢三燈同時確認、決策信心也夠高」時才會給加碼空間，
             # 而且加碼股數會被你自己設定的「分配資金」上限鎖住，不會讓你越加越重倉。
+            # V2.11 加入價格間距限制：現價要比成本價至少拉開0.5倍ATR，才核准加碼，避免在成本附近小區間
+            # 盤整、趨勢還沒真正走出來的時候就被建議加碼。系統沒有交易日誌記錄「上次加碼價位」，
+            # 這裡用「距離成本價」當替代基準，精神一致但不是逐筆追蹤每次加碼的間距。
             addon_shares_approved = 0
             if _held_qty > 0:
                 if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損", "🔵 停利退場"]:
@@ -801,6 +825,8 @@ else:
                     ai_advice.append("⏸️ 暫不建議加碼：SOP 三燈還沒有同時亮起（籌碼/量能/趨勢未同步確認）。")
                 elif confidence < 80:
                     ai_advice.append(f"⏸️ 暫不建議加碼：決策信心僅 {confidence}%，還沒到高信心加碼的門檻（80%以上）。")
+                elif atr > 0 and price < cost + 0.5 * atr:
+                    ai_advice.append(f"⏸️ 暫不建議加碼：現價距離成本還沒拉開足夠空間（門檻約 {cost + 0.5 * atr:.2f}），可能還在整理區間，避免提早加碼。")
                 else:
                     _current_value = _held_qty * price
                     _remaining_room = max(0.0, cap - _current_value)
@@ -809,7 +835,7 @@ else:
                         ai_advice.append("⏸️ 不建議加碼：目前持有市值已達到你設定的分配資金上限，加碼會超出原本的資金規劃。")
                     elif _addon_shares > 0:
                         addon_shares_approved = _addon_shares
-                        ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%，資金額度內約可加碼 {_addon_shares} 股（不超過分配資金上限，且僅為原始建倉股數的一半，避免單押過重）。")
+                        ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%、現價已與成本拉開足夠空間，資金額度內約可加碼 {_addon_shares} 股（不超過分配資金上限，且僅為原始建倉股數的一半，避免單押過重）。")
                     else:
                         ai_advice.append("⏸️ 資金額度所剩不多，加碼股數不足1股，暫不建議加碼。")
 
