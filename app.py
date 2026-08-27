@@ -1252,7 +1252,7 @@ else:
             ai_advice.extend([f"🎯 決策信心：{confidence}%"] + [f"<span style='color:#fbbf24;'>{w}</span>" for w in macro_warnings])
             boll_touch = price >= boll_upper
             if rsi > 80:
-                ai_advice.append(f"<span style='color:#f87171;'>🚨 RSI 極度過熱：{rsi:.1f}；{\"同時觸及布林上軌。\" if boll_touch else \"請避免追高。\"}</span>")
+                ai_advice.append(f"<span style='color:#f87171;'>🚨 RSI 極度過熱：{rsi:.1f}；{"同時觸及布林上軌。" if boll_touch else "請避免追高。"}</span>")
             elif rsi > 70:
                 ai_advice.append(f"<span style='color:#fbbf24;'>⚠️ RSI 短線過熱：{rsi:.1f}，留意分批停利。</span>")
             elif rsi < 30:
