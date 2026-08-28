@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.3"
+APP_VERSION = "V2.11.4"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -1041,10 +1041,16 @@ def calculate_position_size(cap, risk_pct, entry_price, stop_price, available_ca
 def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, cost):
     """
     【V2.11.x 核心修正】有狀態版移動防守線，取代舊版「每次重新掃描過去60天重建棘輪」的無狀態算法。
-    直接讀取上一次已保存的 previous_stop 當基準，新防守線只會是三者取最大值，天然滿足「只能上移」：
+    直接讀取上一次已保存的 previous_stop 當基準，新防守線只會是兩者取最大值，天然滿足「只能上移」：
       initial_stop（只在 previous_stop 還不存在時，即首次建倉時使用）＝ cost − 2×ATR
       candidate_stop ＝ MA20 − ATR
-      new_stop = max(previous_stop 或 initial_stop, candidate_stop, cost)
+      new_stop = max(previous_stop 或 initial_stop, candidate_stop)
+
+    【V2.11.4 修正】拿掉了先前版本 max() 裡的 cost_f，那樣寫會導致「還沒獲利」的部位防守線也被
+    強制拉到成本價，等於初始的 ATR 緩衝空間完全失效，只要收盤價比成本價低一點點（完全正常的小拉回）
+    就會被誤判跌破防守線、強制全部出清。拿掉之後：day 1 的防守線正確落在 cost−2×ATR（給合理緩衝），
+    之後隨著 candidate_stop（MA20−ATR）自然墊高、透過棘輪只升不降的特性，一旦行情真的走出來，
+    防守線會自然而然墊到成本價以上（保本），不需要用力把 cost 塞進 max() 裡強迫達成。
     """
     cost_f = _safe_float(cost)
     if cost_f <= 0:
@@ -1052,14 +1058,22 @@ def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, co
     initial_stop = cost_f - 2 * _safe_float(atr)
     base = _safe_float(previous_stop) if _safe_float(previous_stop) > 0 else initial_stop
     candidate_stop = _safe_float(ma20) - _safe_float(atr)
-    return max(base, candidate_stop, cost_f)
+    return max(base, candidate_stop)
 
 def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, previous_high,
-                         t1_taken, t2_taken, current_shares, is_us_stock=False, partial_exit_ratio=0.30):
+                         t1_taken, t2_taken, current_shares, is_us_stock=False, partial_exit_ratio=0.30,
+                         macd_osc_status=None):
     """
     出清／分批停利計畫（規格書 9、10節）。回傳 dict 一定含 current_trailing_stop 與 t1_price/t2_price，
     並在符合條件時附上 next_state 建議（呼叫端 evaluate_trade_state 會再用 transition_state 實際套用，
     確保優先權判斷：全部出清 > T2 > T1 > 續抱，全部在這個函式內部就決定好，呼叫端不需要再重排順序）。
+
+    【MACD深度整合】macd_osc_status 是「日線」MACD柱狀體狀態（翻紅第1根/正值/負值/收腳中/翻黑/None）。
+    只用「已確認翻黑」（柱狀體由正轉負，不是還在醞釀的頂背離）觸發分批停利，且觸發條件是「價格到達
+    T1/T2 結構化目標」或「MACD翻黑」兩者任一成立即可——用兩套獨立的訊號來源互相補位：結構化目標抓
+    「漲多少該獲利了結」，MACD翻黑抓「動能真的轉弱了，不用等價格真的碰到目標價才反應」。刻意不用
+    「頂背離」這種還在醞釀階段的訊號來觸發賣出，避免對正常回檔反應過度、犧牲「讓利潤奔跑」的精神；
+    頂背離的用途是攔阻「新進場」與「加碼」，不是拿來提前出場。
     """
     current_trailing_stop = calculate_trailing_stop_stateful(previous_trailing_stop, price, ma20, atr, average_cost)
     if _safe_float(previous_high) > 0 and _safe_float(atr) > 0:
@@ -1081,15 +1095,30 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
                         "full_exit_shares": current_shares})
         return result
 
-    if not t1_taken and t1_price > 0 and price >= t1_price:
-        result.update({"next_state": "PARTIAL_EXIT_NEXT_DAY", "signal_type": "T1_PARTIAL_EXIT",
-                        "signal_reason": f"到達第一目標 T1（{t1_price:.2f}），隔日分批停利",
+    macd_confirmed_bearish = macd_osc_status == "翻黑"
+    is_profitable = _safe_float(average_cost) > 0 and price > average_cost
+
+    if not t1_taken and ((t1_price > 0 and price >= t1_price) or (macd_confirmed_bearish and is_profitable)):
+        if t1_price > 0 and price >= t1_price:
+            reason = f"到達第一目標 T1（{t1_price:.2f}），隔日分批停利"
+            signal_type = "T1_PARTIAL_EXIT"
+        else:
+            reason = "MACD日線柱狀體翻黑（動能確認轉弱），尚未到達T1但提前分批停利，保留獲利"
+            signal_type = "MACD_REVERSAL_T1"
+        result.update({"next_state": "PARTIAL_EXIT_NEXT_DAY", "signal_type": signal_type,
+                        "signal_reason": reason,
                         "partial_exit_shares": max(1, int(current_shares * _safe_float(partial_exit_ratio, 0.30)))})
         return result
 
-    if t1_taken and not t2_taken and t2_price > 0 and price >= t2_price:
-        result.update({"next_state": "PARTIAL_EXIT_NEXT_DAY", "signal_type": "T2_PARTIAL_EXIT",
-                        "signal_reason": f"到達第二目標 T2（{t2_price:.2f}），隔日第二段停利",
+    if t1_taken and not t2_taken and ((t2_price > 0 and price >= t2_price) or (macd_confirmed_bearish and is_profitable)):
+        if t2_price > 0 and price >= t2_price:
+            reason = f"到達第二目標 T2（{t2_price:.2f}），隔日第二段停利"
+            signal_type = "T2_PARTIAL_EXIT"
+        else:
+            reason = "MACD日線柱狀體翻黑（動能確認轉弱），尚未到達T2但提前出清剩餘部位，保留獲利"
+            signal_type = "MACD_REVERSAL_T2"
+        result.update({"next_state": "PARTIAL_EXIT_NEXT_DAY", "signal_type": signal_type,
+                        "signal_reason": reason,
                         "partial_exit_shares": current_shares})
         return result
 
@@ -1101,6 +1130,11 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     空手進場計畫（規格書 7節）。indicators 需含：price, atr, previous_high, ma20, decision_score,
     trend_gate, chip_gate, volume_gate, r1, market_regime, is_us_stock, data_date。
     entry_gate 沒通過或 decision_score < 70 時回傳 None（不建立計畫，維持 PREPARE）。
+
+    【MACD深度整合】indicators 可另外帶 macd_osc_status／macd_divergence_type（日線）。
+    只要日線出現「頂背離」（價格創新高但動能已經在衰竭，假突破的典型特徵）或「翻黑」，
+    就直接擋下這次建立新進場計畫——這是本次整合最核心的目的：避開假突破。
+    缺這兩個欄位（資料不足/尚未計算）時視為中性，不影響進場判斷。
     """
     price = _safe_float(indicators.get("price"))
     atr = _safe_float(indicators.get("atr"))
@@ -1108,11 +1142,15 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     decision_score = _safe_float(indicators.get("decision_score"))
     is_us_stock = bool(indicators.get("is_us_stock"))
     data_date = indicators.get("data_date", "")
+    macd_osc_status = indicators.get("macd_osc_status")
+    macd_divergence_type = indicators.get("macd_divergence_type")
+    macd_blocks_entry = macd_divergence_type == "頂背離" or macd_osc_status == "翻黑"
 
     entry_gate_pass = bool(
         indicators.get("trend_gate") and indicators.get("chip_gate") and indicators.get("volume_gate")
         and (indicators.get("r1") is not None and indicators.get("r1") >= 1.5)
         and indicators.get("market_regime") != "BEARISH"
+        and not macd_blocks_entry
     )
     if not entry_gate_pass or decision_score < 70 or atr <= 0:
         return None
@@ -1206,6 +1244,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             plan.get("current_trailing_stop") or plan.get("initial_stop"),
             indicators.get("previous_high"), plan.get("t1_taken"), plan.get("t2_taken"),
             held_qty, is_us_stock, plan.get("partial_exit_ratio", 0.30),
+            macd_osc_status=indicators.get("macd_osc_status"),
         )
         plan["t1_price"] = exit_plan["t1_price"] if plan.get("t1_price", 0) <= 0 else plan["t1_price"]
         plan["t2_price"] = exit_plan["t2_price"] if plan.get("t2_price", 0) <= 0 else plan["t2_price"]
@@ -2022,6 +2061,10 @@ else:
                     ai_advice.append(f"⏸️ 暫不建議加碼：決策信心僅 {confidence}%，還沒到高信心加碼的門檻（80%以上）。")
                 elif atr > 0 and price < cost + 0.5 * atr:
                     ai_advice.append(f"⏸️ 暫不建議加碼：現價距離成本還沒拉開足夠空間（門檻約 {cost + 0.5 * atr:.2f}），可能還在整理區間，避免提早加碼。")
+                elif _macd_daily_result.error is None and (_macd_daily_result.divergence_type == "頂背離" or _macd_daily_result.osc_status == "翻黑"):
+                    # 【MACD深度整合】新增關卡：日線MACD出現頂背離或已翻黑，代表動能可能已經在轉弱，
+                    # 這時候不該再加重部位，即使前面幾道關卡都通過也一樣暫停加碼。
+                    ai_advice.append(f"⏸️ 暫不建議加碼：日線MACD出現「{_macd_daily_result.divergence_type if _macd_daily_result.divergence_type == '頂背離' else _macd_daily_result.osc_status}」，動能可能轉弱，暫緩加碼觀察後續。")
                 else:
                     _addon_quality_gate_pass = True
                     _current_value = _held_qty * price
@@ -2068,11 +2111,19 @@ else:
                 _entry_r1 = None
 
             _old_plan = _normalize_trade_plan_row(trade_plan_data.get(code, _trade_plan_defaults(code)))
+            # 【MACD深度整合】把「日線」MACD結果讀出來，餵給交易計畫狀態機。用日線而不用週線，
+            # 是因為週線需要至少35週歷史暖身、新股常常「資料不足」，若拿週線去擋新倉/加碼，
+            # 會讓剛上市股票長期卡死無法進場；日線資料完整度高很多，適合當硬性關卡。
+            # 資料不足（error不為None）時視為中性（None），不影響任何判斷，不會誤擋。
+            _macd_osc_status = _macd_daily_result.osc_status if _macd_daily_result.error is None else None
+            _macd_divergence_type = _macd_daily_result.divergence_type if _macd_daily_result.error is None else None
+
             _plan_indicators = {
                 "code": code, "price": price, "atr": atr, "ma20": ma20, "previous_high": _plan_previous_high,
                 "decision_score": ai_score, "trend_gate": step3_pass, "chip_gate": step1_pass, "volume_gate": step2_pass,
                 "r1": _entry_r1, "market_regime": "BEARISH" if _regime_is_bearish(macro_data, is_us_stock) else "NORMAL",
                 "is_us_stock": is_us_stock, "data_date": _plan_data_date,
+                "macd_osc_status": _macd_osc_status, "macd_divergence_type": _macd_divergence_type,
             }
             _plan_portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": _held_qty,
                                      "available_cash": max(0.0, cap - _held_qty * price),
