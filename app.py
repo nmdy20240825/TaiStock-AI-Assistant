@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.x"
+APP_VERSION = "V2.11.3"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -1753,6 +1753,8 @@ if not portfolio:
 else:
     summary_data, card_data, paused_data = [], [], []
     macd_report_results: List[MACDSignalResult] = []
+    _any_intraday_reevaluation = False  # 【新增】只要有任何一檔因「今天K棒尚未收斂」被強制重新評估過，
+                                         # 就算全域執行模式是VIEW_ONLY，最後也要把這次的結果存回trade_plan。
 
     for code, info in list(portfolio.items()):
         if isinstance(info, dict):
@@ -2076,12 +2078,22 @@ else:
                                      "available_cash": max(0.0, cap - _held_qty * price),
                                      "addon_quality_gate": _addon_quality_gate_pass}
 
-            if execution_mode == TAIWAN_CLOSE_UPDATE or (not _old_plan.get("taiwan_data_date") and _plan_data_date):
-                # 台股有新日K，或這檔股票從未被 evaluate 過（第一次遷移／新增持股時的一次性 bootstrap）
+            # 【修正：今天K棒尚未收斂時，即使全域執行模式判定為唯讀，這一檔也要強制重新評估】
+            # 問題根源：系統用「資料日期字串有沒有變」判斷要不要重跑狀態機，但當最後一根K棒就是
+            # 「今天」（is_today_bar=True）時，同一個日期底下的實際數值（量能/KD/RSI/收盤價）仍可能
+            # 隨資料來源更新而改變——若這裡沿用純日期比對，會把「今天稍早、用還沒收斂的資料算出來的
+            # 決策」凍結一整天，跟同一次畫面上「AI決策與SOP」分頁每次都重新即時計算的結果對不上。
+            # 只要 is_today_bar 還是 True，就強制走跟 TAIWAN_CLOSE_UPDATE 一樣的完整重新評估，
+            # 確保交易計畫會跟著當天最新資料調整，不會卡在早上的過時快照。
+            _force_intraday_recheck = bool(is_today_bar)
+            if execution_mode == TAIWAN_CLOSE_UPDATE or _force_intraday_recheck or (not _old_plan.get("taiwan_data_date") and _plan_data_date):
+                # 台股有新日K、今天K棒尚未收斂需要持續追蹤、或這檔股票從未被 evaluate 過（首次遷移/新增持股的一次性 bootstrap）
                 _new_plan = process_taiwan_close_update(_old_plan, _plan_indicators, macro_data, _plan_portfolio_info)
                 _new_plan["taiwan_data_date"] = _plan_data_date
                 if latest_us_date:
                     _new_plan["us_data_date"] = latest_us_date
+                if _force_intraday_recheck and execution_mode == VIEW_ONLY:
+                    _any_intraday_reevaluation = True
             elif execution_mode == US_CLOSE_UPDATE:
                 _new_plan = process_us_close_update(_old_plan, macro_data, latest_us_date, is_us_stock)
             else:
@@ -2141,8 +2153,12 @@ else:
     save_history(system_history)
     # 【V2.11.x 新增】trade_plan 只在真的有新資料時才寫回（VIEW_ONLY 模式嚴格唯讀，不做任何寫入，
     # 避免同一天重複開啟頁面時，把「唯讀複本」誤當作正式結果覆蓋回 Google Sheet）。
-    if execution_mode != VIEW_ONLY:
+    # 【修正】但若本次執行中有任何一檔因「今天K棒尚未收斂」被強制重新評估過，即使全域模式仍是
+    # VIEW_ONLY，也要把這次追上最新資料的結果存回去，否則追平的計算白做了，畫面重整一次又會消失。
+    if execution_mode != VIEW_ONLY or _any_intraday_reevaluation:
         save_trade_plan(trade_plan_data)
+    if execution_mode == VIEW_ONLY and _any_intraday_reevaluation:
+        st.caption("🔄 偵測到部分股票的今日K棒尚未收斂，已針對這幾檔強制重新評估交易計畫並存回，其餘股票維持唯讀。")
 
     # 【V2.10 新增②】AI 每日一句：從今天戰力最高的持股，自動拼一句話當作頭條，
     # 不用先看完整份排行榜跟卡片才知道「今天最值得注意的是哪一檔」。
