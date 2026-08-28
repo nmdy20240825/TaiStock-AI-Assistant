@@ -1721,6 +1721,15 @@ def render_stock_card(data, system_history, portfolio_data):
                 elif _style == "error": st.error(_action_msg)
                 else: st.info(_action_msg)
 
+                # 【新增】澄清這裡的「操作動作」只是純MACD規則算出來的理論建議，不是要你現在執行的指令；
+                # 日線MACD已經實質影響🗓️交易計畫（頂背離/翻黑會暫停加碼，翻黑且有獲利會提前分批停利），
+                # 但頂背離本身不會直接觸發賣出——避免對還在噴出階段、反覆出現頂背離的強勢股賣過頭。
+                # 週線MACD目前完全沒有接入交易計畫判斷，純粹參考。這裡明確告知，避免誤以為兩邊互相矛盾。
+                if _tf_label.startswith("📅"):
+                    st.caption("ℹ️ 以上是純MACD規則算出的理論建議，非現在要執行的指令。日線MACD已實質影響「🗓️交易計畫」：頂背離/翻黑會暫停加碼，翻黑且有獲利會提前分批停利；但頂背離本身不會直接觸發賣出（避免對噴出階段反覆出現的頂背離反應過度）。實際要不要操作，請以「🗓️交易計畫」分頁的判斷為準。")
+                else:
+                    st.caption("ℹ️ 以上是純MACD規則算出的理論建議，目前週線MACD尚未接入「🗓️交易計畫」的判斷，僅供參考對照，不會影響加碼/出清/進場的正式決策。")
+
                 st.caption(f"📝 {_macd_r.detail}")
                 if _macd_r.risk_management is not None:
                     st.write(f"**失效停損點（關鍵支撐）**：{_macd_r.risk_management:.2f}")
