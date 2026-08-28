@@ -4,6 +4,9 @@ import yfinance as yf
 import numpy as np
 import requests
 import datetime
+import json
+from dataclasses import dataclass, asdict, field
+from typing import Optional, Literal, Dict, Any, List, Tuple
 import plotly.graph_objects as go
 
 st.set_page_config(layout="wide", page_title="TaiStock V2.9 全自動紀律決策系統")
@@ -161,6 +164,263 @@ def calc_trailing_stop(close_series, ma20_series, atr_series, cost, lookback=60,
         return None, "fallback"
     return max(candidates), "ratchet"
 
+# --- 0-0-1. MACD 動能變化與背離分析模組（新增）---
+# 依據「柱狀體主導、背離為轉折預警、快慢線交叉僅作次要確認」的架構，
+# 提供日線／週線通用的 MACD 訊號分析器，輸出結構化 MACDSignalResult。
+
+OSCStatus = Literal["正值", "負值", "收腳中", "翻紅第1根", "翻黑", "資料不足"]
+DivergenceType = Literal["無", "頂背離", "底背離", "低檔雙背離", "資料不足"]
+SignalAction = Literal["觀望", "預警關注", "分批試單", "核心進場", "減碼50%", "出場", "資料不足"]
+
+def calc_macd_full_series(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    計算完整的 DIF／DEA／OSC 序列（而非只取最後一個數值），供背離偵測與「連續遞增/遞減」
+    這類需要比對多根歷史值的判斷使用。公式與既有 calc_macd() 的 EMA 版一致，只是回傳整段序列。
+    """
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    dif = ema_fast - ema_slow
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    osc = dif - dea
+    return dif, dea, osc
+
+def resample_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    把日線 OHLCV 轉成週線（週五收盤為一週結尾，符合台股與美股慣例）。
+    資料不足或缺少必要欄位時回傳空 DataFrame，呼叫端需自行檢查長度。
+    """
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        needed = ["Open", "High", "Low", "Close"]
+        if any(col not in df.columns for col in needed):
+            return pd.DataFrame()
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in df.columns:
+            agg["Volume"] = "sum"
+        weekly = df.resample("W-FRI").agg(agg)
+        weekly = weekly.dropna(subset=["Close"])
+        return weekly
+    except Exception:
+        return pd.DataFrame()
+
+@dataclass
+class MACDSignalResult:
+    """MACD 動能與背離分析的結構化輸出，支援 dict / DataFrame / JSON 三種取用方式。"""
+    stock_id: str
+    stock_name: str
+    timeframe: str                          # "日線" 或 "週線"
+    dif: Optional[float]
+    dea: Optional[float]
+    osc: Optional[float]
+    osc_status: OSCStatus
+    divergence_type: DivergenceType
+    signal_action: SignalAction
+    risk_management: Optional[float]        # 關鍵支撐停損價（跌破前低參考價）
+    detail: str = ""                        # 人類可讀的判斷依據說明
+    error: Optional[str] = None             # 資料不足或計算失敗時的錯誤訊息
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, default=str)
+
+class MACDStrategyAnalyzer:
+    """
+    MACD 動能變化與背離分析器。接收股票代號、名稱與 OHLCV DataFrame（日線或週線皆可，
+    呼叫端自行決定要不要先用 resample_to_weekly() 轉換），回傳 MACDSignalResult。
+
+    設計原則（對應角色定義的三層權重）：
+      1. 柱狀體（OSC）狀態是主導訊號（收腳/翻紅/翻黑）。
+      2. 背離型態是反轉與風險預警訊號，優先權高於柱狀體單純翻紅（頂背離時即使OSC還是正值，
+         也要示警減碼；底背離時即使OSC還沒翻紅，也可以先分批試單）。
+      3. DIF/DEA黃金交叉只做為趨勢確立的次要確認，不單獨驅動任何 signal_action。
+    """
+
+    def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9,
+                 divergence_lookback: int = 20, min_bars: int = 35, kd_period: int = 9) -> None:
+        self.fast = fast
+        self.slow = slow
+        self.signal = signal
+        self.divergence_lookback = divergence_lookback
+        self.min_bars = min_bars          # 至少需要這麼多根K棒才進行分析（EMA26+訊號9需要暖身期）
+        self.kd_period = kd_period
+
+    def _empty_result(self, stock_id: str, stock_name: str, timeframe: str, error: str) -> MACDSignalResult:
+        return MACDSignalResult(
+            stock_id=stock_id, stock_name=stock_name, timeframe=timeframe,
+            dif=None, dea=None, osc=None, osc_status="資料不足", divergence_type="資料不足",
+            signal_action="資料不足", risk_management=None, detail=error, error=error,
+        )
+
+    def _detect_osc_status(self, osc: pd.Series) -> Tuple[OSCStatus, str]:
+        """
+        依據角色定義：
+          翻紅第1根：OSC_{t-1}<0 且 OSC_t>0
+          翻黑     ：OSC_{t-1}>0 且 OSC_t<0
+          收腳中   ：OSC_t<0 且 |OSC_t| < |OSC_{t-1}|（負值柱狀體縮短）
+          正值/負值：其餘一般狀態
+        """
+        cur, prev = float(osc.iloc[-1]), float(osc.iloc[-2])
+        if pd.isna(cur) or pd.isna(prev):
+            return "資料不足", "OSC 最新兩筆數值含 NaN，無法判斷狀態"
+        if prev < 0 and cur > 0:
+            return "翻紅第1根", f"OSC 由負轉正（{prev:.3f} → {cur:.3f}），多頭取回主導權"
+        if prev > 0 and cur < 0:
+            return "翻黑", f"OSC 由正轉負（{prev:.3f} → {cur:.3f}），多頭動能結束"
+        if cur < 0 and abs(cur) < abs(prev):
+            return "收腳中", f"負值柱狀體縮短（|{prev:.3f}| → |{cur:.3f}|），空頭動能衰退"
+        if cur > 0:
+            return "正值", f"OSC 維持正值（{cur:.3f}）"
+        return "負值", f"OSC 維持負值（{cur:.3f}），尚未見收腳"
+
+    def _detect_divergence(self, close: pd.Series, low: pd.Series, high: pd.Series,
+                            osc: pd.Series, k: Optional[pd.Series]) -> Tuple[DivergenceType, str]:
+        """
+        簡化版背離偵測：在 lookback 視窗內找出「前一個波段低點/高點」，
+        跟「當下這一根」比較價格與OSC的相對高低，判斷是否符合底背離/頂背離定義。
+        這是一個實用近似算法（非嚴謹的zigzag轉折點演算法），足以捕捉角色定義的背離型態，
+        但對雜訊敏感度會比專業轉折點演算法高，建議之後可以再疊加最小波段幅度過濾雜訊。
+        """
+        n = min(self.divergence_lookback, len(close) - 1)
+        if n < 5:
+            return "無", "資料長度不足以偵測背離（lookback視窗過短）"
+
+        window_close = close.iloc[-(n + 1):-1]
+        window_low = low.iloc[-(n + 1):-1]
+        window_high = high.iloc[-(n + 1):-1]
+        window_osc = osc.iloc[-(n + 1):-1]
+
+        cur_close, cur_osc = float(close.iloc[-1]), float(osc.iloc[-1])
+        if pd.isna(cur_close) or pd.isna(cur_osc) or window_close.empty:
+            return "無", "最新資料含 NaN，跳過背離判斷"
+
+        # ---- 底背離：現價創新低，但 OSC 在對應前波低點時的位置比現在的 OSC 還低 ----
+        prev_low_idx = window_close.idxmin()
+        prev_low_close = float(window_close.loc[prev_low_idx])
+        prev_low_osc = float(window_osc.loc[prev_low_idx]) if not pd.isna(window_osc.loc[prev_low_idx]) else None
+
+        if cur_close < prev_low_close and prev_low_osc is not None and cur_osc > prev_low_osc:
+            note = f"價格創新低（{cur_close:.2f} < 前波低點{prev_low_close:.2f}），但OSC未破前低（{cur_osc:.3f} > {prev_low_osc:.3f}）"
+            if k is not None and len(k) >= 2 and not pd.isna(k.iloc[-1]) and float(k.iloc[-1]) < 20:
+                return "低檔雙背離", note + f"；KD同步低檔區（K={float(k.iloc[-1]):.1f} < 20）"
+            return "底背離", note
+
+        # ---- 頂背離：現價創新高，且 OSC 連續3根遞減（含當日）----
+        prev_high_idx = window_high.idxmax()
+        prev_high_close = float(window_close.loc[prev_high_idx]) if prev_high_idx in window_close.index else float(window_high.loc[prev_high_idx])
+        if len(osc) >= 3:
+            o0, o1, o2 = float(osc.iloc[-1]), float(osc.iloc[-2]), float(osc.iloc[-3])
+            osc_declining_3 = (not any(pd.isna(x) for x in (o0, o1, o2))) and (o0 < o1 < o2)
+        else:
+            osc_declining_3 = False
+
+        if cur_close > prev_high_close and osc_declining_3:
+            return "頂背離", f"價格創新高（{cur_close:.2f} > 前波高點{prev_high_close:.2f}），但OSC柱狀體連續3根遞減（{o2:.3f}→{o1:.3f}→{o0:.3f}），多頭力竭"
+
+        return "無", "目前價格與OSC走勢一致，未偵測到背離"
+
+    def _compute_risk_management(self, low: pd.Series) -> Optional[float]:
+        """關鍵支撐停損價：lookback 視窗內（不含當日）的最低價，作為「跌破前低」的風控參考。"""
+        n = min(self.divergence_lookback, len(low) - 1)
+        if n < 3:
+            return None
+        window = low.iloc[-(n + 1):-1]
+        if window.empty or window.isna().all():
+            return None
+        return float(window.min())
+
+    def _decide_signal_action(self, osc_status: OSCStatus, divergence_type: DivergenceType) -> Tuple[SignalAction, str]:
+        """
+        優先序（由高到低）：出場(翻黑) > 減碼50%(頂背離) > 分批試單(底背離/低檔雙背離)
+        > 核心進場(翻紅第1根) > 預警關注(收腳中) > 觀望。
+        黃金交叉不在這裡出現——它只作為趨勢確認的次要訊號，不驅動 action。
+        """
+        if osc_status == "翻黑":
+            return "出場", "柱狀體翻黑，多頭結束，剩餘部位出場"
+        if divergence_type == "頂背離":
+            return "減碼50%", "偵測到頂背離，多頭力竭，強制執行分批獲利了結50%"
+        if divergence_type in ("底背離", "低檔雙背離"):
+            extra = "（疊加KD低檔背離，信心水準較高）" if divergence_type == "低檔雙背離" else ""
+            return "分批試單", f"偵測到{divergence_type}，空頭動能減弱{extra}，採分批左側試單，待柱狀體翻紅再補齊部位"
+        if osc_status == "翻紅第1根":
+            return "核心進場", "柱狀體由負轉正第1根，多頭取回主導權，波段核心進場點"
+        if osc_status == "收腳中":
+            return "預警關注", "負值柱狀體收腳，空頭動能衰退，納入觀察但不宜重押"
+        return "觀望", "無明確訊號，維持空手觀望"
+
+    def analyze(self, stock_id: str, stock_name: str, ohlcv: pd.DataFrame, timeframe: str = "日線") -> MACDSignalResult:
+        """
+        主分析入口。ohlcv 需含 Open/High/Low/Close（Volume 可選），index 為日期。
+        資料長度不足、缺少必要欄位、或關鍵欄位是 NaN 時，一律回傳「資料不足」的安全結果，
+        絕不拋出例外中斷呼叫端（既有系統的個股迴圈仍要能繼續跑其他股票）。
+        """
+        try:
+            if ohlcv is None or ohlcv.empty:
+                return self._empty_result(stock_id, stock_name, timeframe, "OHLCV 資料為空")
+            for col in ("Open", "High", "Low", "Close"):
+                if col not in ohlcv.columns:
+                    return self._empty_result(stock_id, stock_name, timeframe, f"缺少必要欄位：{col}")
+
+            close = ohlcv["Close"].squeeze()
+            high = ohlcv["High"].squeeze()
+            low = ohlcv["Low"].squeeze()
+            if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+            if isinstance(high, pd.DataFrame): high = high.iloc[:, 0]
+            if isinstance(low, pd.DataFrame): low = low.iloc[:, 0]
+
+            if len(close) < self.min_bars:
+                return self._empty_result(stock_id, stock_name, timeframe,
+                                           f"資料長度不足（{len(close)}根 < 最少需求{self.min_bars}根），暖身期不足，不予計算")
+
+            dif, dea, osc = calc_macd_full_series(close, self.fast, self.slow, self.signal)
+            if pd.isna(dif.iloc[-1]) or pd.isna(dea.iloc[-1]) or pd.isna(osc.iloc[-1]) or pd.isna(osc.iloc[-2]):
+                return self._empty_result(stock_id, stock_name, timeframe, "最新 MACD 數值為 NaN，暫時跳過本次分析")
+
+            osc_status, osc_note = self._detect_osc_status(osc)
+
+            k_series = None
+            try:
+                k_series, _ = calc_kd(high, low, close, period=self.kd_period)
+            except Exception:
+                k_series = None
+
+            divergence_type, div_note = self._detect_divergence(close, low, high, osc, k_series)
+            risk_stop = self._compute_risk_management(low)
+            signal_action, action_note = self._decide_signal_action(osc_status, divergence_type)
+
+            cross_note = ""
+            if len(dif) >= 2 and not pd.isna(dif.iloc[-1]) and not pd.isna(dea.iloc[-1]) and not pd.isna(dif.iloc[-2]) and not pd.isna(dea.iloc[-2]):
+                golden_cross = dif.iloc[-2] <= dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
+                death_cross = dif.iloc[-2] >= dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
+                if golden_cross:
+                    cross_note = "；DIF今日向上突破DEA（黃金交叉，趨勢確立次要確認）"
+                elif death_cross:
+                    cross_note = "；DIF今日向下跌破DEA（死亡交叉，次要確認）"
+
+            detail = f"{osc_note}；{div_note}{cross_note}。判定：{action_note}"
+
+            return MACDSignalResult(
+                stock_id=stock_id, stock_name=stock_name, timeframe=timeframe,
+                dif=round(float(dif.iloc[-1]), 4), dea=round(float(dea.iloc[-1]), 4), osc=round(float(osc.iloc[-1]), 4),
+                osc_status=osc_status, divergence_type=divergence_type, signal_action=signal_action,
+                risk_management=round(risk_stop, 2) if risk_stop is not None else None,
+                detail=detail, error=None,
+            )
+        except Exception as e:
+            return self._empty_result(stock_id, stock_name, timeframe, f"MACD分析發生未預期錯誤：{e}")
+
+def build_macd_report(macd_results: List[MACDSignalResult]) -> pd.DataFrame:
+    """把一批 MACDSignalResult 轉成報表用的 DataFrame，供 UI 表格顯示或 CSV/JSON 匯出使用。"""
+    if not macd_results:
+        return pd.DataFrame()
+    rows = [r.to_dict() for r in macd_results]
+    return pd.DataFrame(rows)
+
+# 全域單一實例，供主迴圈重複呼叫；參數皆為預設值，若要調整（例如背離lookback天數）改這裡即可。
+macd_analyzer = MACDStrategyAnalyzer()
+
 # --- 0-1. V2.11.x 交易計畫 / 事件驅動狀態機：共用型別轉換與日期工具 ---
 def _safe_float(value, default=0.0):
     """任何輸入安全轉 float；None、空字串、NaN、無法轉換一律回傳 default。"""
@@ -309,6 +569,26 @@ def fetch_stock_data(code):
             df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="6mo", progress=False)
         return _trim_trailing_nan_rows(df)
     except Exception: return pd.DataFrame()
+
+@st.cache_data(ttl=1800)
+def fetch_stock_data_extended(code):
+    """
+    【MACD模組新增】專供「週線」分析使用的較長期資料抓取。既有 fetch_stock_data() 只抓6個月
+    （約26根週K），對週線 MACD（EMA26+訊號9）而言暖身期完全不夠，週線分析會永遠卡在「資料不足」。
+    這裡另開一個獨立、較長快取時間（30分鐘）的抓取函式，抓 2 年資料，跟 fetch_stock_data()
+    完全分開快取、互不影響，不會改變既有日線指標/K線圖/任何既有功能的行為或抓取頻率。
+    """
+    try:
+        if code.isalpha() or code.endswith('.US'):
+            df = yf.download(code.replace('.US', ''), period="2y", progress=False)
+        elif code.endswith('.TW') or code.endswith('.TWO'):
+            df = yf.download(code, period="2y", progress=False)
+        else:
+            df_tw = yf.download(f"{code}.TW", period="2y", progress=False)
+            df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="2y", progress=False)
+        return _trim_trailing_nan_rows(df)
+    except Exception:
+        return pd.DataFrame()
 
 # --- 3. 籌碼資料抓取 ---
 @st.cache_data(ttl=3600)
@@ -1211,7 +1491,7 @@ def render_stock_card(data, system_history, portfolio_data):
                     st.rerun()
 
         st.write("")
-        tab_c1, tab_c2, tab_c3, tab_c4, tab_c5 = st.tabs(["⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "📈 決策時間軸", "🗓️ 交易計畫"])
+        tab_c1, tab_c2, tab_c3, tab_c4, tab_c5, tab_c6 = st.tabs(["⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "📈 決策時間軸", "🗓️ 交易計畫", "📐 MACD動能背離"])
 
         with tab_c1:
             st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
@@ -1363,6 +1643,43 @@ def render_stock_card(data, system_history, portfolio_data):
                 if _plan_state == "FULL_EXIT_NEXT_DAY":
                     st.error(f"🔴 建議全部出清股數：{data.get('plan_full_exit_shares', 0)} 股（下一交易日執行）\n⚠️ 系統不保證一定能以防守觸發價成交，實際成交價可能因跳空而偏離，請留意跳空風險。")
 
+        with tab_c6:
+            # 【新增】MACD 動能變化與背離分析：日線／週線分開顯示，格式對照四大模組
+            # （技術指標現況診斷／訊號層級評估／交易決策建議／風險過濾提醒）。
+            _action_style = {
+                "核心進場": ("success", "🟢"), "分批試單": ("success", "🟢"), "觀望": ("info", "⚪"),
+                "預警關注": ("warning", "🟡"), "減碼50%": ("warning", "🟠"), "出場": ("error", "🔴"),
+                "資料不足": ("info", "⚪"),
+            }
+            for _tf_label, _macd_r in [("📅 日線", data.get('macd_daily')), ("🗓️ 週線", data.get('macd_weekly'))]:
+                if _macd_r is None:
+                    continue
+                st.markdown(f"#### {_tf_label}")
+                if _macd_r.error:
+                    st.info(f"ℹ️ {_macd_r.error}")
+                    st.divider()
+                    continue
+
+                _mc1, _mc2, _mc3 = st.columns(3)
+                _mc1.metric("DIF", f"{_macd_r.dif:.3f}" if _macd_r.dif is not None else "—")
+                _mc2.metric("DEA", f"{_macd_r.dea:.3f}" if _macd_r.dea is not None else "—")
+                _mc3.metric("柱狀體 OSC", f"{_macd_r.osc:.3f}" if _macd_r.osc is not None else "—", _macd_r.osc_status)
+
+                st.write(f"**背離型態判定**：{_macd_r.divergence_type}")
+                st.write(f"**訊號層級**：{_macd_r.osc_status} ｜ **背離**：{_macd_r.divergence_type}")
+
+                _style, _icon = _action_style.get(_macd_r.signal_action, ("info", "⚪"))
+                _action_msg = f"{_icon} **操作動作：{_macd_r.signal_action}**"
+                if _style == "success": st.success(_action_msg)
+                elif _style == "warning": st.warning(_action_msg)
+                elif _style == "error": st.error(_action_msg)
+                else: st.info(_action_msg)
+
+                st.caption(f"📝 {_macd_r.detail}")
+                if _macd_r.risk_management is not None:
+                    st.write(f"**失效停損點（關鍵支撐）**：{_macd_r.risk_management:.2f}")
+                st.divider()
+
 # --- 6. 主程式執行 ---
 st.title("⚡ TaiStock V2.9 全自動決策系統")
 st.warning("⚠️ 本系統僅為個人化技術指標整理與紀律提醒工具，所有分數、判定、建議均由你自訂的公式與參數計算而成，**不構成任何投資建議**，過去的訊號表現也不保證未來結果。所有操作決策與風險，仍需由你自己判斷並承擔。")
@@ -1428,6 +1745,7 @@ if not portfolio:
     st.info("👈 請先從左側邊欄新增股票代號！")
 else:
     summary_data, card_data, paused_data = [], [], []
+    macd_report_results: List[MACDSignalResult] = []
 
     for code, info in list(portfolio.items()):
         if isinstance(info, dict):
@@ -1504,6 +1822,21 @@ else:
             if _bad_fields:
                 st.warning(f"⚠️ {name or code} 本次抓到的資料不完整（缺值欄位：{'、'.join(_bad_fields)}），已跳過這次分析，下次重新整理應會恢復正常。")
                 continue
+
+            # ===== MACD 動能變化與背離分析模組（新增，與既有分數/final_status計算並行、互不影響）=====
+            _macd_daily_result = macd_analyzer.analyze(code, name, df, timeframe="日線")
+            # 週線分析需要較長歷史暖身，改抓獨立的2年期資料再做週線resample（不影響既有6個月日線抓取）。
+            try:
+                _df_long = fetch_stock_data_extended(code)
+            except Exception:
+                _df_long = pd.DataFrame()
+            _weekly_df = resample_to_weekly(_df_long) if _df_long is not None and not _df_long.empty else pd.DataFrame()
+            if len(_weekly_df) >= macd_analyzer.min_bars:
+                _macd_weekly_result = macd_analyzer.analyze(code, name, _weekly_df, timeframe="週線")
+            else:
+                _macd_weekly_result = macd_analyzer._empty_result(code, name, "週線", f"週線資料不足（僅{len(_weekly_df)}週，需要至少{macd_analyzer.min_bars}週），可能是延伸資料抓取失敗或該標的上市時間過短")
+            macd_report_results.append(_macd_daily_result)
+            macd_report_results.append(_macd_weekly_result)
 
             inst = get_institutional_data(code)
             # 【V2.11.2 正式導入】把原本「獲利>10%用固定門檻切換」的停損/目標價，
@@ -1768,6 +2101,8 @@ else:
                 "plan_full_exit_shares": trade_plan_data[code]["full_exit_shares"],
                 "plan_execution_date": trade_plan_data[code]["execution_date"], "plan_valid_until": trade_plan_data[code]["valid_until"],
                 "plan_taiwan_data_date": trade_plan_data[code]["taiwan_data_date"], "plan_us_data_date": trade_plan_data[code]["us_data_date"],
+                # ===== MACD 動能與背離分析（新增）=====
+                "macd_daily": _macd_daily_result, "macd_weekly": _macd_weekly_result,
             })
         except Exception as e: st.error(f"分析 {code} 發生錯誤: {e}")
 
@@ -1882,6 +2217,39 @@ else:
             _dominant_ratio = _dominant_count / len(card_data) * 100
             if _dominant_ratio >= 60:
                 st.warning(f"⚠️ 標籤集中度偏高：你追蹤的 {len(card_data)} 檔股票裡，有 {_dominant_count} 檔（{_dominant_ratio:.0f}%）都屬於「{_dominant_tag}」這個屬性，這些股票的漲跌行為可能高度連動，不算真正分散。（此為依系統標籤概估，非正式產業分類）")
+        st.divider()
+
+    # ===== 【新增】MACD 動能與背離分析報表：整合日線／週線結果，支援表格檢視與 CSV/JSON 匯出 =====
+    if macd_report_results:
+        st.markdown("### 📐 MACD 動能與背離分析報表")
+        _df_macd = build_macd_report(macd_report_results)
+        _macd_actionable = _df_macd[_df_macd["signal_action"].isin(["核心進場", "分批試單", "減碼50%", "出場"])]
+        if not _macd_actionable.empty:
+            st.markdown("**🔔 目前有明確訊號的標的**")
+            st.dataframe(
+                _macd_actionable[["stock_id", "stock_name", "timeframe", "osc_status", "divergence_type", "signal_action", "risk_management"]]
+                .rename(columns={"stock_id": "代號", "stock_name": "名稱", "timeframe": "週期", "osc_status": "柱狀體狀態",
+                                  "divergence_type": "背離型態", "signal_action": "操作動作", "risk_management": "失效停損參考價"})
+                .reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("目前所有追蹤股票的日線／週線都沒有明確的 MACD 訊號（觀望中）。")
+
+        with st.expander("展開完整 MACD 分析報表（所有股票，日線＋週線）"):
+            st.dataframe(
+                _df_macd[["stock_id", "stock_name", "timeframe", "dif", "dea", "osc", "osc_status", "divergence_type", "signal_action", "risk_management", "detail"]]
+                .rename(columns={"stock_id": "代號", "stock_name": "名稱", "timeframe": "週期", "dif": "DIF", "dea": "DEA", "osc": "OSC",
+                                  "osc_status": "柱狀體狀態", "divergence_type": "背離型態", "signal_action": "操作動作",
+                                  "risk_management": "失效停損參考價", "detail": "判斷依據"})
+                .reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
+            _macd_csv = _df_macd.to_csv(index=False).encode("utf-8-sig")
+            _macd_json = json.dumps([r.to_dict() for r in macd_report_results], ensure_ascii=False, default=str, indent=2).encode("utf-8")
+            _dl_col1, _dl_col2 = st.columns(2)
+            _dl_col1.download_button("📤 匯出 MACD 報表 (CSV)", _macd_csv, file_name="macd_signal_report.csv", mime="text/csv")
+            _dl_col2.download_button("📤 匯出 MACD 報表 (JSON)", _macd_json, file_name="macd_signal_report.json", mime="application/json")
         st.divider()
 
     if summary_data:
