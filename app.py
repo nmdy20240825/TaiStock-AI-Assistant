@@ -1237,7 +1237,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             plan = transition_state(plan, "HOLD", {"current_trailing_stop": exit_plan["current_trailing_stop"]},
                                      data_date, "市場逆風解除，重新評估加碼條件")
 
-        if not regime_bearish:
+        if not regime_bearish and portfolio_info.get("addon_quality_gate", True):
             addon_shares = calculate_addon_shares(
                 held_qty, price, exit_plan["current_trailing_stop"], price, exit_plan["current_trailing_stop"],
                 portfolio_info.get("cap", 20000.0), portfolio_info.get("risk", 5.0),
@@ -1252,7 +1252,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
                                              {"current_trailing_stop": exit_plan["current_trailing_stop"],
                                               "addon_shares_suggested": addon_shares,
                                               "addon_shares_approved": addon_shares, "signal_type": "ADD"},
-                                             data_date, f"SOP條件成立，資金/風險額度內約可加碼 {addon_shares} 股")
+                                             data_date, f"SOP三燈/信心/價格間距等品質關卡與資金風險上限均已通過，約可加碼 {addon_shares} 股")
 
         return transition_state(plan, "HOLD",
                                  {"current_trailing_stop": exit_plan["current_trailing_stop"],
@@ -1997,6 +1997,11 @@ else:
             # 盤整、趨勢還沒真正走出來的時候就被建議加碼。系統沒有交易日誌記錄「上次加碼價位」，
             # 這裡用「距離成本價」當替代基準，精神一致但不是逐筆追蹤每次加碼的間距。
             addon_shares_approved = 0
+            # 【修正②：UI加碼建議 與 狀態機加碼判斷 共用同一組品質關卡】
+            # 這個旗標只會在下面 elif 鏈真正走到「可以加碼」的最終 else 分支時被設成 True，
+            # 不是另外重寫一份條件——確保「UI會不會顯示可以加碼」跟「狀態機會不會核准加碼」
+            # 永遠是同一份判斷邏輯算出來的同一個答案，不會再各說各話。
+            _addon_quality_gate_pass = False
             if _held_qty > 0:
                 if final_status in ["🔴 破損", "🔴 破線", "⚠️ 帳面虧損", "🔵 停利退場"]:
                     ai_advice.append("<span style='color: #f87171;'>❌ 不建議加碼：目前處於警示/停損停利狀態，加碼等於攤平虧損部位，違反紀律。</span>")
@@ -2009,6 +2014,7 @@ else:
                 elif atr > 0 and price < cost + 0.5 * atr:
                     ai_advice.append(f"⏸️ 暫不建議加碼：現價距離成本還沒拉開足夠空間（門檻約 {cost + 0.5 * atr:.2f}），可能還在整理區間，避免提早加碼。")
                 else:
+                    _addon_quality_gate_pass = True
                     _current_value = _held_qty * price
                     _remaining_room = max(0.0, cap - _current_value)
                     # 【V2.11.2 正式導入】加碼後總風險上限檢查：現有持倉風險 + 加碼部位風險，
@@ -2034,15 +2040,34 @@ else:
             _plan_previous_high_window = h.iloc[-61:-1] if len(h) > 60 else h.iloc[:-1]
             _plan_previous_high = float(_plan_previous_high_window.max()) if len(_plan_previous_high_window) > 0 else price
 
+            # 【修正①：進場R1不該借用「持有成本」算出來的舊r1】
+            # 上面的 r1（第1868~1874行）只有 cost>0（已持有）時才有值，空手股票永遠是 None。
+            # calculate_entry_plan() 的進場閘門要求 r1>=1.5，若沿用舊r1，等於空手股票永遠無法
+            # 通過進場閘門——整個「辨識新突破」的功能形同虛設。這裡改用「跟 calculate_entry_plan()
+            # 未來會算出的突破價/初始停損完全同一套基準」重新算一次進場專用R1：
+            #   突破價＝前高×1.005（跟 calculate_entry_plan 的 breakout_price 公式一致）
+            #   初始停損＝突破價－2×ATR（跟 calculate_entry_plan 的 initial_stop 公式一致）
+            #   T1＝用 calc_structural_target 在「突破價」這個基準點上算，而不是在「現價」上算，
+            #        避免現價離前高還很遠時，算出來的T1/風險距離失真。
+            _entry_breakout_price = round_to_tick(_plan_previous_high * 1.005, is_us_stock) if _plan_previous_high > 0 else price
+            if atr > 0 and _entry_breakout_price > 0:
+                _entry_initial_stop = _entry_breakout_price - 2 * atr
+                _entry_t1, _entry_t2, _entry_target_branch = calc_structural_target(h, _entry_breakout_price, atr)
+                _entry_risk_dist = _entry_breakout_price - _entry_initial_stop  # 恆等於 2×ATR
+                _entry_r1 = (_entry_t1 - _entry_breakout_price) / _entry_risk_dist if (_entry_risk_dist > 0 and _entry_t1 > _entry_breakout_price) else None
+            else:
+                _entry_r1 = None
+
             _old_plan = _normalize_trade_plan_row(trade_plan_data.get(code, _trade_plan_defaults(code)))
             _plan_indicators = {
                 "code": code, "price": price, "atr": atr, "ma20": ma20, "previous_high": _plan_previous_high,
                 "decision_score": ai_score, "trend_gate": step3_pass, "chip_gate": step1_pass, "volume_gate": step2_pass,
-                "r1": r1, "market_regime": "BEARISH" if _regime_is_bearish(macro_data, is_us_stock) else "NORMAL",
+                "r1": _entry_r1, "market_regime": "BEARISH" if _regime_is_bearish(macro_data, is_us_stock) else "NORMAL",
                 "is_us_stock": is_us_stock, "data_date": _plan_data_date,
             }
             _plan_portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": _held_qty,
-                                     "available_cash": max(0.0, cap - _held_qty * price)}
+                                     "available_cash": max(0.0, cap - _held_qty * price),
+                                     "addon_quality_gate": _addon_quality_gate_pass}
 
             if execution_mode == TAIWAN_CLOSE_UPDATE or (not _old_plan.get("taiwan_data_date") and _plan_data_date):
                 # 台股有新日K，或這檔股票從未被 evaluate 過（第一次遷移／新增持股時的一次性 bootstrap）
