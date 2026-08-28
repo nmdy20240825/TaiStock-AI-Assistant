@@ -9,7 +9,14 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Literal, Dict, Any, List, Tuple
 import plotly.graph_objects as go
 
-st.set_page_config(layout="wide", page_title="TaiStock V2.9 全自動紀律決策系統")
+# 【新增】單一版本常數：畫面上所有顯示版本號的地方都從這裡讀取，避免像過去那樣
+# 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
+# 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
+# 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
+APP_VERSION = "V2.11.x"
+APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
+
+st.set_page_config(layout="wide", page_title=APP_TITLE)
 
 # ===== UI 視覺與字體優化模組 =====
 st.markdown("""
@@ -1681,7 +1688,7 @@ def render_stock_card(data, system_history, portfolio_data):
                 st.divider()
 
 # --- 6. 主程式執行 ---
-st.title("⚡ TaiStock V2.9 全自動決策系統")
+st.title(f"⚡ {APP_TITLE}")
 st.warning("⚠️ 本系統僅為個人化技術指標整理與紀律提醒工具，所有分數、判定、建議均由你自訂的公式與參數計算而成，**不構成任何投資建議**，過去的訊號表現也不保證未來結果。所有操作決策與風險，仍需由你自己判斷並承擔。")
 
 macro_data = fetch_macro_data()
@@ -1738,7 +1745,7 @@ if not TRADE_PLAN_LOAD_OK:
 
 market_regime_label = derive_market_regime(macro_data)
 _mode_display = {"TAIWAN_CLOSE_UPDATE": "🇹🇼 台股收盤更新", "US_CLOSE_UPDATE": "🇺🇸 美股收盤更新", "VIEW_ONLY": "👁️ 唯讀檢視（無新資料）"}
-st.caption(f"⚙️ 執行模式：**{_mode_display.get(execution_mode, execution_mode)}** ｜台股資料日期：{latest_tw_date or 'N/A'}｜美股資料日期：{latest_us_date or 'N/A'}｜市場燈號：{market_regime_label}｜上次已保存：台{saved_tw_date or 'N/A'} / 美{saved_us_date or 'N/A'}")
+st.caption(f"⚙️ 執行模式：**{_mode_display.get(execution_mode, execution_mode)}** ｜台股資料日期：{latest_tw_date or 'N/A'}｜美股資料日期：{latest_us_date or 'N/A'}｜市場燈號：{market_regime_label}｜上次已保存：台{saved_tw_date or 'N/A'} / 美{saved_us_date or 'N/A'}｜版本：{APP_VERSION}")
 st.divider()
 
 if not portfolio:
