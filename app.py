@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.4"
+APP_VERSION = "V2.11.6"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -721,7 +721,10 @@ ALLOWED_TRANSITIONS = {
                 "HOLD", "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "PREPARE"},
     "BREAKOUT_WAIT": {"ENTER_NEXT_DAY", "PULLBACK_WAIT", "INVALID", "EXPIRED", "BREAKOUT_WAIT"},
     "PULLBACK_WAIT": {"ENTER_NEXT_DAY", "INVALID", "EXPIRED", "PULLBACK_WAIT"},
-    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "ENTER_NEXT_DAY"},
+    # 【修正】原本漏了 INVALID／EXPIRED：訊號確認「下一交易日可進場」後，如果執行前價格突然
+    # 跌破失效價、或超過有效期限使用者都還沒來得及執行，理論上應該要能判定失效／過期，
+    # 原本的轉移表卻擋住這條路，導致這兩種情況發生時轉移一直被拒絕（見上方 transition_state 修正說明）。
+    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "ENTER_NEXT_DAY"},
     # 【修正：股數變 0 的重置路徑】HOLD/ADD_NEXT_DAY/PARTIAL_EXIT_NEXT_DAY 都可能因為使用者在系統之外
     # 手動賣出全部持股，導致 held_qty 直接變 0，這種情況也要能重置回 PREPARE 重新追蹤訊號，
     # 否則狀態會卡死在「理論上已經沒有部位、卻永遠回不去空手訊號流程」的中間態。
@@ -1008,11 +1011,16 @@ def transition_state(plan, next_state, extra_fields, data_date, reason=""):
     唯一允許改變 plan['state'] 的地方。會先查 ALLOWED_TRANSITIONS 確認這是合法轉移，
     不合法就直接忽略、維持原狀態（寧可卡住讓使用者發現，也不要跳到不該去的狀態），
     合法的話才更新 state、origin_state、時間戳記與傳入的其餘欄位。
+
+    【修正】拒絕轉移時的提示文字改成「直接覆蓋」而不是「接在舊文字前面」。舊寫法會導致同一個
+    被反覆拒絕的轉移（例如訊號還在等待執行、盤中股價短暫觸及失效價又拉回）每被拒絕一次就多疊加
+    一段文字，搭配「今天K棒未收斂時強制重新評估」的機制，一天內可能被拒絕好幾次，疊出一大段
+    重複的灰色文字。現在只保留最新一次的拒絕原因，不會再無限增長。
     """
     current = plan.get("state", "PREPARE")
     allowed = ALLOWED_TRANSITIONS.get(current, {current})
     if next_state not in allowed:
-        plan["signal_reason"] = f"（忽略不合法的狀態轉移 {current}→{next_state}，原狀態維持）{plan.get('signal_reason','')}"
+        plan["signal_reason"] = f"（忽略不合法的狀態轉移 {current}→{next_state}，原狀態維持）"
         return plan
     plan["origin_state"] = current
     plan["state"] = next_state
@@ -1434,6 +1442,52 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    with st.expander("🧮 加減碼成本計算小工具"):
+        # 【新增】這個小工具跟上面「新增股票」表單是兩條互相獨立的路徑：
+        # 如果你已經自己算好新成本，不需要用這個工具，直接在上面表單填入新的成本價與股數、
+        # 按「更新設定」即可，一樣會生效——兩種方式擇一使用都可以，這裡只是幫你省去手動心算的步驟。
+        st.caption("幫你算加碼／減碼後的新成本與股數，算完可以直接套用，也可以只看數字自己去上面表單填。")
+        _calc_targets = [c for c, info in portfolio.items() if isinstance(info, dict) and _safe_float(info.get('qty', 0)) > 0]
+        if not _calc_targets:
+            st.info("目前沒有持股數>0的股票可以計算。")
+        else:
+            _calc_code = st.selectbox("選擇股票", _calc_targets, key="calc_code")
+            _calc_info = portfolio.get(_calc_code, {}) if isinstance(portfolio.get(_calc_code), dict) else {}
+            _calc_old_qty = _safe_float(_calc_info.get('qty', 0))
+            _calc_old_cost = _safe_float(_calc_info.get('cost', 0))
+            st.write(f"目前：持有 {_calc_old_qty:.0f} 股，成本 {_calc_old_cost:.2f}")
+            _calc_action = st.radio("動作", ["加碼（買進更多）", "減碼／出場（賣出部分或全部）"], key="calc_action")
+
+            if _calc_action == "加碼（買進更多）":
+                _calc_trade_qty = st.number_input("加碼股數", min_value=0.0, value=0.0, step=1.0, key="calc_add_qty")
+                _calc_trade_price = st.number_input("加碼價格", min_value=0.0, value=_calc_old_cost, step=0.1, key="calc_add_price")
+                if _calc_trade_qty > 0:
+                    _calc_new_qty = _calc_old_qty + _calc_trade_qty
+                    _calc_new_cost = (_calc_old_qty * _calc_old_cost + _calc_trade_qty * _calc_trade_price) / _calc_new_qty if _calc_new_qty > 0 else 0.0
+                    st.success(f"加碼後：持有 {_calc_new_qty:.0f} 股，新加權平均成本 {_calc_new_cost:.2f}")
+                    if st.button("✅ 套用到成本欄位", key="calc_apply_add"):
+                        portfolio[_calc_code]['qty'] = _calc_new_qty
+                        portfolio[_calc_code]['cost'] = round(_calc_new_cost, 2)
+                        save_portfolio(portfolio)
+                        st.rerun()
+            else:
+                _calc_trade_qty = st.number_input("減碼／出場股數", min_value=0.0, max_value=_calc_old_qty, value=0.0, step=1.0, key="calc_reduce_qty")
+                _calc_trade_price = st.number_input("賣出價格（選填，只用來顯示這筆的損益，不影響剩餘部位成本）", min_value=0.0, value=_calc_old_cost, step=0.1, key="calc_reduce_price")
+                if _calc_trade_qty > 0:
+                    _calc_new_qty = _calc_old_qty - _calc_trade_qty
+                    # 減碼／部分出場不會改變「剩餘部位」的加權平均成本，只有股數變少——這跟加碼不同，
+                    # 加碼是混入新一批不同價位的股票才需要重新算加權平均，減碼只是把同一批成本的股票賣掉一部分。
+                    _calc_realized_pnl = (_calc_trade_price - _calc_old_cost) * _calc_trade_qty
+                    st.success(f"減碼後：剩餘 {_calc_new_qty:.0f} 股，成本維持 {_calc_old_cost:.2f}（減碼不影響剩餘部位的平均成本）")
+                    st.caption(f"這筆賣出的損益：{'+' if _calc_realized_pnl >= 0 else ''}{_calc_realized_pnl:,.0f} 元")
+                    if st.button("✅ 套用到股數欄位", key="calc_apply_reduce"):
+                        portfolio[_calc_code]['qty'] = _calc_new_qty
+                        if _calc_new_qty <= 0:
+                            portfolio[_calc_code]['cost'] = 0.0
+                        save_portfolio(portfolio)
+                        st.rerun()
+
+    st.divider()
     st.subheader("📤 匯出 / 📥 匯入持股清單 (CSV)")
     _export_rows = [
         {"code": code, "name": info.get("name", ""), "cost": info.get("cost", 0.0), "cap": info.get("cap", 20000.0),
@@ -1679,7 +1733,14 @@ def render_stock_card(data, system_history, portfolio_data):
                     st.warning("⏸️ 市場目前處於逆風狀態，新倉暫停，但交易計畫本身未被刪除，逆風解除後會自動恢復。")
             else:
                 st.markdown("**持倉計畫資訊**")
-                st.write(f"持有股數：{data.get('held_qty', 0)} 股　｜　平均成本：{data.get('cost', 0):.2f}")
+                _pnl_cost = _safe_float(data.get('cost', 0))
+                _pnl_qty = _safe_float(data.get('held_qty', 0))
+                _pnl_price = _safe_float(data.get('price', 0))
+                _pnl_amount = (_pnl_price - _pnl_cost) * _pnl_qty
+                _pnl_pct = ((_pnl_price - _pnl_cost) / _pnl_cost * 100) if _pnl_cost > 0 else 0.0
+                _pnl_color = "#f87171" if _pnl_amount > 0 else ("#34d399" if _pnl_amount < 0 else "inherit")  # 台股習慣：紅漲(賺)、綠跌(賠)
+                st.write(f"持有股數：{data.get('held_qty', 0)} 股　｜　平均成本：{_pnl_cost:.2f}")
+                st.markdown(f"損益：<span style='color:{_pnl_color}'>{'+' if _pnl_amount >= 0 else ''}{_pnl_amount:,.0f} 元（{'+' if _pnl_pct >= 0 else ''}{_pnl_pct:.2f}%）</span>", unsafe_allow_html=True)
                 st.write(f"T1：{data.get('plan_t1_price', 0):.2f}（{'✅已執行' if data.get('plan_t1_taken') else '⬜未執行'}）　｜　T2：{data.get('plan_t2_price', 0):.2f}（{'✅已執行' if data.get('plan_t2_taken') else '⬜未執行'}）")
                 st.write(f"初始防守線：{data.get('atr_stop_price', 0):.2f}　｜　今日移動防守線（計畫值）：{data.get('plan_current_trailing_stop', 0):.2f}")
                 if _plan_state == "ADD_NEXT_DAY":
@@ -2093,7 +2154,7 @@ else:
                         ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%、現價已與成本拉開足夠空間，資金額度內約可加碼 {_addon_shares} 股（同時受分配資金上限、原始建倉股數一半、加碼後總風險上限三重限制，避免單押過重）。")
                     else:
                         ai_advice.append("⏸️ 資金或風險額度所剩不多，加碼股數不足1股，暫不建議加碼。")
-
+            
             # ===== V2.11.x 交易計畫狀態機：與上方既有 final_status 邏輯並行運作，不修改既有變數 =====
             # 只把「持久化的交易計畫」疊加上去，既有的 ai_score/final_status/atr_stop_price/t1/t2/
             # suggested_shares_adjusted/addon_shares_approved 全部原封不動，UI 既有分頁行為不受影響。
@@ -2369,6 +2430,7 @@ else:
             top_cols[i].metric(f"{emoji} {row['名稱']} ({row['代號']})", f"{row['現價']:.2f}", f"戰力: {row['AI分數']}分", delta_color="normal" if row['AI分數']>=70 else "off")
         st.divider()
 
+    
     # 【V2.10.9 新增】AI 等待清單：找出目前判定為🟡觀望、但分數已經接近70分進場門檻的股票，
     # 只顯示「還差幾分」這種能從現有資料算出來的具體事實，不編造「預估幾天內達標」這類無法可靠預測的內容。
     if card_data:
@@ -2487,3 +2549,6 @@ else:
 
 if __name__ == "__main__":
     pass
+           
+
+
