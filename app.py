@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.10"
+APP_VERSION = "V2.11.11"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -2217,6 +2217,11 @@ else:
             macd_report_results.append(_macd_weekly_result)
 
             inst = get_institutional_data(code)
+            # 【V2.11.11修正：真實bug】is_us_stock 原本定義在T1/T2/防守線計算「之後」（第2263行附近），
+            # 但V2.11.9把T1/T2/防守線計算往前移到這裡統一時，忘記把這個定義也一起搬過來，
+            # 導致 calculate_target_plan() 在 is_us_stock 被賦值前就先用到它，整批股票分析全部
+            # 因為 NameError（name 'is_us_stock' is not defined）而失敗。這裡把定義提前到最前面。
+            is_us_stock = code.isalpha() or code.endswith('.US')
             # 【V2.11.9 修正】_old_plan 提前到這裡計算（原本在後面才算），因為現在防守線／T1/T2
             # 都要讀取「trade_plan裡已經持久化保存的上一次數值」當基準，UI跟狀態機才能真正算出
             # 同一個答案，不是只是公式一樣但各自從零開始算。
@@ -2260,7 +2265,6 @@ else:
                 r1, r2 = None, None
             risk_reward_ratio = r1  # 保留舊變數名，供既有「🟢進場但風報比<1」警示邏輯使用（對照T1）
 
-            is_us_stock = code.isalpha() or code.endswith('.US')
             score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0) if is_us_stock else min(inst['days'] * 5, 20) + (20 if inst['accumulated_shares'] * price >= 3000000000 else (10 if inst['accumulated_shares'] * price >= 1000000000 else 0))
             # 【V2.10.7 修正】RSI>50 原本無條件+10分，但 RSI 極度過熱時（>80）已經是短線反轉風險區，
             # 不該再算作「健康的偏多確認」，所以把這個加分的上限收窄到 50~80 之間；
