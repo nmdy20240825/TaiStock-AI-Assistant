@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.6"
+APP_VERSION = "V2.11.7"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -1337,6 +1337,17 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
         if is_signal_invalid(plan, price):
             return transition_state(plan, "INVALID", {}, data_date, f"現價跌破失效價 {plan.get('invalid_price'):.2f}，訊號條件已被破壞")
 
+        # 【修正】建議股數（suggested_shares）原本只在「建立這個計畫的當下」算一次就凍結，之後
+        # 使用者調整資金／風險% 都不會反映在畫面上，容易誤以為設定沒生效。這裡讓它在計畫還處於
+        # 等待狀態（尚未實際執行）時，每次評估都用「當下」的資金/風險%/ATR 重新計算，不會凍結。
+        # entry_price 是已經鎖定的突破價，不會因為重算股數而跟著變動，只有股數本身會即時跟上設定。
+        _recalc_stop = plan.get("entry_price", 0) - 2 * _safe_float(indicators.get("atr"))
+        plan["suggested_shares"] = calculate_position_size(
+            portfolio_info.get("cap", 20000.0), portfolio_info.get("risk", 5.0),
+            plan.get("entry_price", 0), _recalc_stop,
+            portfolio_info.get("available_cash", portfolio_info.get("cap", 20000.0)),
+        )
+
         if regime_bearish:
             if plan.get("state") in {"ENTER_NEXT_DAY"}:
                 return transition_state(plan, "SUSPENDED_BY_REGIME", {}, data_date, "市場逆風，暫停新倉但保留原交易計畫")
@@ -1591,7 +1602,10 @@ def render_stock_card(data, system_history, portfolio_data):
                     st.rerun()
 
         st.write("")
-        tab_c1, tab_c2, tab_c3, tab_c4, tab_c5, tab_c6 = st.tabs(["⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "📈 決策時間軸", "🗓️ 交易計畫", "📐 MACD動能背離"])
+        # 【調整】分頁順序改為：交易計畫優先（平常真正要照著做的依據，放第一分頁一打開就看到），
+        # 決策時間軸放最後（比較像是有空才回顧的歷史資料）。只調整這裡的宣告順序，下面每個分頁
+        # 實際內容的程式碼位置完全不動，用變數對應關係換順序，避免搬動大段內容時改錯。
+        tab_c5, tab_c1, tab_c2, tab_c3, tab_c6, tab_c4 = st.tabs(["🗓️ 交易計畫", "⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "📐 MACD動能背離", "📈 決策時間軸"])
 
         with tab_c1:
             st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
@@ -1718,11 +1732,10 @@ def render_stock_card(data, system_history, portfolio_data):
             if data.get('plan_signal_reason'):
                 st.caption(f"📝 {data['plan_signal_reason']}")
 
-            _pc1, _pc2 = st.columns(2)
-            with _pc1:
-                st.write(f"**訊號日期資料**\n台股資料日：{data.get('plan_taiwan_data_date') or '—'}\n美股資料日：{data.get('plan_us_data_date') or '—'}\n建議執行日：{data.get('plan_execution_date') or '—'}\n有效期限：{data.get('plan_valid_until') or '—'}")
-            with _pc2:
-                st.write(f"**目前執行模式**：{_mode_display.get(execution_mode, execution_mode)}\n**下一交易日**：{_next_business_day(data.get('plan_taiwan_data_date') or today_str) or '—'}")
+            # 【修正】原本用 st.columns(2) 左右分欄，在手機/平板較窄的螢幕上兩欄文字容易被硬擠在一起、
+            # 看起來混在一起分不清楚，改成單欄、由上到下依序顯示，寬螢幕/窄螢幕都不會有排版混淆的問題。
+            st.write(f"**訊號日期資料**\n台股資料日：{data.get('plan_taiwan_data_date') or '—'}\n美股資料日：{data.get('plan_us_data_date') or '—'}\n建議執行日：{data.get('plan_execution_date') or '—'}\n有效期限：{data.get('plan_valid_until') or '—'}")
+            st.write(f"**目前執行模式**：{_mode_display.get(execution_mode, execution_mode)}\n**下一交易日**：{_next_business_day(data.get('plan_taiwan_data_date') or today_str) or '—'}")
 
             if data.get('held_qty', 0) <= 0:
                 st.markdown("**空手訊號資訊**")
@@ -2154,7 +2167,7 @@ else:
                         ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%、現價已與成本拉開足夠空間，資金額度內約可加碼 {_addon_shares} 股（同時受分配資金上限、原始建倉股數一半、加碼後總風險上限三重限制，避免單押過重）。")
                     else:
                         ai_advice.append("⏸️ 資金或風險額度所剩不多，加碼股數不足1股，暫不建議加碼。")
-            
+
             # ===== V2.11.x 交易計畫狀態機：與上方既有 final_status 邏輯並行運作，不修改既有變數 =====
             # 只把「持久化的交易計畫」疊加上去，既有的 ai_score/final_status/atr_stop_price/t1/t2/
             # suggested_shares_adjusted/addon_shares_approved 全部原封不動，UI 既有分頁行為不受影響。
@@ -2430,7 +2443,6 @@ else:
             top_cols[i].metric(f"{emoji} {row['名稱']} ({row['代號']})", f"{row['現價']:.2f}", f"戰力: {row['AI分數']}分", delta_color="normal" if row['AI分數']>=70 else "off")
         st.divider()
 
-    
     # 【V2.10.9 新增】AI 等待清單：找出目前判定為🟡觀望、但分數已經接近70分進場門檻的股票，
     # 只顯示「還差幾分」這種能從現有資料算出來的具體事實，不編造「預估幾天內達標」這類無法可靠預測的內容。
     if card_data:
@@ -2549,6 +2561,5 @@ else:
 
 if __name__ == "__main__":
     pass
-           
 
 
