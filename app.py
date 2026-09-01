@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.7"
+APP_VERSION = "V2.11.9"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -471,26 +471,54 @@ def _date_str(value):
     except Exception:
         return str(value)[:10]
 
-def _next_business_day(date_str):
-    """回傳輸入日期之後的下一個交易日（僅排除週末，未接台股行事曆，不排除國定假日）。"""
+# 【V2.11.9新增，P1-4】台股／美股靜態假日表——用來補強 _next_business_day/_add_business_days
+# 原本「只排除週末」的限制。這是手動整理的靜態清單（資料來源：台灣證券交易所、NYSE官方休市公告），
+# 不是即時行事曆服務，需要每年手動更新一次（通常年底前補上下一年度資料）。若忘記更新，
+# 效果會退回「只排除週末」，不會出錯、只是遇到連假時 valid_until/execution_date 可能提早1~2天。
+TW_MARKET_HOLIDAYS = {
+    # 2026（資料來源：臺灣證券交易所 https://www.twse.com.tw/zh/trading/holiday.html）
+    "2026-01-01", "2026-02-12", "2026-02-13", "2026-02-16", "2026-02-17",
+    "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-27", "2026-04-03",
+    "2026-04-06", "2026-05-01", "2026-06-19", "2026-09-25", "2026-09-28",
+    "2026-10-09", "2026-10-26", "2026-12-25",
+    # 2027（依行政院人事行政總處行事曆與證交所慣例推算，正式公告前可能微調）
+    "2027-01-01", "2027-02-02", "2027-02-03", "2027-02-04", "2027-02-05",
+    "2027-02-08", "2027-02-09", "2027-02-10", "2027-03-01", "2027-04-05",
+    "2027-04-06", "2027-04-30", "2027-06-09", "2027-09-15", "2027-09-28",
+    "2027-10-11", "2027-10-25", "2027-12-24", "2027-12-31",
+}
+US_MARKET_HOLIDAYS = {
+    # 2026（資料來源：NYSE https://www.nyse.com/markets/hours-calendars）
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+
+def _next_business_day(date_str, is_us_stock=False):
+    """回傳輸入日期之後的下一個交易日（排除週末，並依 is_us_stock 對照台股或美股的靜態假日表；
+    假日表只到2027年，超出範圍時自動退回「只排除週末」，不會拋錯）。"""
     try:
+        holidays = US_MARKET_HOLIDAYS if is_us_stock else TW_MARKET_HOLIDAYS
         d = pd.Timestamp(date_str)
         d += pd.Timedelta(days=1)
-        while d.weekday() >= 5:
+        while d.weekday() >= 5 or d.strftime("%Y-%m-%d") in holidays:
             d += pd.Timedelta(days=1)
         return d.strftime("%Y-%m-%d")
     except Exception:
         return ""
 
-def _add_business_days(date_str, days):
-    """回傳輸入日期往後推 N 個交易日的日期（僅排除週末，未接台股行事曆，不排除國定假日）。
+def _add_business_days(date_str, days, is_us_stock=False):
+    """回傳輸入日期往後推 N 個交易日的日期（排除週末與靜態假日表，同上限制）。
     用於計算訊號有效期限 valid_until（規格書 7.6：PREPARE/BREAKOUT_WAIT=3個交易日，PULLBACK_WAIT=5個交易日）。"""
     try:
+        holidays = US_MARKET_HOLIDAYS if is_us_stock else TW_MARKET_HOLIDAYS
         d = pd.Timestamp(date_str)
         remaining = int(days)
         while remaining > 0:
             d += pd.Timedelta(days=1)
-            if d.weekday() < 5:
+            if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in holidays:
                 remaining -= 1
         return d.strftime("%Y-%m-%d")
     except Exception:
@@ -1046,27 +1074,79 @@ def calculate_position_size(cap, risk_pct, entry_price, stop_price, available_ca
     capital_based_shares = cash_limit / _safe_float(entry_price) if _safe_float(entry_price) > 0 else 0
     return int(np.floor(min(risk_based_shares, capital_based_shares)))
 
-def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, cost):
+def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, profit_trigger_pct=10.0, min_gap_atr_multiple=1.0):
     """
-    【V2.11.x 核心修正】有狀態版移動防守線，取代舊版「每次重新掃描過去60天重建棘輪」的無狀態算法。
-    直接讀取上一次已保存的 previous_stop 當基準，新防守線只會是兩者取最大值，天然滿足「只能上移」：
-      initial_stop（只在 previous_stop 還不存在時，即首次建倉時使用）＝ cost − 2×ATR
-      candidate_stop ＝ MA20 − ATR
-      new_stop = max(previous_stop 或 initial_stop, candidate_stop)
+    【單一目標價權威來源，V2.11.8新增】T1/T2 計算的唯一入口。
 
-    【V2.11.4 修正】拿掉了先前版本 max() 裡的 cost_f，那樣寫會導致「還沒獲利」的部位防守線也被
-    強制拉到成本價，等於初始的 ATR 緩衝空間完全失效，只要收盤價比成本價低一點點（完全正常的小拉回）
-    就會被誤判跌破防守線、強制全部出清。拿掉之後：day 1 的防守線正確落在 cost−2×ATR（給合理緩衝），
-    之後隨著 candidate_stop（MA20−ATR）自然墊高、透過棘輪只升不降的特性，一旦行情真的走出來，
-    防守線會自然而然墊到成本價以上（保本），不需要用力把 cost 塞進 max() 裡強迫達成。
+    修正前的問題：UI顯示（main loop 呼叫 calc_structural_target + 10%獲利門檻判斷）跟正式交易計畫
+    狀態機（calculate_exit_plan 內部另外寫一套，永遠用前高、完全沒有10%獲利門檻、也沒有「前高太近
+    就改外推」的判斷）是兩套完全獨立維護的公式，同一檔股票在「🛡️風控點位」跟「🗓️交易計畫」兩個
+    分頁可能顯示不同的T1/T2數字。現在兩邊都改成呼叫這一個函式，確保同一組輸入（price/cost/atr/
+    previous_high）算出來的T1/T2永遠一致，不會再各自維護一份公式。
+
+    規則（沿用原本UI版本更完整的邏輯，狀態機這邊改用這套，不再自己算）：
+      - cost<=0（空手，沒有成本可比較獲利%）：T1=T2=0
+      - atr 無效（None/NaN/<=0）：T1=T2=cost×1.10（無法算風險距離時的保底值）
+      - 獲利尚未超過 profit_trigger_pct（預設10%）：T1=T2=cost×1.10（先看固定門檻，未達門檻不做結構分析）
+      - 獲利已超過門檻：前高離現價夠遠（> min_gap_atr_multiple×ATR）就用前高當T1，
+        否則現價已經追平/超過前高、前高沒有參考價值，改用「現價+2×ATR」外推；T2一律是T1再加2×ATR
+    回傳 (t1, t2, branch)，branch 記錄是哪個分支算出來的，方便顯示／除錯。
+    """
+    if cost is None or cost <= 0:
+        return 0.0, 0.0, "no_position"
+    if atr is None or atr <= 0 or pd.isna(atr):
+        return round_to_tick(cost * 1.10, is_us_stock), round_to_tick(cost * 1.10, is_us_stock), "atr_unavailable"
+    if price <= cost * (1 + profit_trigger_pct / 100.0):
+        t1 = t2 = cost * 1.10
+        return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), "profit_gate"
+    ph = _safe_float(previous_high)
+    min_gap = min_gap_atr_multiple * atr
+    if ph > price + min_gap:
+        t1, t2, branch = ph, ph + 2 * atr, "resistance"
+    else:
+        t1, t2, branch = price + 2 * atr, price + 4 * atr, "atr_fallback"
+    return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), branch
+
+def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=10.0):
+    """
+    【單一防守線權威來源，V2.11.9新增】取代 UI 用的 `calc_trailing_stop()`（60天回溯重建棘輪，
+    獲利>10%才啟用）跟狀態機用的 `calculate_trailing_stop_stateful()`（有狀態增量棘輪，完全沒有
+    10%門檻，從第一天就開始墊）——這兩個公式原本各自維護，同一檔股票在「🛡️風控點位」跟
+    「🗓️交易計畫」可能顯示不同防守線，甚至連「有沒有跌破、要不要全部出清」都可能兩邊不一致。
+
+    統一後的規則（採用UI原本較完整的「獲利門檻」邏輯，狀態機這邊改用這套，不再自己算）：
+      - cost<=0：回傳0（無成本可比較）
+      - 獲利尚未超過 profit_trigger_pct（預設10%）：防守線是 max(previous_stop, cost−2×ATR)——
+        還沒開始棘輪的全新部位會落在 cost−2×ATR；但如果先前已經棘輪墊高過（previous_stop更高，
+        例如價格一度衝過10%獲利門檻又拉回），不會因為現在跌回門檻以下就把防守線退回去，
+        「只能上移不能下移」是防守線的鐵律，門檻只決定「要不要開始棘輪」，不能拿來讓已經墊高的
+        防守線倒退（V2.11.9修正：這是我在測試時發現的真實回歸，第一版寫法會讓已經墊高的防守線
+        在價格拉回10%門檻以下時被打回原形，等於防守線可以下降，違反棘輪的基本設計原則）
+      - 獲利已超過門檻：棘輪模式，new_stop = max(previous_stop 或 cost−2×ATR起點, MA20−ATR)，
+        只能上移不能下移（V2.11.4已修正過的「不會被cost強制拉高」特性沿用）
+
+    previous_stop：呼叫端傳入「上一次已經算出、且已經持久化保存的防守線」（沒有就傳 None 或 0，
+    會用 cost−2×ATR 當起點）。UI跟狀態機都必須傳入「同一個來源」（trade_plan.current_trailing_stop）
+    的 previous_stop，才能確保兩邊算出同一個答案——這是本次統一的關鍵，不只是公式一樣，
+    連「上一次的記憶」都要讀同一份，否則UI每次重算會因為沒有記憶又跟狀態機兜不起來。
     """
     cost_f = _safe_float(cost)
     if cost_f <= 0:
         return 0.0
-    initial_stop = cost_f - 2 * _safe_float(atr)
-    base = _safe_float(previous_stop) if _safe_float(previous_stop) > 0 else initial_stop
-    candidate_stop = _safe_float(ma20) - _safe_float(atr)
-    return max(base, candidate_stop)
+    flat_stop = cost_f - 2 * _safe_float(atr)
+    prev = _safe_float(previous_stop)
+    if price is None or _safe_float(price) <= cost_f * (1 + profit_trigger_pct / 100.0):
+        return max(prev, flat_stop) if prev > 0 else flat_stop
+    base = prev if prev > 0 else flat_stop
+    candidate = _safe_float(ma20) - _safe_float(atr)
+    return max(base, candidate)
+
+def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, cost):
+    """
+    【V2.11.9】改為 calculate_stop_plan() 的薄包裝，保留舊名稱／參數順序以維持既有呼叫端不用改，
+    實際計算邏輯已經全部收斂進 calculate_stop_plan()，不再各自維護一份公式。
+    """
+    return calculate_stop_plan(current_price, cost, atr, ma20, previous_stop)
 
 def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, previous_high,
                          t1_taken, t2_taken, current_shares, is_us_stock=False, partial_exit_ratio=0.30,
@@ -1084,14 +1164,7 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
     頂背離的用途是攔阻「新進場」與「加碼」，不是拿來提前出場。
     """
     current_trailing_stop = calculate_trailing_stop_stateful(previous_trailing_stop, price, ma20, atr, average_cost)
-    if _safe_float(previous_high) > 0 and _safe_float(atr) > 0:
-        t1_price = round_to_tick(previous_high, is_us_stock)
-        t2_price = round_to_tick(previous_high + 2 * atr, is_us_stock)
-    elif _safe_float(atr) > 0:
-        t1_price = round_to_tick(price + 2 * atr, is_us_stock)
-        t2_price = round_to_tick(price + 4 * atr, is_us_stock)
-    else:
-        t1_price, t2_price = 0.0, 0.0
+    t1_price, t2_price, _target_branch = calculate_target_plan(price, average_cost, atr, previous_high, is_us_stock)
 
     result = {"current_trailing_stop": current_trailing_stop, "t1_price": t1_price, "t2_price": t2_price,
               "next_state": None, "signal_type": "", "signal_reason": "", "partial_exit_shares": 0, "full_exit_shares": 0}
@@ -1173,22 +1246,22 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
 
     if price > chase_limit > 0:
         state = "PULLBACK_WAIT"
-        valid_until = _add_business_days(data_date, 5)
+        valid_until = _add_business_days(data_date, 5, is_us_stock)
         reason = "現價已超過追價上限，改為等待回測區間"
     elif price >= breakout_price > 0:
         state = "ENTER_NEXT_DAY"
-        valid_until = _add_business_days(data_date, 3)
+        valid_until = _add_business_days(data_date, 3, is_us_stock)
         reason = "突破確認且未超過追價上限，隔日執行進場"
     else:
         state = "BREAKOUT_WAIT"
-        valid_until = _add_business_days(data_date, 3)
+        valid_until = _add_business_days(data_date, 3, is_us_stock)
         reason = "Gate 與 Score 同時成立，等待價格突破"
 
     return {
         "signal_type": "ENTRY", "entry_price": breakout_price, "breakout_price": breakout_price,
         "pullback_low": pullback_low, "pullback_high": pullback_high, "chase_limit": chase_limit,
         "invalid_price": invalid_price, "state": state, "signal_date": data_date,
-        "execution_date": _next_business_day(data_date) if state == "ENTER_NEXT_DAY" else "",
+        "execution_date": _next_business_day(data_date, is_us_stock) if state == "ENTER_NEXT_DAY" else "",
         "valid_until": valid_until, "signal_reason": reason,
         "suggested_shares": calculate_position_size(
             portfolio_info.get("cap", 20000.0), portfolio_info.get("risk", 5.0),
@@ -1198,11 +1271,19 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     }
 
 def calculate_addon_shares(current_shares, current_price, current_stop, add_price, add_stop,
-                            allocated_capital, risk_percent, available_cash, suggested_shares_cap=None):
+                            allocated_capital, risk_percent, available_cash, suggested_shares_cap=None,
+                            confidence_multiplier=1.0):
     """
     加碼股數（規格書8節）。三重上限取最小值：加碼後總風險不超過 max_risk、資金餘額、以及可選的
     「原建倉股數上限」（既有 taistock_v2_9.py 已驗證過的保守設計，這裡保留但改為可選參數，
     未提供時不套用這個額外上限，行為與規格書8.2原始公式完全一致）。
+
+    confidence_multiplier（V2.11.9新增，P0-3統一）：0~1之間的縮減比例，對應「決策信心」分級
+    （100%/60%/20%/0%）。這個機制原本只存在UI端（乘在suggested_shares_adjusted裡），狀態機完全沒有，
+    導致「要不要加碼」統一了、但「加碼多少股」UI跟狀態機還是兩個數字。現在UI跟狀態機都呼叫這同一個
+    函式、都傳入同一個confidence_multiplier來源，兩邊算出來的加碼股數會永遠一致。
+    suggested_shares_cap 現在統一約定傳「未經信心縮減的原始建倉股數的一半」，信心縮減只在這裡
+    最後統一乘一次，不會被同時套用兩次。
     """
     max_risk = _safe_float(allocated_capital) * _safe_float(risk_percent) / 100.0
     remaining_risk = _safe_float(current_shares) * max(_safe_float(current_price) - _safe_float(current_stop), 0.0)
@@ -1215,7 +1296,8 @@ def calculate_addon_shares(current_shares, current_price, current_stop, add_pric
     candidates = [risk_based_add_shares, capital_based_add_shares]
     if suggested_shares_cap is not None:
         candidates.append(suggested_shares_cap)
-    return int(np.floor(min(candidates))) if candidates else 0
+    raw_shares = min(candidates) if candidates else 0
+    return int(np.floor(raw_shares * _safe_float(confidence_multiplier, 1.0)))
 
 # --- 4-6. 狀態機主體（規格書十四節主程式正確執行順序：持倉優先於新倉、出清優先於停利/加碼/續抱）---
 def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info):
@@ -1254,8 +1336,13 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             held_qty, is_us_stock, plan.get("partial_exit_ratio", 0.30),
             macd_osc_status=indicators.get("macd_osc_status"),
         )
-        plan["t1_price"] = exit_plan["t1_price"] if plan.get("t1_price", 0) <= 0 else plan["t1_price"]
-        plan["t2_price"] = exit_plan["t2_price"] if plan.get("t2_price", 0) <= 0 else plan["t2_price"]
+        # 【V2.11.8 修正】原本只在「第一次設定」時寫入 t1_price/t2_price，之後永遠凍結不再更新——
+        # 即使已經統一成同一套公式（calculate_target_plan），只要時間拉長、前高或股價變化，
+        # 畫面上凍結的舊數字還是會跟即時算出來的新數字兜不起來。改成每次評估都直接採用
+        # calculate_exit_plan 剛算出來的最新值，確保「🗓️交易計畫」顯示的T1/T2永遠等於當下
+        # 用同一套公式即時算出的結果，跟「🛡️風控點位」分頁不會再對不上。
+        plan["t1_price"] = exit_plan["t1_price"]
+        plan["t2_price"] = exit_plan["t2_price"]
 
         if exit_plan["next_state"] == "FULL_EXIT_NEXT_DAY":
             key = f"{code}|FULL_EXIT|{data_date}|{round(exit_plan['current_trailing_stop'], 2)}"
@@ -1297,6 +1384,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
                 portfolio_info.get("cap", 20000.0), portfolio_info.get("risk", 5.0),
                 max(0.0, _safe_float(portfolio_info.get("cap", 20000.0)) - held_qty * price),
                 suggested_shares_cap=int(plan.get("suggested_shares", 0) * 0.5) if plan.get("suggested_shares", 0) > 0 else None,
+                confidence_multiplier=portfolio_info.get("confidence_multiplier", 1.0),
             )
             if addon_shares > 0:
                 key = f"{code}|ADD|{data_date}|{addon_shares}"
@@ -1368,7 +1456,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
                 return plan
             plan["signal_key"] = key
             return transition_state(plan, "ENTER_NEXT_DAY",
-                                     {"execution_date": _next_business_day(data_date)},
+                                     {"execution_date": _next_business_day(data_date, is_us_stock)},
                                      data_date, "突破/回測進場條件成立，隔日執行")
         return plan
 
@@ -1610,12 +1698,16 @@ def render_stock_card(data, system_history, portfolio_data):
         with tab_c1:
             st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
             st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
-            st.code(f"籌碼/長線: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
+            # 【V2.11.9修正，P1-1】美股的 score_inst 實際上是用「price>MA60 且 MACD>0」算的
+            # 動能/趨勢分數，跟台股用真正的法人籌碼資料算出來的 score_inst 不是同一件事，
+            # 不該在美股卡片上也標成「籌碼/長線」，容易誤導成美股也有籌碼資料可看。
+            _inst_label = "動能/趨勢" if data['is_us'] else "籌碼/長線"
+            st.code(f"{_inst_label}: +{data['score_inst']:.0f} | 趨勢技術: +{data['score_tech']:.0f} | 量能指標: +{data['score_vol']:.0f} | 風控狀態: +{data['score_risk']:.0f}", language="text")
             # 【V2.9.5 修正】改用小方塊組成的迷你進度條（而非整條拉滿寬度的 st.progress），
             # 視覺上更接近「一排小方塊」的樣式，且寬度只跟着方塊數走、不會佔滿整個畫面寬度。
             _bar_rows = []
             for _label, _val, _max in [
-                ("籌碼/長線", data['score_inst'], 40),
+                (_inst_label, data['score_inst'], 40),
                 ("趨勢技術", data['score_tech'], 30),
                 ("量能指標", data['score_vol'], 15),
                 ("風控狀態", data['score_risk'], 15),
@@ -1735,7 +1827,10 @@ def render_stock_card(data, system_history, portfolio_data):
             # 【修正】原本用 st.columns(2) 左右分欄，在手機/平板較窄的螢幕上兩欄文字容易被硬擠在一起、
             # 看起來混在一起分不清楚，改成單欄、由上到下依序顯示，寬螢幕/窄螢幕都不會有排版混淆的問題。
             st.write(f"**訊號日期資料**\n台股資料日：{data.get('plan_taiwan_data_date') or '—'}\n美股資料日：{data.get('plan_us_data_date') or '—'}\n建議執行日：{data.get('plan_execution_date') or '—'}\n有效期限：{data.get('plan_valid_until') or '—'}")
-            st.write(f"**目前執行模式**：{_mode_display.get(execution_mode, execution_mode)}\n**下一交易日**：{_next_business_day(data.get('plan_taiwan_data_date') or today_str) or '—'}")
+            # 【V2.11.9修正，P1-4】原本這裡沒有分台股/美股，一律用台股假日表算下一交易日，
+            # 對美股會不準。改成依這張卡片的股票代號判斷市場，跟其他地方判斷 is_us_stock 的方式一致。
+            _card_is_us_stock = str(data.get('code', '')).isalpha() or str(data.get('code', '')).endswith('.US')
+            st.write(f"**目前執行模式**：{_mode_display.get(execution_mode, execution_mode)}\n**下一交易日**：{_next_business_day(data.get('plan_taiwan_data_date') or today_str, _card_is_us_stock) or '—'}")
 
             if data.get('held_qty', 0) <= 0:
                 st.markdown("**空手訊號資訊**")
@@ -1970,26 +2065,29 @@ else:
             macd_report_results.append(_macd_weekly_result)
 
             inst = get_institutional_data(code)
-            # 【V2.11.2 正式導入】把原本「獲利>10%用固定門檻切換」的停損/目標價，
-            # 換成結構化版本：移動停利用「無狀態棘輪」重建只能上移的歷程；目標價改用
-            # 前高（結構壓力位）或 ATR 外推，取代僵化的「成本×固定倍數」。
+            # 【V2.11.9 修正】_old_plan 提前到這裡計算（原本在後面才算），因為現在防守線／T1/T2
+            # 都要讀取「trade_plan裡已經持久化保存的上一次數值」當基準，UI跟狀態機才能真正算出
+            # 同一個答案，不是只是公式一樣但各自從零開始算。
+            _old_plan = _normalize_trade_plan_row(trade_plan_data.get(code, _trade_plan_defaults(code)))
+            _prev_stop_for_calc = _old_plan.get("current_trailing_stop") or _old_plan.get("initial_stop")
+
+            # 【V2.11.8 修正】T1/T2 目標價原本這裡跟正式交易計畫狀態機（calculate_exit_plan）各自維護
+            # 一套公式：這裡有「獲利>10%才用結構分析、否則用cost×1.10」的門檻判斷，狀態機那邊卻永遠
+            # 直接用前高、完全沒有這個門檻，導致「🛡️風控點位」跟「🗓️交易計畫」兩個分頁可能顯示不同
+            # 的T1/T2數字。現在改成兩邊都呼叫同一個 calculate_target_plan()，公式統一、不再各自維護。
+            _t_previous_high_window = h.iloc[-61:-1] if len(h) > 60 else h.iloc[:-1]
+            _t_previous_high = float(_t_previous_high_window.max()) if len(_t_previous_high_window) > 0 else price
+
+            # 【V2.11.9 修正】移動防守線原本這裡跟正式交易計畫狀態機各自維護一套公式：這裡用
+            # calc_trailing_stop()（無狀態、每次重新掃描過去60天重建），狀態機用
+            # calculate_trailing_stop_stateful()（有狀態增量），兩者連「有沒有10%獲利門檻」都不一樣，
+            # 導致同一檔股票兩個分頁顯示不同防守線，甚至連「有沒有跌破」都可能不一致（P0-2）。
+            # 現在改成兩邊都呼叫同一個 calculate_stop_plan()，且都讀取 trade_plan 持久化的
+            # 上一次防守線（_prev_stop_for_calc）當基準，公式跟記憶體都統一。
             # atr_stop_price／take_profit_price 這兩個變數名稱保留不變，
             # 讓後面所有既有的分數/顯示邏輯不用跟著大改；take_profit_price = T1（較近的第一目標）。
-            _ma20_series = c.rolling(20).mean()
-            _atr_series = calc_atr_series(h, l, c, period=14)
-
-            if cost > 0 and price > cost * 1.10:
-                _ratchet_stop, _stop_method = calc_trailing_stop(c, _ma20_series, _atr_series, cost)
-                atr_stop_price = _ratchet_stop if _ratchet_stop is not None else max(cost, ma20)
-                t1, t2, _target_branch = calc_structural_target(h, price, atr)
-            elif cost > 0:
-                atr_stop_price = cost - (atr * 2)
-                t1, t2 = cost * 1.10, cost * 1.10  # 未達10%獲利時，維持原本「先看5%/10%門檻」的既有邏輯，不套用結構目標
-                _target_branch = "atr_fallback"
-            else:
-                atr_stop_price = 0
-                t1, t2 = 0, 0
-                _target_branch = "atr_fallback"
+            t1, t2, _target_branch = calculate_target_plan(price, cost, atr, _t_previous_high, is_us_stock)
+            atr_stop_price = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc)
 
             take_profit_price = t1
 
@@ -2152,19 +2250,25 @@ else:
                     _addon_quality_gate_pass = True
                     _current_value = _held_qty * price
                     _remaining_room = max(0.0, cap - _current_value)
-                    # 【V2.11.2 正式導入】加碼後總風險上限檢查：現有持倉風險 + 加碼部位風險，
-                    # 不能超過這檔股票原本設定的風險金額（分配資金×單筆風險%），避免加碼把整體風險越墊越高。
-                    _current_position_risk = _held_qty * _per_share_risk
-                    _remaining_risk_budget = max(risk_amount - _current_position_risk, 0.0)
-                    _risk_based_addon_cap = int(_remaining_risk_budget / _per_share_risk) if _per_share_risk > 0 else 0
-                    _addon_shares = int(min(_remaining_room / price, suggested_shares_adjusted * 0.5, _risk_based_addon_cap)) if price > 0 else 0
+                    # 【V2.11.9 修正，P0-3統一】原本這裡自己重算一套「_risk_based_addon_cap」，跟狀態機的
+                    # calculate_addon_shares() 是兩份獨立維護的公式（風險距離分母用的防守線也不一樣，見
+                    # P0-2）。現在直接呼叫同一個函式，用統一後的 atr_stop_price（calculate_stop_plan算出）
+                    # 當防守線，suggested_shares（原始、未經信心縮減）×0.5當上限，confidence_multiplier
+                    # 統一在函式內部最後才乘一次，UI跟狀態機不會再算出兩個不同的加碼股數。
+                    _addon_shares = calculate_addon_shares(
+                        _held_qty, price, atr_stop_price, price, atr_stop_price,
+                        cap, risk_pct, _remaining_room,
+                        suggested_shares_cap=suggested_shares * 0.5 if suggested_shares > 0 else None,
+                        confidence_multiplier=position_pct,
+                    )
+                    _remaining_risk_budget = max(risk_amount - _held_qty * _per_share_risk, 0.0)
                     if _remaining_risk_budget <= 0:
                         ai_advice.append("⏸️ 不建議加碼：目前持倉的風險已達（或超過）這檔股票原始設定的風險預算上限，加碼會讓總風險超出你原本能接受的範圍。")
                     elif _remaining_room <= 0:
                         ai_advice.append("⏸️ 不建議加碼：目前持有市值已達到你設定的分配資金上限，加碼會超出原本的資金規劃。")
                     elif _addon_shares > 0:
                         addon_shares_approved = _addon_shares
-                        ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%、現價已與成本拉開足夠空間，資金額度內約可加碼 {_addon_shares} 股（同時受分配資金上限、原始建倉股數一半、加碼後總風險上限三重限制，避免單押過重）。")
+                        ai_advice.append(f"📈 可考慮加碼：SOP三燈全亮、決策信心{confidence}%、現價已與成本拉開足夠空間，資金額度內約可加碼 {_addon_shares} 股（同時受分配資金上限、原始建倉股數一半、加碼後總風險上限、決策信心縮減四重限制，避免單押過重）。")
                     else:
                         ai_advice.append("⏸️ 資金或風險額度所剩不多，加碼股數不足1股，暫不建議加碼。")
 
@@ -2172,8 +2276,10 @@ else:
             # 只把「持久化的交易計畫」疊加上去，既有的 ai_score/final_status/atr_stop_price/t1/t2/
             # suggested_shares_adjusted/addon_shares_approved 全部原封不動，UI 既有分頁行為不受影響。
             _plan_data_date = _date_str(_last_bar_date)
-            _plan_previous_high_window = h.iloc[-61:-1] if len(h) > 60 else h.iloc[:-1]
-            _plan_previous_high = float(_plan_previous_high_window.max()) if len(_plan_previous_high_window) > 0 else price
+            # 【V2.11.8】previous_high 沿用上面 T1/T2 統一計算時已經算好的 _t_previous_high，
+            # 不再重複計算一次——確保「用來算 legacy T1/T2」跟「用來算進場R1／傳給狀態機」的前高，
+            # 是同一個數字，不會因為兩處各自重算而有微小落差。
+            _plan_previous_high = _t_previous_high
 
             # 【修正①：進場R1不該借用「持有成本」算出來的舊r1】
             # 上面的 r1（第1868~1874行）只有 cost>0（已持有）時才有值，空手股票永遠是 None。
@@ -2193,7 +2299,7 @@ else:
             else:
                 _entry_r1 = None
 
-            _old_plan = _normalize_trade_plan_row(trade_plan_data.get(code, _trade_plan_defaults(code)))
+            # 【V2.11.9】_old_plan 已經在前面（第2020行附近）算好並用於防守線/T1/T2計算，這裡不用重算。
             # 【MACD深度整合】把「日線」MACD結果讀出來，餵給交易計畫狀態機。用日線而不用週線，
             # 是因為週線需要至少35週歷史暖身、新股常常「資料不足」，若拿週線去擋新倉/加碼，
             # 會讓剛上市股票長期卡死無法進場；日線資料完整度高很多，適合當硬性關卡。
@@ -2210,7 +2316,8 @@ else:
             }
             _plan_portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": _held_qty,
                                      "available_cash": max(0.0, cap - _held_qty * price),
-                                     "addon_quality_gate": _addon_quality_gate_pass}
+                                     "addon_quality_gate": _addon_quality_gate_pass,
+                                     "confidence_multiplier": position_pct}
 
             # 【修正：今天K棒尚未收斂時，即使全域執行模式判定為唯讀，這一檔也要強制重新評估】
             # 問題根源：系統用「資料日期字串有沒有變」判斷要不要重跑狀態機，但當最後一根K棒就是
@@ -2219,7 +2326,15 @@ else:
             # 決策」凍結一整天，跟同一次畫面上「AI決策與SOP」分頁每次都重新即時計算的結果對不上。
             # 只要 is_today_bar 還是 True，就強制走跟 TAIWAN_CLOSE_UPDATE 一樣的完整重新評估，
             # 確保交易計畫會跟著當天最新資料調整，不會卡在早上的過時快照。
-            _force_intraday_recheck = bool(is_today_bar)
+            #
+            # 【V2.11.9 修正，P1-3】原本這裡沒有區分台股/美股：只要「最後一根K棒的日期＝系統今天」
+            # 就會強制完整重算，但這個判斷完全繞過了 process_us_close_update() 原本設計的白名單保護
+            # （只准動暫停/恢復欄位，不准碰價格/T1/T2/防守線）。美股在台灣時區下，資料日期跟台灣「今天」
+            # 對齊純屬巧合，可能發生在美股盤中還沒收盤、資料還在形成的時候，若這時候強制跑完整
+            # evaluate_trade_state()，可能拿美股盤中的暫時性下殺去觸發不該觸發的 FULL_EXIT_NEXT_DAY，
+            # 等實際收盤資料出來才發現是誤判。修正：is_today_bar 的強制重算只適用台股，
+            # 美股一律只透過 US_CLOSE_UPDATE（白名單保護）或每日一次的 TAIWAN_CLOSE_UPDATE 全域週期更新。
+            _force_intraday_recheck = bool(is_today_bar) and not is_us_stock
             if execution_mode == TAIWAN_CLOSE_UPDATE or _force_intraday_recheck or (not _old_plan.get("taiwan_data_date") and _plan_data_date):
                 # 台股有新日K、今天K棒尚未收斂需要持續追蹤、或這檔股票從未被 evaluate 過（首次遷移/新增持股的一次性 bootstrap）
                 _new_plan = process_taiwan_close_update(_old_plan, _plan_indicators, macro_data, _plan_portfolio_info)
@@ -2299,7 +2414,10 @@ else:
     if card_data:
         _headline_top = max(card_data, key=lambda x: x['ai_score'])
         if _headline_top['ai_score'] > 0:
-            _sub_scores = {"籌碼/長線動能": _headline_top['score_inst'], "趨勢技術": _headline_top['score_tech'], "量能表現": _headline_top['score_vol'], "風控狀態": _headline_top['score_risk']}
+            # 【V2.11.9修正，P1-1】同一個「籌碼」誤標問題：今天戰力最高的若剛好是美股，
+            # 這裡不該說優勢來自「籌碼/長線動能」，美股的這個子分數其實是動能/趨勢，跟籌碼無關。
+            _inst_label_headline = "動能/趨勢" if _headline_top.get('is_us') else "籌碼/長線動能"
+            _sub_scores = {_inst_label_headline: _headline_top['score_inst'], "趨勢技術": _headline_top['score_tech'], "量能表現": _headline_top['score_vol'], "風控狀態": _headline_top['score_risk']}
             _top_sub_label = max(_sub_scores, key=_sub_scores.get)
             _tag_str = "、".join(_headline_top['tags'][:2])
             st.info(f"🧠 **AI 每日一句**：今天最值得留意的是 **{_headline_top['name']}（{_headline_top['code']}）**，戰力 {_headline_top['ai_score']} 分，判定「{_headline_top['final_status']}」。優勢主要來自「{_top_sub_label}」，標籤：{_tag_str}。")
@@ -2561,5 +2679,4 @@ else:
 
 if __name__ == "__main__":
     pass
-
 
