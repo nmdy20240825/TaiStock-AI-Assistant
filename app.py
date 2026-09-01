@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.9"
+APP_VERSION = "V2.11.10"
 APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -191,6 +191,57 @@ def calc_macd_full_series(close: pd.Series, fast: int = 12, slow: int = 26, sign
     osc = dif - dea
     return dif, dea, osc
 
+def calculate_momentum_acceleration_score(rsi_series, osc_series, volume_series, lookback=3):
+    """
+    【V2.11.10新增，AI Score動能加速度，觀察用】±10分的子分數，不併入現有 ai_score 總分、
+    不影響任何進場/加碼門檻（decision_score≥70、confidence≥80完全不會用到這個數字）。
+
+    目的：現有 ai_score 只看「現在是不是處於多頭區間」（K>D、RSI 50~80、price>MA20 這種靜態門檻），
+    分不出「正在轉強」跟「正在轉弱」——例如 RSI 55→62→69 跟 75→70→64 只要還在50以上，
+    現有分數完全看不出差別。這個子分數改看最近幾天的「變化方向」（斜率），來補上這個缺口：
+      RSI 斜率：最近lookback天的RSI變化量，每2點記1分，上限±4分
+      MACD柱狀體(OSC)斜率：用近20天OSC標準差正規化後的變化量，上限±4分
+      成交量斜率：5日均量最近lookback天的變化百分比，每20%記1分，上限±2分
+    回傳 (分數, 說明文字)。任何一項資料不足時該項不計分，不會讓整體分數異常。
+    """
+    score = 0.0
+    detail_parts = []
+    try:
+        if rsi_series is not None and len(rsi_series) > lookback:
+            _r0, _r1 = float(rsi_series.iloc[-1]), float(rsi_series.iloc[-1 - lookback])
+            if not (pd.isna(_r0) or pd.isna(_r1)):
+                rsi_slope = _r0 - _r1
+                pts = max(-4.0, min(4.0, rsi_slope / 2.0))
+                score += pts
+                detail_parts.append(f"RSI{lookback}日變化{rsi_slope:+.1f}（{pts:+.1f}分）")
+    except Exception:
+        pass
+    try:
+        if osc_series is not None and len(osc_series) > max(lookback, 20):
+            _o0, _o1 = float(osc_series.iloc[-1]), float(osc_series.iloc[-1 - lookback])
+            if not (pd.isna(_o0) or pd.isna(_o1)):
+                osc_slope = _o0 - _o1
+                _osc_std = float(osc_series.iloc[-20:].std())
+                _osc_ref = _osc_std if _osc_std > 0 else (abs(_o1) or 1.0)
+                norm_slope = osc_slope / _osc_ref
+                pts = max(-4.0, min(4.0, norm_slope * 2.0))
+                score += pts
+                detail_parts.append(f"OSC{lookback}日變化{osc_slope:+.3f}（{pts:+.1f}分）")
+    except Exception:
+        pass
+    try:
+        if volume_series is not None and len(volume_series) > lookback + 5:
+            _vma = volume_series.rolling(5).mean()
+            _v0, _v1 = float(_vma.iloc[-1]), float(_vma.iloc[-1 - lookback])
+            if not (pd.isna(_v0) or pd.isna(_v1)) and _v1 > 0:
+                vol_change_pct = (_v0 - _v1) / _v1 * 100.0
+                pts = max(-2.0, min(2.0, vol_change_pct / 20.0))
+                score += pts
+                detail_parts.append(f"量能5日均量變化{vol_change_pct:+.1f}%（{pts:+.1f}分）")
+    except Exception:
+        pass
+    return round(max(-10.0, min(10.0, score)), 1), "；".join(detail_parts) if detail_parts else "資料不足，無法計算動能加速度"
+
 def resample_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
     """
     把日線 OHLCV 轉成週線（週五收盤為一週結尾，符合台股與美股慣例）。
@@ -246,13 +297,19 @@ class MACDStrategyAnalyzer:
     """
 
     def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9,
-                 divergence_lookback: int = 20, min_bars: int = 35, kd_period: int = 9) -> None:
+                 divergence_lookback: int = 20, min_bars: int = 35, kd_period: int = 9,
+                 min_new_extreme_pct: float = 0.5, min_osc_change_pct: float = 10.0) -> None:
         self.fast = fast
         self.slow = slow
         self.signal = signal
         self.divergence_lookback = divergence_lookback
         self.min_bars = min_bars          # 至少需要這麼多根K棒才進行分析（EMA26+訊號9需要暖身期）
         self.kd_period = kd_period
+        # 【V2.11.10新增，P2背離降噪】原本只要「現價比前高多1分錢」「OSC隨便遞減一點點」就會判定背離，
+        # 對強勢噴出股（例如創意3443）很容易誤判——因為那種股票本來就是OSC自然收斂但價格仍持續創高。
+        # 新增兩道最小幅度濾網：創高/破低要有意義的幅度，OSC的變化也要有意義的幅度，才算真背離。
+        self.min_new_extreme_pct = min_new_extreme_pct  # 創新高/新低，至少要比前波高/低點多這個百分比（預設0.5%）
+        self.min_osc_change_pct = min_osc_change_pct     # OSC變化幅度，至少要是參考OSC值的這個百分比（預設10%）
 
     def _empty_result(self, stock_id: str, stock_name: str, timeframe: str, error: str) -> MACDSignalResult:
         return MACDSignalResult(
@@ -308,8 +365,16 @@ class MACDStrategyAnalyzer:
         prev_low_close = float(window_close.loc[prev_low_idx])
         prev_low_osc = float(window_osc.loc[prev_low_idx]) if not pd.isna(window_osc.loc[prev_low_idx]) else None
 
-        if cur_close < prev_low_close and prev_low_osc is not None and cur_osc > prev_low_osc:
-            note = f"價格創新低（{cur_close:.2f} < 前波低點{prev_low_close:.2f}），但OSC未破前低（{cur_osc:.3f} > {prev_low_osc:.3f}）"
+        # 【V2.11.10降噪】創新低要有意義的幅度（預設至少低於前低0.5%），避免現價只比前低低一點點雜訊
+        # 就被判定「創新低」；OSC的變化也要有意義的幅度（預設至少是前低OSC值的10%），
+        # 避免OSC只是隨機微幅波動就被當成「未破前低」的背離證據。
+        _min_low_gap = prev_low_close * (self.min_new_extreme_pct / 100.0)
+        _osc_ref = abs(prev_low_osc) if prev_low_osc is not None and prev_low_osc != 0 else None
+        _min_osc_gap = (_osc_ref * self.min_osc_change_pct / 100.0) if _osc_ref else 0.0
+
+        if (cur_close < prev_low_close - _min_low_gap and prev_low_osc is not None
+                and cur_osc > prev_low_osc + _min_osc_gap):
+            note = f"價格創新低（{cur_close:.2f} < 前波低點{prev_low_close:.2f}，已超過最小幅度門檻），但OSC未破前低（{cur_osc:.3f} > {prev_low_osc:.3f}，差距已超過雜訊門檻）"
             if k is not None and len(k) >= 2 and not pd.isna(k.iloc[-1]) and float(k.iloc[-1]) < 20:
                 return "低檔雙背離", note + f"；KD同步低檔區（K={float(k.iloc[-1]):.1f} < 20）"
             return "底背離", note
@@ -322,11 +387,21 @@ class MACDStrategyAnalyzer:
             osc_declining_3 = (not any(pd.isna(x) for x in (o0, o1, o2))) and (o0 < o1 < o2)
         else:
             osc_declining_3 = False
+            o0 = o1 = o2 = None
 
-        if cur_close > prev_high_close and osc_declining_3:
-            return "頂背離", f"價格創新高（{cur_close:.2f} > 前波高點{prev_high_close:.2f}），但OSC柱狀體連續3根遞減（{o2:.3f}→{o1:.3f}→{o0:.3f}），多頭力竭"
+        # 【V2.11.10降噪】同樣道理：創新高要有意義的幅度，OSC從o2到o0的總遞減量也要有意義的幅度
+        # （預設至少是o2本身的10%），避免強勢噴出股「價格持續創高、OSC只是自然小幅收斂」被誤判頂背離
+        # ——這正是我們實際遇過的創意(3443)案例。
+        _min_high_gap = prev_high_close * (self.min_new_extreme_pct / 100.0)
+        _osc_decline_significant = False
+        if osc_declining_3 and o2 != 0:
+            _decline_pct = (o2 - o0) / abs(o2) * 100.0
+            _osc_decline_significant = _decline_pct >= self.min_osc_change_pct
 
-        return "無", "目前價格與OSC走勢一致，未偵測到背離"
+        if cur_close > prev_high_close + _min_high_gap and osc_declining_3 and _osc_decline_significant:
+            return "頂背離", f"價格創新高（{cur_close:.2f} > 前波高點{prev_high_close:.2f}，已超過最小幅度門檻），且OSC柱狀體連續3根遞減（{o2:.3f}→{o1:.3f}→{o0:.3f}，遞減幅度{_decline_pct:.1f}%已超過雜訊門檻），多頭力竭"
+
+        return "無", "目前價格與OSC走勢一致，或幅度未超過最小雜訊門檻，未偵測到顯著背離"
 
     def _compute_risk_management(self, low: pd.Series) -> Optional[float]:
         """關鍵支撐停損價：lookback 視窗內（不含當日）的最低價，作為「跌破前低」的風控參考。"""
@@ -734,10 +809,13 @@ TRADE_PLAN_HEADERS = [
 ]
 
 # 規格書第六節定義的11種狀態；ChatGPT 草稿版少了 PULLBACK_WAIT，這裡補齊。
+# V2.11.10新增 BREAKOUT_FAILED（Breakout Engine）：突破後隔日站不穩（收盤跌破突破價且量能萎縮
+# 或單日跌幅過大），跟「INVALID」（價格已經跌破更寬的失效價）是兩種不同嚴重程度的失敗，
+# BREAKOUT_FAILED 抓得比較早、比較貼近「這次突破品質不夠」的判斷，不用等真的崩到失效價才反應。
 TRADE_STATES = {
     "PREPARE", "BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "HOLD",
     "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY",
-    "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED",
+    "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "BREAKOUT_FAILED",
 }
 
 # 規格書第六節「狀態轉移」表格的合法轉移清單。transition_state() 會用這張表擋掉不合法的跳轉。
@@ -747,12 +825,12 @@ ALLOWED_TRANSITIONS = {
     # ADD_NEXT_DAY／PARTIAL_EXIT_NEXT_DAY／FULL_EXIT_NEXT_DAY，因此這幾種轉移也要開放。
     "PREPARE": {"BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "INVALID", "EXPIRED",
                 "HOLD", "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "PREPARE"},
-    "BREAKOUT_WAIT": {"ENTER_NEXT_DAY", "PULLBACK_WAIT", "INVALID", "EXPIRED", "BREAKOUT_WAIT"},
-    "PULLBACK_WAIT": {"ENTER_NEXT_DAY", "INVALID", "EXPIRED", "PULLBACK_WAIT"},
+    "BREAKOUT_WAIT": {"ENTER_NEXT_DAY", "PULLBACK_WAIT", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "BREAKOUT_WAIT"},
+    "PULLBACK_WAIT": {"ENTER_NEXT_DAY", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "PULLBACK_WAIT"},
     # 【修正】原本漏了 INVALID／EXPIRED：訊號確認「下一交易日可進場」後，如果執行前價格突然
     # 跌破失效價、或超過有效期限使用者都還沒來得及執行，理論上應該要能判定失效／過期，
     # 原本的轉移表卻擋住這條路，導致這兩種情況發生時轉移一直被拒絕（見上方 transition_state 修正說明）。
-    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "ENTER_NEXT_DAY"},
+    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "ENTER_NEXT_DAY"},
     # 【修正：股數變 0 的重置路徑】HOLD/ADD_NEXT_DAY/PARTIAL_EXIT_NEXT_DAY 都可能因為使用者在系統之外
     # 手動賣出全部持股，導致 held_qty 直接變 0，這種情況也要能重置回 PREPARE 重新追蹤訊號，
     # 否則狀態會卡死在「理論上已經沒有部位、卻永遠回不去空手訊號流程」的中間態。
@@ -764,6 +842,7 @@ ALLOWED_TRANSITIONS = {
     "FULL_EXIT_NEXT_DAY": {"PREPARE", "FULL_EXIT_NEXT_DAY"},   # 出清後歸零，重新開始追蹤新訊號
     "INVALID": {"PREPARE", "INVALID"},
     "EXPIRED": {"PREPARE", "EXPIRED"},
+    "BREAKOUT_FAILED": {"PREPARE", "BREAKOUT_FAILED"},   # 突破失敗後歸零，重新開始追蹤新訊號
 }
 
 # 若 load_trade_plan() 失敗，強制整個執行流程降級為 VIEW_ONLY，不允許本次任何寫入或狀態推進。
@@ -1033,6 +1112,28 @@ def is_signal_invalid(plan, price):
         return False
     return price < invalid_price
 
+def is_breakout_failed(plan, price, volume, vol_ma5, atr, prev_close):
+    """
+    【V2.11.10新增，Breakout Engine「T+1 Execution Gate」】比 is_signal_invalid 抓得更早、更貼近
+    「這次突破的品質不夠、可能是假突破」的判斷，不用等真的崩到更寬的失效價才反應。
+
+    判定條件（採用「收盤跌破突破價」+「量能萎縮 或 單日跌幅過大」的組合，避免對正常的
+    突破後拉回測試（throwback）反應過度——如果只看「收盤跌破突破價」，會連很多正常的
+    小幅拉回都判定失敗；但如果只看「量縮才算」，又會漏掉「帶量重跌」這種更危險的假突破，
+    所以量縮跟單日跌幅過大兩個條件是「或」的關係，任一成立就判定突破失敗）：
+      收盤價 < 突破價
+      且 (當日成交量 < 5日均量  或  單日跌幅 ≥ 1.5×ATR)
+    """
+    breakout_price = _safe_float(plan.get("breakout_price"))
+    if breakout_price <= 0 or price is None or _safe_float(price) >= breakout_price:
+        return False
+    vol_ma5_f = _safe_float(vol_ma5)
+    volume_shrunk = vol_ma5_f > 0 and _safe_float(volume) < vol_ma5_f
+    atr_f = _safe_float(atr)
+    prev_close_f = _safe_float(prev_close)
+    sharp_drop = prev_close_f > 0 and atr_f > 0 and (prev_close_f - _safe_float(price)) >= 1.5 * atr_f
+    return volume_shrunk or sharp_drop
+
 # --- 4-4. 狀態轉移（規格書第六節狀態轉移表）---
 def transition_state(plan, next_state, extra_fields, data_date, reason=""):
     """
@@ -1107,12 +1208,13 @@ def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, pr
         t1, t2, branch = price + 2 * atr, price + 4 * atr, "atr_fallback"
     return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), branch
 
-def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=10.0):
+def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=10.0, swing_low=None):
     """
-    【單一防守線權威來源，V2.11.9新增】取代 UI 用的 `calc_trailing_stop()`（60天回溯重建棘輪，
-    獲利>10%才啟用）跟狀態機用的 `calculate_trailing_stop_stateful()`（有狀態增量棘輪，完全沒有
-    10%門檻，從第一天就開始墊）——這兩個公式原本各自維護，同一檔股票在「🛡️風控點位」跟
-    「🗓️交易計畫」可能顯示不同防守線，甚至連「有沒有跌破、要不要全部出清」都可能兩邊不一致。
+    【單一防守線權威來源，V2.11.9新增，V2.11.10擴充Trend Runner多方法】取代 UI 用的
+    `calc_trailing_stop()`（60天回溯重建棘輪，獲利>10%才啟用）跟狀態機用的
+    `calculate_trailing_stop_stateful()`（有狀態增量棘輪，完全沒有10%門檻，從第一天就開始墊）——
+    這兩個公式原本各自維護，同一檔股票在「🛡️風控點位」跟「🗓️交易計畫」可能顯示不同防守線，
+    甚至連「有沒有跌破、要不要全部出清」都可能兩邊不一致。
 
     統一後的規則（採用UI原本較完整的「獲利門檻」邏輯，狀態機這邊改用這套，不再自己算）：
       - cost<=0：回傳0（無成本可比較）
@@ -1122,8 +1224,12 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
         「只能上移不能下移」是防守線的鐵律，門檻只決定「要不要開始棘輪」，不能拿來讓已經墊高的
         防守線倒退（V2.11.9修正：這是我在測試時發現的真實回歸，第一版寫法會讓已經墊高的防守線
         在價格拉回10%門檻以下時被打回原形，等於防守線可以下降，違反棘輪的基本設計原則）
-      - 獲利已超過門檻：棘輪模式，new_stop = max(previous_stop 或 cost−2×ATR起點, MA20−ATR)，
-        只能上移不能下移（V2.11.4已修正過的「不會被cost強制拉高」特性沿用）
+      - 獲利已超過門檻：棘輪模式（V2.11.10起「Trend Runner」三方法並用，取最大值——最貼近現價、
+        保護最多獲利的那個）：
+          candidate = max(MA20−ATR, 波段低點(swing_low，若有提供), 現價−1.5×ATR)
+          new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
+        （V2.11.4已修正過的「不會被cost強制拉高」特性沿用；swing_low沒有提供時該候選值不計入，
+        不影響既有只用MA20−ATR的呼叫端）
 
     previous_stop：呼叫端傳入「上一次已經算出、且已經持久化保存的防守線」（沒有就傳 None 或 0，
     會用 cost−2×ATR 當起點）。UI跟狀態機都必須傳入「同一個來源」（trade_plan.current_trailing_stop）
@@ -1138,7 +1244,10 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
     if price is None or _safe_float(price) <= cost_f * (1 + profit_trigger_pct / 100.0):
         return max(prev, flat_stop) if prev > 0 else flat_stop
     base = prev if prev > 0 else flat_stop
-    candidate = _safe_float(ma20) - _safe_float(atr)
+    _candidates = [_safe_float(ma20) - _safe_float(atr), _safe_float(price) - 1.5 * _safe_float(atr)]
+    if swing_low is not None and _safe_float(swing_low) > 0:
+        _candidates.append(_safe_float(swing_low))
+    candidate = max(_candidates)
     return max(base, candidate)
 
 def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, cost):
@@ -1150,7 +1259,7 @@ def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, co
 
 def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, previous_high,
                          t1_taken, t2_taken, current_shares, is_us_stock=False, partial_exit_ratio=0.30,
-                         macd_osc_status=None):
+                         macd_osc_status=None, swing_low=None):
     """
     出清／分批停利計畫（規格書 9、10節）。回傳 dict 一定含 current_trailing_stop 與 t1_price/t2_price，
     並在符合條件時附上 next_state 建議（呼叫端 evaluate_trade_state 會再用 transition_state 實際套用，
@@ -1162,8 +1271,12 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
     「漲多少該獲利了結」，MACD翻黑抓「動能真的轉弱了，不用等價格真的碰到目標價才反應」。刻意不用
     「頂背離」這種還在醞釀階段的訊號來觸發賣出，避免對正常回檔反應過度、犧牲「讓利潤奔跑」的精神；
     頂背離的用途是攔阻「新進場」與「加碼」，不是拿來提前出場。
+
+    swing_low（V2.11.10新增，Trend Runner）：近期波段低點，傳給 calculate_stop_plan() 當第三個
+    防守線候選方法（跟MA20−ATR、現價−1.5×ATR取最大值），沒有提供時該候選值不計入，行為退回
+    V2.11.9版本（只有MA20−ATR與現價−1.5×ATR兩種候選）。
     """
-    current_trailing_stop = calculate_trailing_stop_stateful(previous_trailing_stop, price, ma20, atr, average_cost)
+    current_trailing_stop = calculate_stop_plan(price, average_cost, atr, ma20, previous_trailing_stop, swing_low=swing_low)
     t1_price, t2_price, _target_branch = calculate_target_plan(price, average_cost, atr, previous_high, is_us_stock)
 
     result = {"current_trailing_stop": current_trailing_stop, "t1_price": t1_price, "t2_price": t2_price,
@@ -1216,6 +1329,11 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     只要日線出現「頂背離」（價格創新高但動能已經在衰竭，假突破的典型特徵）或「翻黑」，
     就直接擋下這次建立新進場計畫——這是本次整合最核心的目的：避開假突破。
     缺這兩個欄位（資料不足/尚未計算）時視為中性，不影響進場判斷。
+
+    【V2.11.10新增，Breakout Engine】在既有關卡之上，再加兩道「真突破」確認：
+      量價確認：當日成交量 ≥ 5日均量×1.5，突破沒有放量的話容易是誘多，不核准建立計畫
+      MACD確認：柱狀體要是「正值」或「翻紅第1根」才算真正確認，不只是「不逆風」這種消極不擋
+    這兩項資料不足（volume/vol_ma5缺失、MACD資料不足）時視為中性通過，不會誤擋新股或資料不全的情況。
     """
     price = _safe_float(indicators.get("price"))
     atr = _safe_float(indicators.get("atr"))
@@ -1227,11 +1345,18 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     macd_divergence_type = indicators.get("macd_divergence_type")
     macd_blocks_entry = macd_divergence_type == "頂背離" or macd_osc_status == "翻黑"
 
+    _volume = indicators.get("volume")
+    _vol_ma5 = indicators.get("vol_ma5")
+    volume_confirms = (_safe_float(_volume) >= _safe_float(_vol_ma5) * 1.5) if (_vol_ma5 is not None and _safe_float(_vol_ma5) > 0) else True
+    macd_confirms = (macd_osc_status in ("正值", "翻紅第1根")) if macd_osc_status is not None else True
+
     entry_gate_pass = bool(
         indicators.get("trend_gate") and indicators.get("chip_gate") and indicators.get("volume_gate")
         and (indicators.get("r1") is not None and indicators.get("r1") >= 1.5)
         and indicators.get("market_regime") != "BEARISH"
         and not macd_blocks_entry
+        and volume_confirms
+        and macd_confirms
     )
     if not entry_gate_pass or decision_score < 70 or atr <= 0:
         return None
@@ -1335,6 +1460,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             indicators.get("previous_high"), plan.get("t1_taken"), plan.get("t2_taken"),
             held_qty, is_us_stock, plan.get("partial_exit_ratio", 0.30),
             macd_osc_status=indicators.get("macd_osc_status"),
+            swing_low=indicators.get("swing_low"),
         )
         # 【V2.11.8 修正】原本只在「第一次設定」時寫入 t1_price/t2_price，之後永遠凍結不再更新——
         # 即使已經統一成同一套公式（calculate_target_plan），只要時間拉長、前高或股價變化，
@@ -1422,6 +1548,12 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
     if plan.get("state") in active_wait_states and plan.get("entry_price", 0) > 0:
         if plan.get("state") != "PREPARE" and is_signal_expired(plan, data_date):
             return transition_state(plan, "EXPIRED", {}, data_date, "交易計畫超過有效期限")
+        # 【V2.11.10新增，Breakout Engine】比失效價更早的一道防線：突破後隔日站不穩就先判定失敗，
+        # 不用等真的崩到更寬的失效價才反應。只在還沒真正持有時檢查（這裡本來就是空手分支）。
+        if is_breakout_failed(plan, price, indicators.get("volume"), indicators.get("vol_ma5"),
+                               indicators.get("atr"), indicators.get("prev_close")):
+            return transition_state(plan, "BREAKOUT_FAILED", {}, data_date,
+                                     f"收盤跌破突破價 {plan.get('breakout_price'):.2f} 且量能萎縮或單日跌幅過大，判定突破失敗")
         if is_signal_invalid(plan, price):
             return transition_state(plan, "INVALID", {}, data_date, f"現價跌破失效價 {plan.get('invalid_price'):.2f}，訊號條件已被破壞")
 
@@ -1729,6 +1861,12 @@ def render_stock_card(data, system_history, portfolio_data):
                 st.warning("⚠️ 已觸發停損防禦機制：現價已跌破防守線，系統強制將總分歸零（不採計上方拆解分數加總），優先保護本金。", icon="⚠️")
             if not data['is_us']:
                 st.markdown(f"- **外資動向**: {data['inst']['foreign_trend']} | **投信動向**: {data['inst']['trust_trend']}")
+            # 【V2.11.10新增，觀察用】動能加速度：獨立於上面總分之外的±10分參考數字，補上「現有分數
+            # 看不出正在轉強還是轉弱」的缺口。明確標示為觀察用，目前不影響決策分數、不影響任何
+            # 進場/加碼門檻——先觀察這個數字準不準，之後有需要再考慮要不要正式併入。
+            _accel = data.get('momentum_accel_score', 0.0)
+            _accel_icon = "🔺" if _accel > 2 else ("🔻" if _accel < -2 else "▪️")
+            st.caption(f"{_accel_icon} 動能加速度（觀察用，不影響任何進場/加碼門檻）：{_accel:+.1f} 分 — {data.get('momentum_accel_detail', '')}")
         with tab_c2:
             c_t1, c_t2 = st.columns(2)
             c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}\n**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
@@ -1819,6 +1957,7 @@ def render_stock_card(data, system_history, portfolio_data):
                 "HOLD": "🔵 持有續抱", "ADD_NEXT_DAY": "🟢 下一交易日可加碼",
                 "PARTIAL_EXIT_NEXT_DAY": "🟠 下一交易日分批出場", "FULL_EXIT_NEXT_DAY": "🔴 下一交易日全部出清",
                 "SUSPENDED_BY_REGIME": "⏸️ 市場逆風，暫停新倉/加碼", "INVALID": "🔴 訊號失效", "EXPIRED": "⚪ 訊號已過期",
+                "BREAKOUT_FAILED": "🟠 突破失敗",
             }
             st.markdown(f"**交易計畫狀態**：{_state_label_map.get(_plan_state, _plan_state)}")
             if data.get('plan_signal_reason'):
@@ -2029,12 +2168,25 @@ else:
             delta = c.diff()
             up, down = delta.clip(lower=0).rolling(14).mean().iloc[-1], -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
             rsi = float(100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001)))))
+            # 【V2.11.10新增】RSI完整序列（不只是最後一個數值），供動能加速度子分數算斜率用，
+            # 跟上面的純量rsi分開算，不影響既有計算，只是多留一份序列版本。
+            _up_series = delta.clip(lower=0).rolling(14).mean()
+            _down_series = -1 * delta.clip(upper=0).rolling(14).mean()
+            _rsi_series = 100 - (100 / (1 + (_up_series / (_down_series + 0.001))))
             # 【V2.11.2 修正】原本 range(-13,0) 只加總13天卻除以14，跟新增的 calc_atr_series()（14期）
             # 對不齊，微幅低估ATR。改成 range(-14,0) 真正取14天，兩處ATR計算基準一致。
             atr = float(sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-14, 0)]) / 14)
             bias = float(((price - ma60) / ma60) * 100)
             # 【V2.11 修正②】布林上軌：用於跟 RSI 超買訊號交叉確認，不進計分公式，純粹是文字警示用。
             boll_upper = float((c.rolling(20).mean() + 2 * c.rolling(20).std()).iloc[-1])
+
+            # 【V2.11.10新增，觀察用】動能加速度子分數：完全不影響 ai_score 總分或任何進場/加碼門檻，
+            # 純粹補上「現有分數看不出正在轉強還是轉弱」的缺口，先觀察準不準，之後再決定要不要正式生效。
+            try:
+                _osc_full_series = calc_macd_full_series(c)[2]
+                _momentum_accel_score, _momentum_accel_detail = calculate_momentum_acceleration_score(_rsi_series, _osc_full_series, v)
+            except Exception:
+                _momentum_accel_score, _momentum_accel_detail = 0.0, "計算失敗，暫不顯示"
 
             # 【V2.9.3／V2.10.1 修正】yfinance 偶爾會回傳不完整的資料（例如最後一根K棒缺值），
             # 導致 price/ma/k/d/rsi/atr 等任一數值變成 NaN。NaN 沒被擋下來的話會一路
@@ -2071,6 +2223,12 @@ else:
             _old_plan = _normalize_trade_plan_row(trade_plan_data.get(code, _trade_plan_defaults(code)))
             _prev_stop_for_calc = _old_plan.get("current_trailing_stop") or _old_plan.get("initial_stop")
 
+            # 【V2.11.10新增，Trend Runner】波段低點：過去20天（不含今日）實際低點，當防守線的
+            # 第三種候選方法（跟MA20−ATR、現價−1.5×ATR取最大值），用真實買盤支撐過的價位當防守線，
+            # 不是只靠均線推算出來的理論值。
+            _swing_low_window = l.iloc[-21:-1] if len(l) > 20 else l.iloc[:-1]
+            _swing_low = float(_swing_low_window.min()) if len(_swing_low_window) > 0 else 0.0
+
             # 【V2.11.8 修正】T1/T2 目標價原本這裡跟正式交易計畫狀態機（calculate_exit_plan）各自維護
             # 一套公式：這裡有「獲利>10%才用結構分析、否則用cost×1.10」的門檻判斷，狀態機那邊卻永遠
             # 直接用前高、完全沒有這個門檻，導致「🛡️風控點位」跟「🗓️交易計畫」兩個分頁可能顯示不同
@@ -2087,7 +2245,7 @@ else:
             # atr_stop_price／take_profit_price 這兩個變數名稱保留不變，
             # 讓後面所有既有的分數/顯示邏輯不用跟著大改；take_profit_price = T1（較近的第一目標）。
             t1, t2, _target_branch = calculate_target_plan(price, cost, atr, _t_previous_high, is_us_stock)
-            atr_stop_price = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc)
+            atr_stop_price = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc, swing_low=_swing_low)
 
             take_profit_price = t1
 
@@ -2313,6 +2471,8 @@ else:
                 "r1": _entry_r1, "market_regime": "BEARISH" if _regime_is_bearish(macro_data, is_us_stock) else "NORMAL",
                 "is_us_stock": is_us_stock, "data_date": _plan_data_date,
                 "macd_osc_status": _macd_osc_status, "macd_divergence_type": _macd_divergence_type,
+                "swing_low": _swing_low, "volume": volume, "vol_ma5": vol_ma5,
+                "prev_close": float(c.iloc[-2]) if len(c) >= 2 else price,
             }
             _plan_portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": _held_qty,
                                      "available_cash": max(0.0, cap - _held_qty * price),
@@ -2379,6 +2539,7 @@ else:
                 "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
                 "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero, "risk_reward_ratio": risk_reward_ratio,
                 "t1": t1, "t2": t2, "r1": r1, "r2": r2, "target_branch": _target_branch, "is_today_bar": is_today_bar,
+                "momentum_accel_score": _momentum_accel_score, "momentum_accel_detail": _momentum_accel_detail,
                 # ===== V2.11.x 交易計畫（trade_plan）欄位，統一用 plan_ 前綴，跟既有欄位分開，互不覆蓋 =====
                 "plan_state": trade_plan_data[code]["state"], "plan_origin_state": trade_plan_data[code]["origin_state"],
                 "plan_signal_type": trade_plan_data[code]["signal_type"], "plan_signal_reason": trade_plan_data[code]["signal_reason"],
@@ -2679,4 +2840,3 @@ else:
 
 if __name__ == "__main__":
     pass
-
