@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.13"
+APP_VERSION = "V2.11.16"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -298,7 +298,8 @@ class MACDStrategyAnalyzer:
 
     def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9,
                  divergence_lookback: int = 20, min_bars: int = 35, kd_period: int = 9,
-                 min_new_extreme_pct: float = 0.5, min_osc_change_pct: float = 10.0) -> None:
+                 min_new_extreme_pct: float = 0.5, min_osc_change_pct: float = 10.0,
+                 min_bar_gap: int = 3) -> None:
         self.fast = fast
         self.slow = slow
         self.signal = signal
@@ -310,6 +311,9 @@ class MACDStrategyAnalyzer:
         # 新增兩道最小幅度濾網：創高/破低要有意義的幅度，OSC的變化也要有意義的幅度，才算真背離。
         self.min_new_extreme_pct = min_new_extreme_pct  # 創新高/新低，至少要比前波高/低點多這個百分比（預設0.5%）
         self.min_osc_change_pct = min_osc_change_pct     # OSC變化幅度，至少要是參考OSC值的這個百分比（預設10%）
+        # 【V2.11.14新增】最小bar間距：拿來當比較基準的前波高/低點，至少要距離今天這根K棒這麼多根，
+        # 避免抓到「昨天、前天剛形成、根本還在雜訊範圍內」的極短期高低點當作背離比較基準。
+        self.min_bar_gap = min_bar_gap
 
     def _empty_result(self, stock_id: str, stock_name: str, timeframe: str, error: str) -> MACDSignalResult:
         return MACDSignalResult(
@@ -371,10 +375,13 @@ class MACDStrategyAnalyzer:
         _min_low_gap = prev_low_close * (self.min_new_extreme_pct / 100.0)
         _osc_ref = abs(prev_low_osc) if prev_low_osc is not None and prev_low_osc != 0 else None
         _min_osc_gap = (_osc_ref * self.min_osc_change_pct / 100.0) if _osc_ref else 0.0
+        # 【V2.11.14新增】前低點至少要距離今天這根K棒 min_bar_gap 根，太近視為雜訊、不採用。
+        _low_bars_back = len(close) - 1 - close.index.get_loc(prev_low_idx)
+        _low_gap_ok = _low_bars_back >= self.min_bar_gap
 
-        if (cur_close < prev_low_close - _min_low_gap and prev_low_osc is not None
+        if (_low_gap_ok and cur_close < prev_low_close - _min_low_gap and prev_low_osc is not None
                 and cur_osc > prev_low_osc + _min_osc_gap):
-            note = f"價格創新低（{cur_close:.2f} < 前波低點{prev_low_close:.2f}，已超過最小幅度門檻），但OSC未破前低（{cur_osc:.3f} > {prev_low_osc:.3f}，差距已超過雜訊門檻）"
+            note = f"價格創新低（{cur_close:.2f} < 前波低點{prev_low_close:.2f}，已超過最小幅度門檻，前波低點距今{_low_bars_back}根K棒），但OSC未破前低（{cur_osc:.3f} > {prev_low_osc:.3f}，差距已超過雜訊門檻）"
             if k is not None and len(k) >= 2 and not pd.isna(k.iloc[-1]) and float(k.iloc[-1]) < 20:
                 return "低檔雙背離", note + f"；KD同步低檔區（K={float(k.iloc[-1]):.1f} < 20）"
             return "底背離", note
@@ -397,11 +404,14 @@ class MACDStrategyAnalyzer:
         if osc_declining_3 and o2 != 0:
             _decline_pct = (o2 - o0) / abs(o2) * 100.0
             _osc_decline_significant = _decline_pct >= self.min_osc_change_pct
+        # 【V2.11.14新增】前高點同樣要求最小bar間距。
+        _high_bars_back = len(close) - 1 - close.index.get_loc(prev_high_idx)
+        _high_gap_ok = _high_bars_back >= self.min_bar_gap
 
-        if cur_close > prev_high_close + _min_high_gap and osc_declining_3 and _osc_decline_significant:
-            return "頂背離", f"價格創新高（{cur_close:.2f} > 前波高點{prev_high_close:.2f}，已超過最小幅度門檻），且OSC柱狀體連續3根遞減（{o2:.3f}→{o1:.3f}→{o0:.3f}，遞減幅度{_decline_pct:.1f}%已超過雜訊門檻），多頭力竭"
+        if _high_gap_ok and cur_close > prev_high_close + _min_high_gap and osc_declining_3 and _osc_decline_significant:
+            return "頂背離", f"價格創新高（{cur_close:.2f} > 前波高點{prev_high_close:.2f}，已超過最小幅度門檻，前波高點距今{_high_bars_back}根K棒），且OSC柱狀體連續3根遞減（{o2:.3f}→{o1:.3f}→{o0:.3f}，遞減幅度{_decline_pct:.1f}%已超過雜訊門檻），多頭力竭"
 
-        return "無", "目前價格與OSC走勢一致，或幅度未超過最小雜訊門檻，未偵測到顯著背離"
+        return "無", "目前價格與OSC走勢一致，或幅度/間距未超過最小雜訊門檻，未偵測到顯著背離"
 
     def _compute_risk_management(self, low: pd.Series) -> Optional[float]:
         """關鍵支撐停損價：lookback 視窗內（不含當日）的最低價，作為「跌破前低」的風控參考。"""
@@ -832,7 +842,10 @@ ALLOWED_TRANSITIONS = {
     # 【修正】原本漏了 INVALID／EXPIRED：訊號確認「下一交易日可進場」後，如果執行前價格突然
     # 跌破失效價、或超過有效期限使用者都還沒來得及執行，理論上應該要能判定失效／過期，
     # 原本的轉移表卻擋住這條路，導致這兩種情況發生時轉移一直被拒絕（見上方 transition_state 修正說明）。
-    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "ENTER_NEXT_DAY"},
+    # 【V2.11.14修正，真實bug】同樣道理也漏了 PULLBACK_WAIT：已經確認「下一交易日可進場」後，
+    # 如果隔日真的開太高、追價超過追價上限，理應改判「追價過高、改等回測」，但轉移表原本沒開放
+    # 這條路，導致這個轉移一律被拒絕，狀態會卡在ENTER_NEXT_DAY不動，等於沒有真正擋下追高風險。
+    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "PULLBACK_WAIT", "ENTER_NEXT_DAY"},
     # 【修正：股數變 0 的重置路徑】HOLD/ADD_NEXT_DAY/PARTIAL_EXIT_NEXT_DAY 都可能因為使用者在系統之外
     # 手動賣出全部持股，導致 held_qty 直接變 0，這種情況也要能重置回 PREPARE 重新追蹤訊號，
     # 否則狀態會卡死在「理論上已經沒有部位、卻永遠回不去空手訊號流程」的中間態。
@@ -849,6 +862,11 @@ ALLOWED_TRANSITIONS = {
 
 # 若 load_trade_plan() 失敗，強制整個執行流程降級為 VIEW_ONLY，不允許本次任何寫入或狀態推進。
 TRADE_PLAN_LOAD_OK = True
+
+# 【V2.11.15新增】若 load_portfolio() 失敗，強制整個執行流程降級為安全模式：不顯示任何分析、
+# 不允許任何持股/交易計畫的建立或覆寫。理由跟 TRADE_PLAN_LOAD_OK 完全一樣——絕不能讓「讀取失敗」
+# 悄悄變成「假裝用內建示範持股去跑正式分析」，那樣系統會誤以為自己知道使用者的真實部位。
+PORTFOLIO_LOAD_OK = True
 
 @st.cache_resource
 def get_gsheet_client():
@@ -873,6 +891,23 @@ def get_worksheet(name, headers):
     return ws
 
 def load_portfolio():
+    """
+    讀取 portfolio 分頁。
+
+    【V2.11.15修正，P0】原本這裡不論「分頁真的是空的（第一次使用）」還是「讀取過程發生例外
+    （額度限制、網路逾時、認證失敗……）」，最後都會回傳同一份 DEFAULT_PORTFOLIO（程式碼內建的
+    示範持股），導致系統在「Google Sheets 讀取失敗」時完全沒有察覺自己拿到的是假資料，會直接拿
+    這份示範持股去跑當天完整的分析、甚至可能建立/推進交易計畫——這是系統以為自己知道使用者的
+    真實持股，但其實不知道。
+
+    修正後明確拆成兩種情況：
+      1. 分頁存在、讀得到，但『真的是空的』（第一次使用）：正常 bootstrap，寫入預設持股，行為不變。
+      2. 讀取過程發生任何例外：不再假裝成功，回傳空 dict，並把 PORTFOLIO_LOAD_OK 設為 False，
+         讓主程式強制整個流程降級為安全模式（不顯示分析、禁止任何持股/交易計畫寫入）——
+         做法對齊既有的 load_trade_plan()/TRADE_PLAN_LOAD_OK 機制，兩者現在遵循同一套原則。
+    """
+    global PORTFOLIO_LOAD_OK
+    PORTFOLIO_LOAD_OK = True
     try:
         ws = get_worksheet("portfolio", PORTFOLIO_HEADERS)
         records = ws.get_all_records()
@@ -900,10 +935,21 @@ def load_portfolio():
             data[code] = entry
         return data
     except Exception as e:
-        st.error(f"⚠️ 讀取 Google Sheet 持股資料失敗，暫時使用內建預設值：{e}")
-        return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
+        PORTFOLIO_LOAD_OK = False
+        st.error(f"⚠️ 讀取 Google Sheet 持股資料失敗，本次強制改為安全模式（僅檢視，不顯示任何分析，且已停用「儲存持股」以免覆蓋你在 Google Sheet 上的既有真實資料），避免誤用內建示範持股去計算你的真實部位：{e}")
+        return {}
 
 def save_portfolio(data):
+    """
+    【V2.11.15修正，P0】若 PORTFOLIO_LOAD_OK 是 False（代表這次執行一開始讀取 portfolio 就失敗），
+    直接拒絕寫入並回傳 False——理由跟 save_trade_plan() 的 TRADE_PLAN_LOAD_OK 守門完全一樣：
+    避免拿一份「基於讀取失敗、可能只是空 dict 或不完整內容」的資料去覆蓋 Google Sheet 上
+    原本可能還完好的真實持股資料。這一道守門保護了側邊欄所有會呼叫 save_portfolio() 的入口
+    （新增股票、刪除持股、加減碼小工具、CSV匯入、暫停/恢復分析、手動歸檔），不需要每個呼叫點各自檢查。
+    """
+    if not PORTFOLIO_LOAD_OK:
+        st.error("⚠️ 持股資料本次讀取失敗，安全模式下已停用「儲存持股」以免覆蓋 Google Sheet 上的既有資料，請重新整理頁面確認連線/權限後再試一次。")
+        return False
     try:
         ws = get_worksheet("portfolio", PORTFOLIO_HEADERS)
         ws.clear()
@@ -911,8 +957,10 @@ def save_portfolio(data):
         for code, info in data.items():
             rows.append([code, info.get("name", ""), info.get("cost", 0.0), info.get("cap", 20000.0), info.get("risk", 5.0), info.get("status", "Active"), info.get("break_date", ""), info.get("qty", 0.0)])
         ws.update(rows)
+        return True
     except Exception as e:
         st.error(f"⚠️ 寫入 Google Sheet 持股資料失敗：{e}")
+        return False
 
 def load_history():
     try:
@@ -1081,33 +1129,103 @@ def detect_update_mode(latest_tw_date, latest_us_date, saved_tw_date, saved_us_d
         return US_CLOSE_UPDATE
     return VIEW_ONLY
 
+REGIME_BEARISH_THRESHOLD = 40.0  # 【V2.11.16新增，需要人工確認的參數】分數低於此視為「逆風」，
+# 攔截新倉與加碼；對應五級分類中的「逆風」與「極端逆風」兩級，數值跟舊版二元條件的臨界點相近
+# （見 calculate_regime_score 內的映射說明），是初版經驗值，建議依實際使用效果調整。
+
+def calculate_regime_score(macro_data):
+    """
+    【V2.11.16新增，Market Regime Score】把「順風/逆風」從二元開關改成 0~100 分的連續分數，
+    取代舊版「任一條件成立就整體翻黑」的二元判斷——原本只要台股跌破月線、或那斯達克跌破月線、
+    或VIX≥25其中一項成立，就直接整個判定「🔴逆風」，沒有中間地帶（例如VIX=26跟VIX=45的風險
+    程度天差地遠，舊版一視同仁）。
+
+    子分數（各自 0~100，越高越偏多／環境越穩定）：
+      - TW分數：台股加權指數距離月線（MA20）的百分比，±10% 線性映射到 0~100（剛好在月線上＝50分）
+      - US分數：那斯達克距離月線的百分比，映射方式同上
+      - VIX分數：VIX恐慌指數，12以下＝100分（環境穩定），35以上＝0分（極度恐慌），中間線性內插
+
+    組合規則（刻意採用 min()「取最差」而非加權平均，維持舊版「任一項變差就該保守」的一貫精神，
+    只是從「單一因子一踩線就整體翻黑」改成連續分數，不再是稍微風吹草動就整個熄燈）：
+      - TW股適用分數（tw_regime）：就是 tw_score 本身，跟舊版一致，只看台股加權，不看美股/VIX
+      - US股適用分數（us_regime）：min(us_score, vix_score)，跟舊版一致，那斯達克或VIX任一轉差
+        都會壓低分數
+      - 總覽分數（overview，頁面最上方顯示用）：min(tw_score, us_score, vix_score)，三個市場只要
+        有一個明顯轉差，總覽分數就會被拉低，維持「保守示警優先」的一貫精神，不是三者平均掉
+
+    五級分類（0~100）：80~100 🟢🟢順風／60~79 🟢偏多／40~59 🟡中性／20~39 🟠逆風／0~19 🔴極端逆風
+
+    資料缺失（macro_data 抓取失敗）時，對應子分數給 50 分（中性），不會因為資料暫時缺失就誤判成
+    極端值去攔截或放行交易。
+
+    【需要人工確認的參數】±10%（指數距月線的映射範圍）、VIX 12~35（映射範圍）這兩組區間，以及
+    REGIME_BEARISH_THRESHOLD＝40（逆風門檻）都是初版經驗值，跟 invalid_price 等既有參數一樣，
+    建議依實際使用效果調整。
+    """
+    def _index_score(info):
+        if not info:
+            return 50.0
+        price = _safe_float(info.get("price"))
+        ma20 = _safe_float(info.get("ma20"))
+        if price <= 0 or ma20 <= 0:
+            return 50.0
+        distance_pct = max(-10.0, min(10.0, (price / ma20 - 1.0) * 100.0))
+        return (distance_pct + 10.0) / 20.0 * 100.0
+
+    def _vix_score(info):
+        if not info:
+            return 50.0
+        v = _safe_float(info.get("price"))
+        if v <= 0:
+            return 50.0
+        v = max(12.0, min(35.0, v))
+        return (35.0 - v) / (35.0 - 12.0) * 100.0
+
+    tw_score = _index_score(macro_data.get("TW"))
+    us_score = _index_score(macro_data.get("US"))
+    vix_score = _vix_score(macro_data.get("VIX"))
+    return {
+        "tw": tw_score, "us": us_score, "vix": vix_score,
+        "tw_regime": tw_score,
+        "us_regime": min(us_score, vix_score),
+        "overview": min(tw_score, us_score, vix_score),
+    }
+
+def regime_tier_label(score):
+    """分數轉五級文字標籤，純顯示用；實際攔截邏輯只依賴數字本身（REGIME_BEARISH_THRESHOLD），不依賴這個文字。"""
+    if score >= 80: return "🟢🟢 順風"
+    if score >= 60: return "🟢 偏多"
+    if score >= 40: return "🟡 中性"
+    if score >= 20: return "🟠 逆風"
+    return "🔴 極端逆風"
+
 def derive_market_regime(macro_data):
     """
-    把 fetch_macro_data() 回傳的台股/美股/VIX資料，轉成規格書十一節定義的三段式市場燈號文字，
-    純粹給畫面顯示與人工判讀用；實際攔截新倉/加碼的判斷是用 _regime_is_bearish()（依個股是台股或美股分開判定）。
+    【V2.11.16改為分數制】把 calculate_regime_score() 算出的「總覽分數」轉成顯示文字，
+    取代舊版純二元的🟢順風/🔴逆風判斷，回傳例如「🟡 中性 52/100」這樣附帶分數與各子項細節的字串。
+    實際攔截新倉/加碼的判斷是用 _regime_is_bearish()（依個股是台股或美股分開判定，使用各自對應的
+    子分數，不是這裡的總覽分數）。
     """
-    tw = macro_data.get("TW") or {}
-    us = macro_data.get("US") or {}
-    vix = macro_data.get("VIX") or {}
-    tw_bear = "空頭" in str(tw.get("trend", ""))
-    us_bear = "空頭" in str(us.get("trend", ""))
-    vix_high = _safe_float(vix.get("price"), 0) >= 25
-    if us_bear or vix_high or tw_bear:
-        return "🔴 逆風"
-    return "🟢 順風"
+    scores = calculate_regime_score(macro_data)
+    overview = scores["overview"]
+    return f"{regime_tier_label(overview)} {overview:.0f}/100（台{scores['tw']:.0f}／美{scores['us']:.0f}／VIX{scores['vix']:.0f}）"
 
 def _regime_is_bearish(market_context, is_us_stock):
     """
-    逆風判定：台股個股看加權指數是否跌破月線；美股個股看那斯達克跌破月線 或 VIX>=25。
-    這個函式只回傳 True/False，供 evaluate_trade_state() 決定是否攔截新倉／加碼——
-    規格書明確要求「逆風只限制新倉與加碼，不得刪除個股既有出場計畫」，所以出清/停利判斷完全不使用這個函式。
+    逆風判定：【V2.11.16改為分數制】改呼叫 calculate_regime_score()，用同一份分數判斷，不再各自
+    維護一套二元條件。台股個股用 tw_regime 分數（只看台股加權，跟舊版一致）；美股個股用 us_regime
+    分數（那斯達克與VIX取最差，跟舊版一致）。判斷門檻是 REGIME_BEARISH_THRESHOLD（目前40分，對應
+    五級分類的「逆風」與「極端逆風」兩級），跟舊版二元條件（台股跌破月線／那斯達克跌破月線或VIX≥25）
+    的臨界點相近，只是從「一踩線就整個翻黑」改成分數連續變化，體感上會略為放寬邊緣情況（例如台股
+    剛好在月線下方0.5%這種極輕微破線，新制度下可能還沒觸發攔截，需要真的明顯轉弱才會擋新倉/加碼）。
+
+    這個函式只回傳 True/False，供 evaluate_trade_state() 決定是否攔截新倉／加碼——規格書明確要求
+    「逆風只限制新倉與加碼，不得刪除個股既有出場計畫」，所以出清/停利判斷完全不使用這個函式，
+    這一點跟改版前完全沒有變化。
     """
-    if is_us_stock:
-        us = market_context.get("US") or {}
-        vix = market_context.get("VIX") or {}
-        return ("空頭" in str(us.get("trend", ""))) or _safe_float(vix.get("price"), 0) >= 25
-    tw = market_context.get("TW") or {}
-    return "空頭" in str(tw.get("trend", ""))
+    scores = calculate_regime_score(market_context)
+    regime_score = scores["us_regime"] if is_us_stock else scores["tw_regime"]
+    return regime_score < REGIME_BEARISH_THRESHOLD
 
 # --- 4-3. 重複訊號與有效期限判斷（規格書 7.6、十八節）---
 def is_duplicate_signal(plan, signal_key):
@@ -1127,6 +1245,36 @@ def is_signal_invalid(plan, price):
     if invalid_price <= 0:
         return False
     return price < invalid_price
+
+def classify_next_day_execution(plan, price):
+    """
+    【V2.11.14新增，Next-Day Execution Gate】把「隔日開盤價落在哪個區間該怎麼做」整理成一個
+    好懂的執行燈號，純粹是顯示層面的分類，不建立新狀態、不影響狀態機本身的轉移邏輯——
+    刻意這樣設計是因為前幾輪多次因為「新增狀態卻漏掉合法轉移表分支」出過真實bug（包含這次
+    順便修掉的 ENTER_NEXT_DAY→PULLBACK_WAIT 遺漏），這裡只做分類、不做決策，降低風險。
+
+    回傳 (代號, 說明文字)：
+      EXECUTE：條件正常，可依計畫執行
+      EXECUTE_WITH_LIMIT：價格略低於突破價，可視情況小量執行或觀察是否站穩
+      WAIT_RETEST：開太高、追價過高，不追，等回測
+      CANCEL：已跌破失效條件或已判定突破失敗，不執行
+      NO_TRADE：目前沒有待執行的進場計畫
+    """
+    state = plan.get("state")
+    if state == "ENTER_NEXT_DAY":
+        breakout_price = _safe_float(plan.get("breakout_price"))
+        chase_limit = _safe_float(plan.get("chase_limit"))
+        invalid_price = _safe_float(plan.get("invalid_price"))
+        if invalid_price > 0 and price is not None and _safe_float(price) < invalid_price:
+            return "CANCEL", "🔴 已跌破失效條件，不執行"
+        if chase_limit > 0 and price is not None and _safe_float(price) > chase_limit:
+            return "WAIT_RETEST", "🟠 開盤已超過追價上限，不追價，改等回測"
+        if breakout_price > 0 and price is not None and _safe_float(price) < breakout_price:
+            return "EXECUTE_WITH_LIMIT", "🟡 價格略低於突破價，建議先觀察是否站穩再執行，或酌量減碼執行"
+        return "EXECUTE", "🟢 條件正常，可依計畫執行"
+    if state == "BREAKOUT_FAILED":
+        return "CANCEL", "🔴 已判定突破失敗，不執行"
+    return "NO_TRADE", "⚪ 目前沒有待執行的進場計畫"
 
 def is_breakout_failed(plan, price, volume, vol_ma5, atr, prev_close):
     """
@@ -1683,6 +1831,8 @@ migrate_trade_plan_sheet()
 # --- 5. 側邊欄 UI ---
 with st.sidebar:
     st.header("📋 持股與風控設定")
+    if not PORTFOLIO_LOAD_OK:
+        st.error("🛡️ 安全模式中：持股資料本次讀取失敗，下方所有會修改持股的操作（新增/刪除/加減碼/CSV匯入/暫停恢復/歸檔）都已停用，避免覆蓋 Google Sheet 上的既有資料。重新整理頁面重試即可恢復正常。")
     with st.form("add_stock"):
         new_code = st.text_input("代號 (台股數字 / 美股字母)")
         new_name, new_cost, new_cap, new_risk = st.text_input("名稱 (可留白)"), st.number_input("成本價", value=100.0, step=0.1), st.number_input("分配資金", value=20000, step=5000), st.number_input("單筆風險 (%)", value=5.0, step=0.1)
@@ -1836,6 +1986,15 @@ def render_stock_card(data, system_history, portfolio_data):
 
         st.markdown(f"#### {data['name']} ({data['code']}){broken_label}{watch_label} - {' '.join(data['tags'][:2])}{delta_str}", unsafe_allow_html=True)
         st.markdown(f"<div style='font-size: 0.9em; margin-bottom: 5px; color: #cbd5e1;'>SOP 檢核：{'動能' if data['is_us'] else '籌碼'} {'🟢' if data['step1'] else '⚪'} | 量能 {'🟢' if data['step2'] else '⚪'} | 趨勢 {'🟢' if data['step3'] else '⚪'}</div>", unsafe_allow_html=True)
+        # 【V2.11.14新增，三燈強度顯示】原本三燈只回答「有沒有過」，看不出「勉強過關」還是「過得很輕鬆」，
+        # 這裡把驅動每個燈號判斷的原始數值印出來，讓你自己判斷強弱，不改動燈號本身的PASS/FAIL邏輯。
+        if data['is_us']:
+            _light1_detail = f"價格{'>' if data['price']>data['ma60'] else '≤'}MA60（{data['price']:.1f} vs {data['ma60']:.1f}）、MACD {data['macd']:+.2f}"
+        else:
+            _light1_detail = f"連{data['inst'].get('days',0)}買、累積買超{data['inst'].get('accumulated_shares',0)*data['price']/1e8:.1f}億"
+        _light2_detail = f"K{data['k']:.0f}/D{data['d']:.0f}、RSI{data['rsi']:.0f}、量{data['volume']/max(data['vol_ma5'],1):.2f}倍"
+        _light3_detail = f"價格{'>' if data['price']>data['ma20'] else '≤'}MA20、多頭排列{'是' if (data['ma10']>data['ma20']>data['ma60']) else '否'}"
+        st.caption(f"燈號依據：{'動能' if data['is_us'] else '籌碼'}［{_light1_detail}］｜量能［{_light2_detail}］｜趨勢［{_light3_detail}］")
         _safe_score = data['ai_score']
         if _safe_score is None or (isinstance(_safe_score, float) and _safe_score != _safe_score): _safe_score = 0
         st.progress(max(0, min(100, _safe_score)) / 100)
@@ -2022,6 +2181,13 @@ def render_stock_card(data, system_history, portfolio_data):
                 else:
                     st.caption(f"✅ 已於 {data.get('plan_review_at') or '（時間未記錄）'} 確認閱覽過這個訊號")
 
+            # 【V2.11.14新增，Next-Day Execution Gate】只在還沒真正持有、且交易計畫確實建議「下一交易日
+            # 進場」或「已判定突破失敗」時才顯示，告訴你隔日開盤價落在哪個區間該怎麼做，
+            # 不用自己心算現價相對突破價/追價上限/失效價的位置。
+            if data.get('held_qty', 0) <= 0 and _plan_state in ("ENTER_NEXT_DAY", "BREAKOUT_FAILED"):
+                _gate_code, _gate_note = data.get('plan_next_day_gate', ("NO_TRADE", ""))
+                st.info(f"**隔日執行判斷**：{_gate_note}")
+
             # 【修正】原本用 st.columns(2) 左右分欄，在手機/平板較窄的螢幕上兩欄文字容易被硬擠在一起、
             # 看起來混在一起分不清楚，改成單欄、由上到下依序顯示，寬螢幕/窄螢幕都不會有排版混淆的問題。
             st.write(f"**訊號日期資料**\n台股資料日：{data.get('plan_taiwan_data_date') or '—'}\n美股資料日：{data.get('plan_us_data_date') or '—'}\n建議執行日：{data.get('plan_execution_date') or '—'}\n有效期限：{data.get('plan_valid_until') or '—'}")
@@ -2078,8 +2244,8 @@ def render_stock_card(data, system_history, portfolio_data):
                 _mc2.metric("DEA", f"{_macd_r.dea:.3f}" if _macd_r.dea is not None else "—")
                 _mc3.metric("柱狀體 OSC", f"{_macd_r.osc:.3f}" if _macd_r.osc is not None else "—", _macd_r.osc_status)
 
-                st.write(f"**背離型態判定**：{_macd_r.divergence_type}")
-                st.write(f"**訊號層級**：{_macd_r.osc_status} ｜ **背離**：{_macd_r.divergence_type}")
+                st.write(f"**背離警示（近似演算法，非嚴謹判定）**：{_macd_r.divergence_type}")
+                st.write(f"**訊號層級**：{_macd_r.osc_status} ｜ **背離警示**：{_macd_r.divergence_type}")
 
                 _style, _icon = _action_style.get(_macd_r.signal_action, ("info", "⚪"))
                 _action_msg = f"{_icon} **操作動作：{_macd_r.signal_action}**"
@@ -2195,6 +2361,8 @@ latest_us_date = _date_str((macro_data.get("US") or {}).get("asof"))
 execution_mode = detect_update_mode(latest_tw_date, latest_us_date, saved_tw_date, saved_us_date)
 if not TRADE_PLAN_LOAD_OK:
     execution_mode = VIEW_ONLY  # trade_plan 讀取失敗，強制唯讀，本次不允許任何狀態推進或寫入
+if not PORTFOLIO_LOAD_OK:
+    execution_mode = VIEW_ONLY  # 【V2.11.15新增】portfolio 讀取失敗，同樣強制唯讀，理由同上
 
 market_regime_label = derive_market_regime(macro_data)
 _mode_display = {"TAIWAN_CLOSE_UPDATE": "🇹🇼 台股收盤更新", "US_CLOSE_UPDATE": "🇺🇸 美股收盤更新", "VIEW_ONLY": "👁️ 唯讀檢視（無新資料）"}
@@ -2202,7 +2370,10 @@ st.caption(f"⚙️ 執行模式：**{_mode_display.get(execution_mode, executio
 st.divider()
 
 if not portfolio:
-    st.info("👈 請先從左側邊欄新增股票代號！")
+    if not PORTFOLIO_LOAD_OK:
+        st.error("🛡️ 安全模式：持股資料本次讀取失敗，為避免用錯誤/空白資料跑分析或誤判「你目前沒有任何持股」，本次不顯示任何分析結果。請確認 Google Sheets 連線與服務帳號權限後，重新整理頁面重試。")
+    else:
+        st.info("👈 請先從左側邊欄新增股票代號！")
 else:
     summary_data, card_data, paused_data = [], [], []
     macd_report_results: List[MACDSignalResult] = []
@@ -2654,6 +2825,7 @@ else:
                 "plan_current_trailing_stop_source": trade_plan_data[code]["current_trailing_stop_source"],
                 "plan_review_state": trade_plan_data[code]["review_state"],
                 "plan_review_at": trade_plan_data[code]["review_at"],
+                "plan_next_day_gate": classify_next_day_execution(trade_plan_data[code], price),
                 "plan_suggested_shares": trade_plan_data[code]["suggested_shares"],
                 "plan_addon_shares_approved": trade_plan_data[code]["addon_shares_approved"],
                 "plan_partial_exit_shares": trade_plan_data[code]["partial_exit_shares"],
