@@ -13,8 +13,8 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.11"
-APP_TITLE = f"TaiStock {APP_VERSION} 全自動紀律決策系統"
+APP_VERSION = "V2.11.13"
+APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
 
@@ -420,14 +420,14 @@ class MACDStrategyAnalyzer:
         黃金交叉不在這裡出現——它只作為趨勢確認的次要訊號，不驅動 action。
         """
         if osc_status == "翻黑":
-            return "出場", "柱狀體翻黑，多頭結束，剩餘部位出場"
+            return "出場", "柱狀體翻黑，出場風險升高，建議檢查停損與趨勢是否仍然成立"
         if divergence_type == "頂背離":
-            return "減碼50%", "偵測到頂背離，多頭力竭，強制執行分批獲利了結50%"
+            return "減碼50%", "偵測到頂背離，獲利保護警示，建議評估分批減碼（非強制）"
         if divergence_type in ("底背離", "低檔雙背離"):
             extra = "（疊加KD低檔背離，信心水準較高）" if divergence_type == "低檔雙背離" else ""
-            return "分批試單", f"偵測到{divergence_type}，空頭動能減弱{extra}，採分批左側試單，待柱狀體翻紅再補齊部位"
+            return "分批試單", f"偵測到{divergence_type}，屬於左側觀察訊號{extra}，不代表反轉已確認，建議分批小量試單、待柱狀體翻紅再補齊部位"
         if osc_status == "翻紅第1根":
-            return "核心進場", "柱狀體由負轉正第1根，多頭取回主導權，波段核心進場點"
+            return "核心進場", "柱狀體由負轉正第1根，轉強候選，建議進一步確認價格與量能是否同步配合"
         if osc_status == "收腳中":
             return "預警關注", "負值柱狀體收腳，空頭動能衰退，納入觀察但不宜重押"
         return "觀望", "無明確訊號，維持空手觀望"
@@ -800,10 +800,12 @@ TRADE_PLAN_HEADERS = [
     # 停利相關
     "t1_price", "t2_price", "t1_taken", "t2_taken", "partial_exit_ratio", "partial_exit_shares",
     # 出清相關
-    "initial_stop", "previous_trailing_stop", "current_trailing_stop", "full_exit_shares",
+    "initial_stop", "previous_trailing_stop", "current_trailing_stop", "current_trailing_stop_source", "full_exit_shares",
     # 股數與風險
     "suggested_shares", "addon_shares_suggested", "addon_shares_approved", "remaining_shares",
     "max_risk_amount", "used_risk_amount", "remaining_risk_amount", "last_known_qty",
+    # 人工覆核（V2.11.12新增，簡化版）
+    "review_state", "review_at",
     # 版本
     "plan_version",
 ]
@@ -965,6 +967,10 @@ def _normalize_trade_plan_row(row):
     r["signal_reason"] = str(r.get("signal_reason", "") or "")
     r["signal_key"] = str(r.get("signal_key", "") or "")
     r["last_action"] = str(r.get("last_action", "") or "")
+    r["current_trailing_stop_source"] = str(r.get("current_trailing_stop_source", "") or "")
+    r["review_state"] = str(r.get("review_state", "") or "PENDING")
+    if r["review_state"] not in ("PENDING", "ACKNOWLEDGED"):
+        r["review_state"] = "PENDING"
     r["plan_version"] = str(r.get("plan_version", "") or "2.11.x")
     for k in ["entry_price", "breakout_price", "pullback_low", "pullback_high", "chase_limit",
               "invalid_price", "t1_price", "t2_price", "initial_stop", "previous_trailing_stop",
@@ -1015,11 +1021,18 @@ def save_trade_plan(data):
     整表覆寫 trade_plan 分頁。若 TRADE_PLAN_LOAD_OK 是 False（代表這次執行一開始讀取就失敗），
     直接拒絕寫入並回傳 False——避免拿一份「可能基於不完整讀取算出來」的資料去覆蓋 Google Sheet
     上原本可能還完好的資料。寫入本身若失敗，也只回傳 False、印出錯誤，不拋例外中斷整個頁面。
+
+    【V2.11.12修正】原本這裡沒有 ws.clear()，只靠 ws.update(rows) 覆寫——gspread的update()
+    只會覆寫「這次傳入的資料範圍」，範圍以外的舊儲存格不會被清掉。這代表如果你刪除一檔股票，
+    trade_plan_data 少了一筆，Google Sheet上那一列舊資料卻還留在原地；下次 load_trade_plan()
+    讀取整張表時，這筆已刪除股票的舊交易計畫會被誤讀回來、混進當次分析結果（孤兒列復活）。
+    補上 clear() 後，每次都是「先清空、再完整寫入目前的data」，不會再有殘留孤兒列。
     """
     if not TRADE_PLAN_LOAD_OK:
         return False
     try:
         ws = get_worksheet("trade_plan", TRADE_PLAN_HEADERS)
+        ws.clear()
         rows = [TRADE_PLAN_HEADERS]
         for code, raw in data.items():
             r = _normalize_trade_plan_row(dict(raw, code=code))
@@ -1027,7 +1040,10 @@ def save_trade_plan(data):
         ws.update(rows)
         return True
     except Exception as e:
-        st.error(f"⚠️ 寫入 Google Sheet 交易計畫（trade_plan）失敗，本次狀態變更不視為已保存，既有已保存的計畫不受影響：{e}")
+        # 【V2.11.12修正】原本這裡宣稱「既有已保存的計畫不受影響」，但清空後若中途寫入失敗
+        # （例如網路中斷），Google Sheet 可能已經被清空、新資料卻還沒寫完，不是真正意義上的
+        # 「不受影響」。改成如實描述風險，不做過度保證。
+        st.error(f"⚠️ 寫入 Google Sheet 交易計畫（trade_plan）失敗，這次的狀態變更可能沒有完整保存（含已清空但尚未寫入新資料的可能），建議重新整理頁面確認資料是否正常：{e}")
         return False
 
 def migrate_trade_plan_sheet():
@@ -1235,27 +1251,38 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
     會用 cost−2×ATR 當起點）。UI跟狀態機都必須傳入「同一個來源」（trade_plan.current_trailing_stop）
     的 previous_stop，才能確保兩邊算出同一個答案——這是本次統一的關鍵，不只是公式一樣，
     連「上一次的記憶」都要讀同一份，否則UI每次重算會因為沒有記憶又跟狀態機兜不起來。
+
+    【V2.11.12新增】回傳值改成 (new_stop, source)，source 標示這次的防守線是哪個候選方法算出來的
+    （profit_gate／locked_previous／ratchet_ma20_atr／ratchet_price_atr／ratchet_swing_low／
+    no_position），讓UI可以告訴使用者「防守線為什麼在這裡」，不再只丟一個數字。
     """
     cost_f = _safe_float(cost)
     if cost_f <= 0:
-        return 0.0
+        return 0.0, "no_position"
     flat_stop = cost_f - 2 * _safe_float(atr)
     prev = _safe_float(previous_stop)
     if price is None or _safe_float(price) <= cost_f * (1 + profit_trigger_pct / 100.0):
-        return max(prev, flat_stop) if prev > 0 else flat_stop
+        if prev > 0 and prev >= flat_stop:
+            return prev, "locked_previous"
+        return flat_stop, "profit_gate"
     base = prev if prev > 0 else flat_stop
-    _candidates = [_safe_float(ma20) - _safe_float(atr), _safe_float(price) - 1.5 * _safe_float(atr)]
+    _candidates = {
+        "ratchet_ma20_atr": _safe_float(ma20) - _safe_float(atr),
+        "ratchet_price_atr": _safe_float(price) - 1.5 * _safe_float(atr),
+    }
     if swing_low is not None and _safe_float(swing_low) > 0:
-        _candidates.append(_safe_float(swing_low))
-    candidate = max(_candidates)
-    return max(base, candidate)
+        _candidates["ratchet_swing_low"] = _safe_float(swing_low)
+    best_source, best_value = max(_candidates.items(), key=lambda kv: kv[1])
+    if base >= best_value:
+        return base, "locked_previous"
+    return best_value, best_source
 
 def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, cost):
     """
     【V2.11.9】改為 calculate_stop_plan() 的薄包裝，保留舊名稱／參數順序以維持既有呼叫端不用改，
     實際計算邏輯已經全部收斂進 calculate_stop_plan()，不再各自維護一份公式。
     """
-    return calculate_stop_plan(current_price, cost, atr, ma20, previous_stop)
+    return calculate_stop_plan(current_price, cost, atr, ma20, previous_stop)[0]
 
 def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, previous_high,
                          t1_taken, t2_taken, current_shares, is_us_stock=False, partial_exit_ratio=0.30,
@@ -1276,10 +1303,10 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
     防守線候選方法（跟MA20−ATR、現價−1.5×ATR取最大值），沒有提供時該候選值不計入，行為退回
     V2.11.9版本（只有MA20−ATR與現價−1.5×ATR兩種候選）。
     """
-    current_trailing_stop = calculate_stop_plan(price, average_cost, atr, ma20, previous_trailing_stop, swing_low=swing_low)
+    current_trailing_stop, _stop_source = calculate_stop_plan(price, average_cost, atr, ma20, previous_trailing_stop, swing_low=swing_low)
     t1_price, t2_price, _target_branch = calculate_target_plan(price, average_cost, atr, previous_high, is_us_stock)
 
-    result = {"current_trailing_stop": current_trailing_stop, "t1_price": t1_price, "t2_price": t2_price,
+    result = {"current_trailing_stop": current_trailing_stop, "stop_source": _stop_source, "t1_price": t1_price, "t2_price": t2_price,
               "next_state": None, "signal_type": "", "signal_reason": "", "partial_exit_shares": 0, "full_exit_shares": 0}
 
     # 最高優先權：收盤跌破移動防守線，不論停利分數高低，一律強制全部出清（規格書10.3、10.4）
@@ -1475,8 +1502,9 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             if is_duplicate_signal(plan, key):
                 return plan
             plan["signal_key"] = key
+            plan["review_state"] = "PENDING"  # 【V2.11.12新增】任何新訊號（signal_key改變）一律重置為尚未確認
             return transition_state(plan, "FULL_EXIT_NEXT_DAY",
-                                     {"current_trailing_stop": exit_plan["current_trailing_stop"],
+                                     {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"],
                                       "full_exit_shares": exit_plan["full_exit_shares"],
                                       "signal_type": exit_plan["signal_type"]},
                                      data_date, exit_plan["signal_reason"])
@@ -1486,8 +1514,9 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             if is_duplicate_signal(plan, key):
                 return plan
             plan["signal_key"] = key
+            plan["review_state"] = "PENDING"  # 【V2.11.12新增】任何新訊號（signal_key改變）一律重置為尚未確認
             return transition_state(plan, "PARTIAL_EXIT_NEXT_DAY",
-                                     {"current_trailing_stop": exit_plan["current_trailing_stop"],
+                                     {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"],
                                       "partial_exit_shares": exit_plan["partial_exit_shares"],
                                       "signal_type": exit_plan["signal_type"]},
                                      data_date, exit_plan["signal_reason"])
@@ -1495,13 +1524,13 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
         # 逆風時：只暫停「即將要執行的加碼」，已經是 HOLD 續抱的部位完全不受影響
         if regime_bearish and plan.get("state") == "ADD_NEXT_DAY":
             return transition_state(plan, "SUSPENDED_BY_REGIME",
-                                     {"current_trailing_stop": exit_plan["current_trailing_stop"]},
+                                     {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"]},
                                      data_date, "市場逆風，暫停加碼但保留交易計畫")
 
         # 逆風解除：若上次是因為加碼被暫停，恢復回 ADD_NEXT_DAY 讓使用者重新看到加碼建議
         # （實際加碼股數會在下面重新計算，不會沿用暫停當下的舊數字）。
         if not regime_bearish and plan.get("state") == "SUSPENDED_BY_REGIME" and plan.get("origin_state") == "ADD_NEXT_DAY":
-            plan = transition_state(plan, "HOLD", {"current_trailing_stop": exit_plan["current_trailing_stop"]},
+            plan = transition_state(plan, "HOLD", {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"]},
                                      data_date, "市場逆風解除，重新評估加碼條件")
 
         if not regime_bearish and portfolio_info.get("addon_quality_gate", True):
@@ -1516,14 +1545,15 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
                 key = f"{code}|ADD|{data_date}|{addon_shares}"
                 if not is_duplicate_signal(plan, key):
                     plan["signal_key"] = key
+                    plan["review_state"] = "PENDING"  # 【V2.11.12新增】任何新訊號（signal_key改變）一律重置為尚未確認
                     return transition_state(plan, "ADD_NEXT_DAY",
-                                             {"current_trailing_stop": exit_plan["current_trailing_stop"],
+                                             {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"],
                                               "addon_shares_suggested": addon_shares,
                                               "addon_shares_approved": addon_shares, "signal_type": "ADD"},
                                              data_date, f"SOP三燈/信心/價格間距等品質關卡與資金風險上限均已通過，約可加碼 {addon_shares} 股")
 
         return transition_state(plan, "HOLD",
-                                 {"current_trailing_stop": exit_plan["current_trailing_stop"],
+                                 {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"],
                                   "remaining_shares": held_qty, "addon_shares_approved": 0},
                                  data_date, exit_plan["signal_reason"])
 
@@ -1587,6 +1617,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             if is_duplicate_signal(plan, key):
                 return plan
             plan["signal_key"] = key
+            plan["review_state"] = "PENDING"  # 【V2.11.12新增】任何新訊號（signal_key改變）一律重置為尚未確認
             return transition_state(plan, "ENTER_NEXT_DAY",
                                      {"execution_date": _next_business_day(data_date, is_us_stock)},
                                      data_date, "突破/回測進場條件成立，隔日執行")
@@ -1602,6 +1633,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
         if is_duplicate_signal(plan, key):
             return plan
         plan["signal_key"] = key
+        plan["review_state"] = "PENDING"  # 【V2.11.12新增】任何新訊號（signal_key改變）一律重置為尚未確認
         return transition_state(plan, entry_result["state"], entry_result, data_date, entry_result["signal_reason"])
 
     return plan
@@ -1771,6 +1803,16 @@ with st.sidebar:
         st.rerun()
 
 # --- 卡片渲染邏輯 ---
+# 【V2.11.12新增】防守線來源的中文標籤，供UI顯示「這條防守線為什麼在這個位置」，不再只丟一個數字。
+STOP_SOURCE_LABELS = {
+    "no_position": "無持股",
+    "profit_gate": "成本−2×ATR（尚未進入棘輪模式）",
+    "locked_previous": "沿用前次防守線（本次三種候選都沒有更高）",
+    "ratchet_ma20_atr": "MA20−ATR",
+    "ratchet_price_atr": "現價−1.5×ATR",
+    "ratchet_swing_low": "近20日波段低點",
+}
+
 def render_stock_card(data, system_history, portfolio_data):
     with st.container(border=True):
         hist_records = system_history.get(data['code'], {})
@@ -1910,7 +1952,8 @@ def render_stock_card(data, system_history, portfolio_data):
                 st.caption(f"K線圖暫時無法載入：{_chart_err}")
         with tab_c3:
             _branch_note = "（依前高壓力位）" if data.get('target_branch') == "resistance" else "（前高不明顯，改用ATR外推）"
-            st.write(f"**設定成本**: {data['cost']:.2f}\n**動態防守/停損**: {data['atr_stop_price']:.2f}\n**第一目標 T1**: {data['t1']:.2f} {_branch_note}\n**第二目標 T2**: {data['t2']:.2f}")
+            _stop_source_note = STOP_SOURCE_LABELS.get(data.get('atr_stop_source'), data.get('atr_stop_source', ''))
+            st.write(f"**設定成本**: {data['cost']:.2f}\n**動態防守/停損**: {data['atr_stop_price']:.2f}（來源：{_stop_source_note}）\n**第一目標 T1**: {data['t1']:.2f} {_branch_note}\n**第二目標 T2**: {data['t2']:.2f}")
             # 【V2.11.2 正式導入】波段剩餘空間%：現價距離「第一目標T1」還有多少百分比的路要走，
             # 用「(T1-現價) ÷ (T1-成本)」換算成 0~100% 的剩餘空間，不用自己心算。
             _cost, _price, _target = data['cost'], data['price'], data['t1']
@@ -1963,6 +2006,22 @@ def render_stock_card(data, system_history, portfolio_data):
             if data.get('plan_signal_reason'):
                 st.caption(f"📝 {data['plan_signal_reason']}")
 
+            # 【V2.11.12新增，第六點簡化版】人工覆核：只記錄「有沒有看過」，不記錄「同意/拒絕」
+            # （那個判斷本來就會反映在你有沒有去改股數上，不需要再另外記錄一次主觀決定）。
+            # 只在真的有作用中的計畫時才顯示（PREPARE代表還沒有任何訊號，不需要確認什麼）。
+            if _plan_state != "PREPARE":
+                if data.get('plan_review_state') == "PENDING":
+                    _rc1, _rc2 = st.columns([3, 1])
+                    _rc1.warning("🆕 這是尚未確認過的訊號")
+                    if _rc2.button("✅ 已閱覽", key=f"ack_{data['code']}"):
+                        if data['code'] in trade_plan_data:
+                            trade_plan_data[data['code']]['review_state'] = 'ACKNOWLEDGED'
+                            trade_plan_data[data['code']]['review_at'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                            save_trade_plan(trade_plan_data)
+                        st.rerun()
+                else:
+                    st.caption(f"✅ 已於 {data.get('plan_review_at') or '（時間未記錄）'} 確認閱覽過這個訊號")
+
             # 【修正】原本用 st.columns(2) 左右分欄，在手機/平板較窄的螢幕上兩欄文字容易被硬擠在一起、
             # 看起來混在一起分不清楚，改成單欄、由上到下依序顯示，寬螢幕/窄螢幕都不會有排版混淆的問題。
             st.write(f"**訊號日期資料**\n台股資料日：{data.get('plan_taiwan_data_date') or '—'}\n美股資料日：{data.get('plan_us_data_date') or '—'}\n建議執行日：{data.get('plan_execution_date') or '—'}\n有效期限：{data.get('plan_valid_until') or '—'}")
@@ -1989,7 +2048,7 @@ def render_stock_card(data, system_history, portfolio_data):
                 st.write(f"持有股數：{data.get('held_qty', 0)} 股　｜　平均成本：{_pnl_cost:.2f}")
                 st.markdown(f"損益：<span style='color:{_pnl_color}'>{'+' if _pnl_amount >= 0 else ''}{_pnl_amount:,.0f} 元（{'+' if _pnl_pct >= 0 else ''}{_pnl_pct:.2f}%）</span>", unsafe_allow_html=True)
                 st.write(f"T1：{data.get('plan_t1_price', 0):.2f}（{'✅已執行' if data.get('plan_t1_taken') else '⬜未執行'}）　｜　T2：{data.get('plan_t2_price', 0):.2f}（{'✅已執行' if data.get('plan_t2_taken') else '⬜未執行'}）")
-                st.write(f"初始防守線：{data.get('atr_stop_price', 0):.2f}　｜　今日移動防守線（計畫值）：{data.get('plan_current_trailing_stop', 0):.2f}")
+                st.write(f"初始防守線：{data.get('atr_stop_price', 0):.2f}　｜　今日移動防守線（計畫值）：{data.get('plan_current_trailing_stop', 0):.2f}（來源：{STOP_SOURCE_LABELS.get(data.get('plan_current_trailing_stop_source'), data.get('plan_current_trailing_stop_source', ''))}）")
                 if _plan_state == "ADD_NEXT_DAY":
                     st.success(f"📈 建議加碼股數：{data.get('plan_addon_shares_approved', 0)} 股（下一交易日執行）")
                 if _plan_state == "PARTIAL_EXIT_NEXT_DAY":
@@ -2047,13 +2106,50 @@ def render_stock_card(data, system_history, portfolio_data):
 st.title(f"⚡ {APP_TITLE}")
 st.warning("⚠️ 本系統僅為個人化技術指標整理與紀律提醒工具，所有分數、判定、建議均由你自訂的公式與參數計算而成，**不構成任何投資建議**，過去的訊號表現也不保證未來結果。所有操作決策與風險，仍需由你自己判斷並承擔。")
 
+def calculate_data_freshness(data_date_str, reference_date_str, is_us_stock=False):
+    """
+    【V2.11.13新增，資料新鮮度分級】依照「資料日期」跟「今天」之間差幾個交易日（用既有的
+    台股/美股假日行事曆計算，排除週末與已知假日），分成四級，比單純顯示一個日期字串更容易
+    一眼判斷「這個資料到底新不新鮮」，不用自己心算日期差幾天。
+
+    回傳 (等級文字, 說明文字, 顏色)：
+      🟢 新鮮：資料截至上一個應有交易日（落後0個交易日）
+      🟡 可用但延遲：落後1個交易日
+      🟠 過期：落後2~3個交易日
+      🔴 不可用：無法確認資料日期、日期格式錯誤、或落後超過3個交易日
+    """
+    if not data_date_str:
+        return "🔴 不可用", "無法確認資料日期", "red"
+    try:
+        d = pd.Timestamp(data_date_str)
+        t = pd.Timestamp(reference_date_str)
+        if d > t:
+            return "🔴 不可用", "資料日期在未來，資料來源可能有誤", "red"
+        holidays = US_MARKET_HOLIDAYS if is_us_stock else TW_MARKET_HOLIDAYS
+        lag, cursor = 0, d
+        while cursor < t:
+            cursor += pd.Timedelta(days=1)
+            if cursor.weekday() < 5 and cursor.strftime("%Y-%m-%d") not in holidays:
+                lag += 1
+        if lag <= 0:
+            return "🟢 新鮮", "資料截至上一個應有交易日", "green"
+        elif lag == 1:
+            return "🟡 可用但延遲", "資料落後1個交易日", "yellow"
+        elif lag <= 3:
+            return "🟠 過期", f"資料落後{lag}個交易日", "orange"
+        else:
+            return "🔴 不可用", f"資料落後{lag}個交易日，過久未更新", "red"
+    except Exception:
+        return "🔴 不可用", "資料日期格式錯誤", "red"
+
 macro_data = fetch_macro_data()
 st.markdown("### 🌍 雙軌市場環境總覽")
 m_col1, m_col2, m_col3 = st.columns(3)
 
-def _render_macro_asof(col, asof):
+def _render_macro_asof(col, asof, is_us_stock=False):
     # 【V2.10.8 新增】顯示資料實際對應的交易日期，並在資料超過3天沒更新時跳出警示，
     # 讓使用者自己能判斷「這數字是不是卡住了」，不用只能憑感覺猜。
+    # 【V2.11.13新增】疊加新鮮度分級徽章，不用自己心算日期差幾天。
     if asof is None:
         return
     _asof_ts = pd.Timestamp(asof)
@@ -2061,21 +2157,22 @@ def _render_macro_asof(col, asof):
         _asof_ts = _asof_ts.tz_localize(None)
     _days_old = (pd.Timestamp(datetime.datetime.now()) - _asof_ts).days
     _date_str = _asof_ts.strftime("%Y-%m-%d")
+    _freshness_label, _freshness_note, _ = calculate_data_freshness(_date_str, today_str, is_us_stock)
     if _days_old > 3:
-        col.caption(f"⚠️ 資料日期：{_date_str}（{_days_old}天前，可能不是最新資料，建議留意）")
+        col.caption(f"⚠️ 資料日期：{_date_str}（{_days_old}天前，可能不是最新資料，建議留意）｜{_freshness_label}")
     else:
-        col.caption(f"資料日期：{_date_str}")
+        col.caption(f"資料日期：{_date_str}｜{_freshness_label}（{_freshness_note}）")
 
 tw_trend = macro_data.get('TW', {})
 if tw_trend:
     m_col1.metric("🇹🇼 台股加權 (大盤方向)", f"{tw_trend['price']:,.0f}", tw_trend['trend'], delta_color="normal" if "多頭" in tw_trend['trend'] else "inverse")
-    _render_macro_asof(m_col1, tw_trend.get('asof'))
+    _render_macro_asof(m_col1, tw_trend.get('asof'), is_us_stock=False)
 else: m_col1.metric("🇹🇼 台股加權", "連線中...")
 
 us_trend = macro_data.get('US', {})
 if us_trend:
     m_col2.metric("🇺🇸 那斯達克 (科技風向)", f"{us_trend['price']:,.0f}", us_trend['trend'], delta_color="normal" if "多頭" in us_trend['trend'] else "inverse")
-    _render_macro_asof(m_col2, us_trend.get('asof'))
+    _render_macro_asof(m_col2, us_trend.get('asof'), is_us_stock=True)
 else: m_col2.metric("🇺🇸 那斯達克", "連線中...")
 
 vix_trend = macro_data.get('VIX', {})
@@ -2083,7 +2180,7 @@ if vix_trend:
     v_val = vix_trend['price']
     v_status, v_color = ("🚨 極度恐慌", "inverse") if v_val >= 25 else (("⚠️ 波動加劇", "off") if v_val >= 20 else ("🟢 環境穩定", "normal"))
     m_col3.metric("📉 VIX 恐慌指數", f"{v_val:.2f}", v_status, delta_color=v_color)
-    _render_macro_asof(m_col3, vix_trend.get('asof'))
+    _render_macro_asof(m_col3, vix_trend.get('asof'), is_us_stock=True)
 else: m_col3.metric("📉 VIX 恐慌指數", "連線中...")
 
 # --- 6-0. V2.11.x 執行模式判斷（規格書 5.2、5.3）---
@@ -2250,7 +2347,7 @@ else:
             # atr_stop_price／take_profit_price 這兩個變數名稱保留不變，
             # 讓後面所有既有的分數/顯示邏輯不用跟著大改；take_profit_price = T1（較近的第一目標）。
             t1, t2, _target_branch = calculate_target_plan(price, cost, atr, _t_previous_high, is_us_stock)
-            atr_stop_price = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc, swing_low=_swing_low)
+            atr_stop_price, _atr_stop_source = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc, swing_low=_swing_low)
 
             take_profit_price = t1
 
@@ -2543,6 +2640,7 @@ else:
                 "atr_stop_price": atr_stop_price, "take_profit_price": take_profit_price,
                 "ai_advice": ai_advice, "confidence": confidence, "pivot_point": pivot_point, "pivot_status": pivot_status, "is_us": is_us_stock, "score_inst": score_inst, "score_tech": score_tech, "score_vol": score_vol, "score_risk": score_risk, "score_forced_zero": score_forced_zero, "risk_reward_ratio": risk_reward_ratio,
                 "t1": t1, "t2": t2, "r1": r1, "r2": r2, "target_branch": _target_branch, "is_today_bar": is_today_bar,
+                "atr_stop_source": _atr_stop_source,
                 "momentum_accel_score": _momentum_accel_score, "momentum_accel_detail": _momentum_accel_detail,
                 # ===== V2.11.x 交易計畫（trade_plan）欄位，統一用 plan_ 前綴，跟既有欄位分開，互不覆蓋 =====
                 "plan_state": trade_plan_data[code]["state"], "plan_origin_state": trade_plan_data[code]["origin_state"],
@@ -2553,6 +2651,9 @@ else:
                 "plan_t1_price": trade_plan_data[code]["t1_price"], "plan_t2_price": trade_plan_data[code]["t2_price"],
                 "plan_t1_taken": trade_plan_data[code]["t1_taken"], "plan_t2_taken": trade_plan_data[code]["t2_taken"],
                 "plan_current_trailing_stop": trade_plan_data[code]["current_trailing_stop"],
+                "plan_current_trailing_stop_source": trade_plan_data[code]["current_trailing_stop_source"],
+                "plan_review_state": trade_plan_data[code]["review_state"],
+                "plan_review_at": trade_plan_data[code]["review_at"],
                 "plan_suggested_shares": trade_plan_data[code]["suggested_shares"],
                 "plan_addon_shares_approved": trade_plan_data[code]["addon_shares_approved"],
                 "plan_partial_exit_shares": trade_plan_data[code]["partial_exit_shares"],
@@ -2780,16 +2881,19 @@ else:
 
                 # ===== V2.11.x 交易計畫狀態機驅動的任務（獨立於上面的 final_status 判斷，兩套並列顯示）=====
                 _ps = data.get('plan_state', 'PREPARE')
+                # 【V2.11.12新增】還沒確認過的新訊號加上🆕標記，讓你在總覽清單就能分辨「這是今天才出現
+                # 的新東西」還是「你已經看過、還在等執行的舊訊號」，不用點進每張卡片才知道。
+                _ack_badge = "🆕" if data.get('plan_review_state') == "PENDING" else ""
                 if _ps == "FULL_EXIT_NEXT_DAY":
-                    action_sell.append(f"🔴 **【交易計畫】全部出清**：{data['name']} {data.get('plan_signal_reason','')}，建議出清 {data.get('plan_full_exit_shares',0)} 股（{data.get('plan_execution_date','下一交易日')} 執行）。")
+                    action_sell.append(f"🔴{_ack_badge} **【交易計畫】全部出清**：{data['name']} {data.get('plan_signal_reason','')}，建議出清 {data.get('plan_full_exit_shares',0)} 股（{data.get('plan_execution_date','下一交易日')} 執行）。")
                 elif _ps == "PARTIAL_EXIT_NEXT_DAY":
-                    action_sell.append(f"🟠 **【交易計畫】分批停利（{data.get('plan_signal_type','')}）**：{data['name']} 建議出脫 {data.get('plan_partial_exit_shares',0)} 股（{data.get('plan_execution_date','下一交易日')} 執行）。")
+                    action_sell.append(f"🟠{_ack_badge} **【交易計畫】分批停利（{data.get('plan_signal_type','')}）**：{data['name']} 建議出脫 {data.get('plan_partial_exit_shares',0)} 股（{data.get('plan_execution_date','下一交易日')} 執行）。")
                 elif _ps == "ADD_NEXT_DAY":
-                    action_watch.append(f"📈 **【交易計畫】下一交易日可加碼**：{data['name']} 核准加碼 {data.get('plan_addon_shares_approved',0)} 股。")
+                    action_watch.append(f"📈{_ack_badge} **【交易計畫】下一交易日可加碼**：{data['name']} 核准加碼 {data.get('plan_addon_shares_approved',0)} 股。")
                 elif _ps == "ENTER_NEXT_DAY" and data.get('held_qty', 0) <= 0:
-                    action_buy.append(f"🎯 **【交易計畫】下一交易日可進場**：{data['name']} 突破價 {data.get('plan_breakout_price',0):.2f}，建議股數 {data.get('plan_suggested_shares',0)} 股。")
+                    action_buy.append(f"🎯{_ack_badge} **【交易計畫】下一交易日可進場**：{data['name']} 突破價 {data.get('plan_breakout_price',0):.2f}，建議股數 {data.get('plan_suggested_shares',0)} 股。")
                 elif _ps == "SUSPENDED_BY_REGIME":
-                    action_watch.append(f"⏸️ **【交易計畫】市場逆風暫停**：{data['name']} 原訂計畫已保留，等待逆風解除後自動恢復。")
+                    action_watch.append(f"⏸️{_ack_badge} **【交易計畫】市場逆風暫停**：{data['name']} 原訂計畫已保留，等待逆風解除後自動恢復。")
 
             st.markdown("#### 🟥 優先執行 (風控與停利)")
             if not action_sell: st.write("✅ 今日無急迫停損/停利需求")
@@ -2828,7 +2932,7 @@ else:
         for data in us_cards: render_stock_card(data, system_history, portfolio)
 
     st.divider()
-    st.markdown("### 📈 訊號準確度回測（依累積歷史記錄統計）")
+    st.markdown("### 📈 歷史訊號結果觀察（非正式回測）")
     _bt_stats = compute_signal_backtest(system_history)
     if not _bt_stats:
         st.info("目前累積的歷史記錄還太少（至少要有同一檔股票連續兩天以上的記錄才能比較），先讓系統多跑幾天，這裡的統計會隨時間慢慢累積。")
@@ -2837,10 +2941,11 @@ else:
         for _status, _rets in _bt_stats.items():
             _win_rate = sum(1 for r in _rets if r > 0) / len(_rets) * 100
             _avg_ret = sum(_rets) / len(_rets)
-            _bt_rows.append({"判定狀態": _status, "樣本數": len(_rets), "後續平均報酬%": round(_avg_ret, 2), "上漲勝率%": round(_win_rate, 1)})
+            _bt_rows.append({"判定狀態": _status, "樣本數": len(_rets), "後續平均報酬%": round(_avg_ret, 2), "後續上漲比例%": round(_win_rate, 1)})
         _df_bt = pd.DataFrame(_bt_rows).sort_values("後續平均報酬%", ascending=False).reset_index(drop=True)
         st.dataframe(_df_bt, use_container_width=True, hide_index=True)
         st.caption("「後續平均報酬」＝拿每筆歷史記錄當天的價格，對照同一檔股票目前歷史中最新一筆的價格計算漲跌幅，再依「當時的判定狀態」分組平均。樣本數會隨使用天數增加而增加；目前每檔股票最多保留最近10筆記錄，天數越久統計越有參考價值。")
+        st.caption("⚠️ 此統計未模擬固定持有期間、實際成交、交易成本、滑價、停損與重疊交易，**不是正式策略回測**，僅供檢視過去系統訊號與後續價格變化的粗略參考，不能理解成「這套系統的勝率」。")
 
 if __name__ == "__main__":
     pass
