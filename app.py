@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.16"
+APP_VERSION = "V2.11.18"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -807,6 +807,10 @@ TRADE_PLAN_HEADERS = [
     # 進場相關
     "entry_price", "breakout_price", "pullback_low", "pullback_high",
     "chase_limit", "invalid_price", "pullback_taken",
+    # 回測品質（V2.11.17新增，Retest Engine）
+    "retest_min_price", "retest_quality",
+    # 突破品質（V2.11.17新增，Breakout Quality Engine）
+    "breakout_quality_score", "breakout_quality_grade",
     # 停利相關
     "t1_price", "t2_price", "t1_taken", "t2_taken", "partial_exit_ratio", "partial_exit_shares",
     # 出清相關
@@ -1022,8 +1026,11 @@ def _normalize_trade_plan_row(row):
     r["plan_version"] = str(r.get("plan_version", "") or "2.11.x")
     for k in ["entry_price", "breakout_price", "pullback_low", "pullback_high", "chase_limit",
               "invalid_price", "t1_price", "t2_price", "initial_stop", "previous_trailing_stop",
-              "current_trailing_stop", "max_risk_amount", "used_risk_amount", "remaining_risk_amount"]:
+              "current_trailing_stop", "max_risk_amount", "used_risk_amount", "remaining_risk_amount",
+              "retest_min_price", "breakout_quality_score"]:
         r[k] = _safe_float(r.get(k), 0.0)
+    r["retest_quality"] = str(r.get("retest_quality", "") or "")
+    r["breakout_quality_grade"] = str(r.get("breakout_quality_grade", "") or "")
     r["partial_exit_ratio"] = _safe_float(r.get("partial_exit_ratio"), 0.30)
     for k in ["suggested_shares", "addon_shares_suggested", "addon_shares_approved",
               "remaining_shares", "partial_exit_shares", "full_exit_shares", "last_known_qty"]:
@@ -1298,6 +1305,35 @@ def is_breakout_failed(plan, price, volume, vol_ma5, atr, prev_close):
     sharp_drop = prev_close_f > 0 and atr_f > 0 and (prev_close_f - _safe_float(price)) >= 1.5 * atr_f
     return volume_shrunk or sharp_drop
 
+def classify_retest_quality(retest_min_price, pullback_low, pullback_high, invalid_price):
+    """
+    【V2.11.17新增，Retest Engine（P1-2）】依 PULLBACK_WAIT 期間追蹤到的最低價，判斷這次「回測不破
+    再突破」是不是真的經過回測，還是價格從沒真的拉回等待區間就直接反彈站上（V型急拉，較不可靠）。
+
+    純粹是分類/顯示用，不影響任何狀態轉移或進場判斷本身——理由跟 classify_next_day_execution()
+    （V2.11.14）一樣：前幾輪多次因為「新增判斷邏輯卻漏掉合法轉移分支」出過真實bug，這裡刻意只做
+    事後分類、不做決策，降低風險。
+
+    回傳 (中文說明, 分類代碼)：
+      RETESTED_HELD：期間最低價曾經拉回進等待區間（≤pullback_high）、且沒有跌破失效價，屬於
+                     真正意義上的「回測不破再突破」
+      NO_RETEST：期間最低價從未進入等待區間，代表這次是直接站上、沒有經過真實回測（V型），
+                 訊號可靠度相對存疑，建議額外留意量能是否同步認證
+      INVALID_TOUCHED：期間最低價曾經跌破失效價（理論上這種情況通常會先被 is_signal_invalid()
+                       攔下、走不到這裡，這是防禦性判斷，避免萬一資料跳動漏判）
+      （retest_min_price 沒有記錄到有效資料時，回傳空字串，不做任何提示）
+    """
+    m = _safe_float(retest_min_price)
+    hi = _safe_float(pullback_high)
+    inv = _safe_float(invalid_price)
+    if m <= 0:
+        return "", ""
+    if inv > 0 and m <= inv:
+        return "回測期間曾跌破失效價，訊號品質存疑", "INVALID_TOUCHED"
+    if hi > 0 and m <= hi:
+        return f"回測期間最低來到 {m:.2f}，已實際拉回等待區間內確認支撐，屬真實回測後再突破", "RETESTED_HELD"
+    return "回測期間股價從未實際拉回等待區間，屬直接反彈站上（V型），未經真實回測確認", "NO_RETEST"
+
 # --- 4-4. 狀態轉移（規格書第六節狀態轉移表）---
 def transition_state(plan, next_state, extra_fields, data_date, reason=""):
     """
@@ -1339,23 +1375,48 @@ def calculate_position_size(cap, risk_pct, entry_price, stop_price, available_ca
     capital_based_shares = cash_limit / _safe_float(entry_price) if _safe_float(entry_price) > 0 else 0
     return int(np.floor(min(risk_based_shares, capital_based_shares)))
 
-def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, profit_trigger_pct=10.0, min_gap_atr_multiple=1.0):
+def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, profit_trigger_pct=10.0, min_gap_atr_multiple=1.0,
+                           entry_price=None, initial_stop=None, t1_r_multiple=1.5, t2_r_multiple=2.5):
     """
-    【單一目標價權威來源，V2.11.8新增】T1/T2 計算的唯一入口。
+    【單一目標價權威來源，V2.11.8新增，V2.11.18改為R倍數+前高混合】T1/T2 計算的唯一入口。
 
-    修正前的問題：UI顯示（main loop 呼叫 calc_structural_target + 10%獲利門檻判斷）跟正式交易計畫
-    狀態機（calculate_exit_plan 內部另外寫一套，永遠用前高、完全沒有10%獲利門檻、也沒有「前高太近
-    就改外推」的判斷）是兩套完全獨立維護的公式，同一檔股票在「🛡️風控點位」跟「🗓️交易計畫」兩個
-    分頁可能顯示不同的T1/T2數字。現在兩邊都改成呼叫這一個函式，確保同一組輸入（price/cost/atr/
-    previous_high）算出來的T1/T2永遠一致，不會再各自維護一份公式。
+    【V2.11.18】原本T1/T2純粹用「前高（結構）或現價+N×ATR（外推）」決定，完全不管你當初這筆交易
+    實際承擔了多少風險——兩檔ATR差很多的股票，即使風報比天差地遠，算出來的T1/T2距離可能很接近，
+    因為公式只吃ATR，不吃你的風險距離。這次改成「R倍數 + 前高」混合，兩者取較大值：
 
-    規則（沿用原本UI版本更完整的邏輯，狀態機這邊改用這套，不再自己算）：
-      - cost<=0（空手，沒有成本可比較獲利%）：T1=T2=0
-      - atr 無效（None/NaN/<=0）：T1=T2=cost×1.10（無法算風險距離時的保底值）
-      - 獲利尚未超過 profit_trigger_pct（預設10%）：T1=T2=cost×1.10（先看固定門檻，未達門檻不做結構分析）
-      - 獲利已超過門檻：前高離現價夠遠（> min_gap_atr_multiple×ATR）就用前高當T1，
-        否則現價已經追平/超過前高、前高沒有參考價值，改用「現價+2×ATR」外推；T2一律是T1再加2×ATR
-    回傳 (t1, t2, branch)，branch 記錄是哪個分支算出來的，方便顯示／除錯。
+      R（風險距離）＝entry_price − initial_stop，這是進場當下就鎖定、之後不會再變動的固定值
+      （不像ATR會隨時間變動，R代表「這筆交易當初決定承擔的風險」，是更穩定的度量單位）。
+      entry_price/initial_stop 缺失或不合法（例如很舊的資料、或用CSV匯入的部位沒有經過正式的
+      進場計畫流程）時，退回用 2×ATR 當R的替代值（等同於 initial_stop 原本的定義公式，數值上
+      相近，只是精神上從「用當下浮動ATR」退化成近似值）。
+
+      structural_t1 ＝前高（若前高離現價 > min_gap_atr_multiple×ATR，代表前高還有參考價值）；
+                      否則現價已經追平/超過前高，改用「現價+2×ATR」外推（沿用V2.11.8既有邏輯不變）
+      structural_t2 ＝structural_t1 + 2×ATR（沿用既有的固定差距）
+
+      r_floor_t1 ＝cost + t1_r_multiple×R（預設1.5R，對齊 entry_gate 原本就要求 R1≥1.5 的門檻——
+                   第一目標至少要值回你當初願意承擔的風險等級的1.5倍，不然只是隨便挑一個近的價位，
+                   不是真正「值得」的第一目標）
+      r_floor_t2 ＝cost + t2_r_multiple×R（預設2.5R）
+
+      T1 ＝max(structural_t1, r_floor_t1)：前高夠遠、本身就值超過1.5R，就用前高（有真實壓力位
+           支撐，比純數學算出來的R倍數更貼近市場現實）；前高太近、不值1.5R，就用R floor頂上去
+           （這種情況下，前高不是一個有意義的第一目標，用R倍數確保至少有基本的風報比才算數）
+      T2 ＝max(structural_t2, r_floor_t2)：邏輯相同
+
+    其餘規則不變：
+      - cost<=0（空手）：T1=T2=0
+      - atr 無效：T1=T2=cost×1.10（保底值，這個分支不會用到R，因為沒有ATR也就沒有structural候選）
+      - 獲利尚未超過 profit_trigger_pct（預設10%）：T1=T2=cost×1.10（未達門檻不做任何分析，R倍數
+        邏輯同樣不會啟用）
+
+    回傳 (t1, t2, branch)，branch 標示T1是哪個候選方法算出來的（resistance／atr_fallback／
+    r_floor_t1，新增最後一種），T2一律沿用同一個branch文字（不額外區分T2自己的來源，維持原本
+    函式「一個branch代表整體算法路徑」的慣例，即使極少數情況下T2實際上是被R floor頂上去、但T1
+    卻是前高，這種混合情形branch文字只反映T1的來源，屬於已知的顯示簡化）。
+
+    【需要人工確認的參數】t1_r_multiple（1.5）／t2_r_multiple（2.5）是本次新增的參數，跟
+    min_gap_atr_multiple 等既有參數一樣屬於初版經驗值，建議依實際使用效果調整。
     """
     if cost is None or cost <= 0:
         return 0.0, 0.0, "no_position"
@@ -1364,60 +1425,108 @@ def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, pr
     if price <= cost * (1 + profit_trigger_pct / 100.0):
         t1 = t2 = cost * 1.10
         return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), "profit_gate"
+
+    _entry_f = _safe_float(entry_price)
+    _init_stop_f = _safe_float(initial_stop)
+    r = (_entry_f - _init_stop_f) if (_entry_f > 0 and _init_stop_f > 0 and _entry_f > _init_stop_f) else 2 * atr
+
     ph = _safe_float(previous_high)
     min_gap = min_gap_atr_multiple * atr
     if ph > price + min_gap:
-        t1, t2, branch = ph, ph + 2 * atr, "resistance"
+        structural_t1, structural_t2, structural_branch = ph, ph + 2 * atr, "resistance"
     else:
-        t1, t2, branch = price + 2 * atr, price + 4 * atr, "atr_fallback"
+        structural_t1, structural_t2, structural_branch = price + 2 * atr, price + 4 * atr, "atr_fallback"
+
+    r_floor_t1 = cost + t1_r_multiple * r
+    r_floor_t2 = cost + t2_r_multiple * r
+
+    if r_floor_t1 > structural_t1:
+        t1, branch = r_floor_t1, "r_floor_t1"
+    else:
+        t1, branch = structural_t1, structural_branch
+    t2 = max(structural_t2, r_floor_t2)
     return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), branch
 
-def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=10.0, swing_low=None):
+def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=10.0, swing_low=None, trend_confirmed=False):
     """
-    【單一防守線權威來源，V2.11.9新增，V2.11.10擴充Trend Runner多方法】取代 UI 用的
-    `calc_trailing_stop()`（60天回溯重建棘輪，獲利>10%才啟用）跟狀態機用的
-    `calculate_trailing_stop_stateful()`（有狀態增量棘輪，完全沒有10%門檻，從第一天就開始墊）——
-    這兩個公式原本各自維護，同一檔股票在「🛡️風控點位」跟「🗓️交易計畫」可能顯示不同防守線，
-    甚至連「有沒有跌破、要不要全部出清」都可能兩邊不一致。
+    【單一防守線權威來源，V2.11.9新增，V2.11.10擴充Trend Runner多方法，V2.11.17改為三層防守，
+    V2.11.18把Level1→2切換條件改為「趨勢是否形成」】
 
-    統一後的規則（採用UI原本較完整的「獲利門檻」邏輯，狀態機這邊改用這套，不再自己算）：
-      - cost<=0：回傳0（無成本可比較）
-      - 獲利尚未超過 profit_trigger_pct（預設10%）：防守線是 max(previous_stop, cost−2×ATR)——
-        還沒開始棘輪的全新部位會落在 cost−2×ATR；但如果先前已經棘輪墊高過（previous_stop更高，
-        例如價格一度衝過10%獲利門檻又拉回），不會因為現在跌回門檻以下就把防守線退回去，
-        「只能上移不能下移」是防守線的鐵律，門檻只決定「要不要開始棘輪」，不能拿來讓已經墊高的
-        防守線倒退（V2.11.9修正：這是我在測試時發現的真實回歸，第一版寫法會讓已經墊高的防守線
-        在價格拉回10%門檻以下時被打回原形，等於防守線可以下降，違反棘輪的基本設計原則）
-      - 獲利已超過門檻：棘輪模式（V2.11.10起「Trend Runner」三方法並用，取最大值——最貼近現價、
-        保護最多獲利的那個）：
-          candidate = max(MA20−ATR, 波段低點(swing_low，若有提供), 現價−1.5×ATR)
-          new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
-        （V2.11.4已修正過的「不會被cost強制拉高」特性沿用；swing_low沒有提供時該候選值不計入，
-        不影響既有只用MA20−ATR的呼叫端）
+    【V2.11.18】依你的指示，把 Level1→2 的切換條件從「獲利%」改成「趨勢是否形成」，Level2→3
+    則維持用「獲利%」不變——這兩段各自代表不同的問題，適合用不同的判斷依據：
+    「什麼時候該開始跟結構」是趨勢問題，「什麼時候該重兵保護已經到手的獲利」是金錢問題。
+
+      Level 1「Initial Risk Stop」：trend_confirmed 為 False（趨勢尚未確認形成）
+        防守線 = max(previous_stop, cost−2×ATR)，趨勢還沒走出來前用最保守的固定緩衝，
+        不做任何結構分析（此時價格結構還不夠明確，用結構支撐容易被雜訊洗）
+
+      Level 2「Structural Stop」：trend_confirmed 為 True，但獲利還沒到 profit_trigger_pct（預設10%）
+        趨勢已經確認形成（例如站上MA20、均線多頭排列——沿用你系統既有SOP三燈的「趨勢燈」定義，
+        不是另外發明一套新邏輯），但獲利還不多，還沒到「重兵保護」的程度：
+        candidate = max(MA20−ATR, 波段低點(swing_low，若有提供))
+        new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
+        （只用結構性方法，不用「現價−1.5×ATR」這種貼近現價的緊縮方法——趨勢剛確認、獲利還不多，
+        不需要為了保護還沒賺到的利潤而把防守線收得太緊，避免正常回檔就被洗出去）
+
+      Level 3「Profit Protection Stop」：獲利 ≥ profit_trigger_pct（預設10%，不論 trend_confirmed
+        當下是True還是False——已經到手的獲利要優先保護，不因為趨勢燈臨時熄滅就放鬆防守）
+        candidate = max(MA20−ATR, 波段低點(swing_low，若有提供), 現價−1.5×ATR)
+        new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
+        （沿用V2.11.10「Trend Runner」三方法取最大值，加入「現價−1.5×ATR」這種貼近現價、
+        鎖住最多獲利的候選方法）
+
+    trend_confirmed 建議直接傳入 SOP三燈裡的「趨勢燈」（indicators["trend_gate"]，定義為
+    price>MA20 且 MA10>MA20>MA60），這是系統既有、每天都會算的判斷，不是新發明的獨立邏輯，
+    也不會因此新增額外的判斷子系統或濾網。trend_confirmed 缺失（None）時視為 False（Level 1，
+    最保守），跟其他判斷邏輯「風控類參數缺失時預設保守」的慣例一致。
+
+    三層之間共用同一條鐵律：**只能上移，不能下移**——不論在哪一層，new_stop 永遠是
+    max(previous_stop, 這一層的候選值)。這條鐵律也保護了 trend_confirmed 在Level1/2之間來回
+    切換（例如均線交叉反覆發生）時不會讓防守線跟著忽上忽下：即使某天 trend_confirmed 從True
+    翻回False，防守線本身只會沿用先前已經墊高的 previous_stop，不會真的退回 Level 1 的水準，
+    只有「這一天用哪一組候選公式」這個標籤會變動，實際數值不受影響。
 
     previous_stop：呼叫端傳入「上一次已經算出、且已經持久化保存的防守線」（沒有就傳 None 或 0，
     會用 cost−2×ATR 當起點）。UI跟狀態機都必須傳入「同一個來源」（trade_plan.current_trailing_stop）
-    的 previous_stop，才能確保兩邊算出同一個答案——這是本次統一的關鍵，不只是公式一樣，
-    連「上一次的記憶」都要讀同一份，否則UI每次重算會因為沒有記憶又跟狀態機兜不起來。
+    的 previous_stop，才能確保兩邊算出同一個答案。
 
-    【V2.11.12新增】回傳值改成 (new_stop, source)，source 標示這次的防守線是哪個候選方法算出來的
-    （profit_gate／locked_previous／ratchet_ma20_atr／ratchet_price_atr／ratchet_swing_low／
-    no_position），讓UI可以告訴使用者「防守線為什麼在這裡」，不再只丟一個數字。
+    回傳值 (new_stop, source)，source 標示這次的防守線是哪個候選方法算出來的
+    （initial_stop／locked_previous／ratchet_ma20_atr／ratchet_price_atr／ratchet_swing_low／
+    no_position），讓UI可以告訴使用者「防守線為什麼在這裡」——Level2跟Level3共用
+    ratchet_ma20_atr／ratchet_swing_low 這兩個來源標籤（公式完全一樣），只有 ratchet_price_atr
+    這個來源只會在Level3出現（Level2的候選集合裡沒有這個方法）。
     """
     cost_f = _safe_float(cost)
     if cost_f <= 0:
         return 0.0, "no_position"
     flat_stop = cost_f - 2 * _safe_float(atr)
     prev = _safe_float(previous_stop)
-    if price is None or _safe_float(price) <= cost_f * (1 + profit_trigger_pct / 100.0):
+    price_f = _safe_float(price) if price is not None else 0.0
+    profit_pct = (price_f / cost_f - 1.0) * 100.0 if price is not None else -999.0
+
+    # Level 3 優先判斷：獲利已超過 profit_trigger_pct 時，不論 trend_confirmed 為何都優先重兵保護
+    if price is not None and profit_pct >= profit_trigger_pct:
+        base = prev if prev > 0 else flat_stop
+        _candidates = {
+            "ratchet_ma20_atr": _safe_float(ma20) - _safe_float(atr),
+            "ratchet_price_atr": _safe_float(price) - 1.5 * _safe_float(atr),
+        }
+        if swing_low is not None and _safe_float(swing_low) > 0:
+            _candidates["ratchet_swing_low"] = _safe_float(swing_low)
+        best_source, best_value = max(_candidates.items(), key=lambda kv: kv[1])
+        if base >= best_value:
+            return base, "locked_previous"
+        return best_value, best_source
+
+    # Level 1：Initial Risk Stop —— 趨勢尚未確認形成（trend_confirmed 缺失一律視為 False，取保守值）
+    if price is None or not trend_confirmed:
         if prev > 0 and prev >= flat_stop:
             return prev, "locked_previous"
-        return flat_stop, "profit_gate"
+        return flat_stop, "initial_stop"
+
+    # Level 2：Structural Stop —— 趨勢已確認形成，但獲利還沒到 profit_trigger_pct
     base = prev if prev > 0 else flat_stop
-    _candidates = {
-        "ratchet_ma20_atr": _safe_float(ma20) - _safe_float(atr),
-        "ratchet_price_atr": _safe_float(price) - 1.5 * _safe_float(atr),
-    }
+    _candidates = {"ratchet_ma20_atr": _safe_float(ma20) - _safe_float(atr)}
     if swing_low is not None and _safe_float(swing_low) > 0:
         _candidates["ratchet_swing_low"] = _safe_float(swing_low)
     best_source, best_value = max(_candidates.items(), key=lambda kv: kv[1])
@@ -1434,7 +1543,7 @@ def calculate_trailing_stop_stateful(previous_stop, current_price, ma20, atr, co
 
 def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, previous_high,
                          t1_taken, t2_taken, current_shares, is_us_stock=False, partial_exit_ratio=0.30,
-                         macd_osc_status=None, swing_low=None):
+                         macd_osc_status=None, swing_low=None, trend_confirmed=False, entry_price=None, initial_stop=None):
     """
     出清／分批停利計畫（規格書 9、10節）。回傳 dict 一定含 current_trailing_stop 與 t1_price/t2_price，
     並在符合條件時附上 next_state 建議（呼叫端 evaluate_trade_state 會再用 transition_state 實際套用，
@@ -1450,9 +1559,13 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
     swing_low（V2.11.10新增，Trend Runner）：近期波段低點，傳給 calculate_stop_plan() 當第三個
     防守線候選方法（跟MA20−ATR、現價−1.5×ATR取最大值），沒有提供時該候選值不計入，行為退回
     V2.11.9版本（只有MA20−ATR與現價−1.5×ATR兩種候選）。
+
+    trend_confirmed（V2.11.18新增）：直接轉傳給 calculate_stop_plan()，決定Level1→2的切換
+    （見該函式docstring）。entry_price/initial_stop（V2.11.18新增）：直接轉傳給
+    calculate_target_plan()，用來計算R倍數目標（見該函式docstring）。
     """
-    current_trailing_stop, _stop_source = calculate_stop_plan(price, average_cost, atr, ma20, previous_trailing_stop, swing_low=swing_low)
-    t1_price, t2_price, _target_branch = calculate_target_plan(price, average_cost, atr, previous_high, is_us_stock)
+    current_trailing_stop, _stop_source = calculate_stop_plan(price, average_cost, atr, ma20, previous_trailing_stop, swing_low=swing_low, trend_confirmed=trend_confirmed)
+    t1_price, t2_price, _target_branch = calculate_target_plan(price, average_cost, atr, previous_high, is_us_stock, entry_price=entry_price, initial_stop=initial_stop)
 
     result = {"current_trailing_stop": current_trailing_stop, "stop_source": _stop_source, "t1_price": t1_price, "t2_price": t2_price,
               "next_state": None, "signal_type": "", "signal_reason": "", "partial_exit_shares": 0, "full_exit_shares": 0}
@@ -1493,6 +1606,66 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
 
     result.update({"next_state": "HOLD", "signal_reason": "持有續抱，移動防守線持續追蹤"})
     return result
+
+def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_status, r1, decision_score):
+    """
+    【V2.11.17新增，Breakout Quality Engine（P1-1）】把 is_breakout_failed() 之外「這次突破強不強」
+    的判斷，從 calculate_entry_plan() 原本的純布林關卡（過關/不過關）升級成 0~100 的連續分數，
+    純粹是「這次通過關卡的訊號有多強」的參考指標，**不是新的關卡**——entry_gate 有沒有通過、
+    要不要建立這筆計畫，完全不受這個分數影響，這裡只是替已經通過關卡的訊號多附上一個強度分數。
+
+    四個子分數（權重合計100）：
+      - 量能強度（35分）：當日成交量／5日均量，1.0倍以下0分，2.5倍以上滿分35分，中間線性內插；
+        vol_ma5缺失時給17.5分（半分，跟 calculate_entry_plan() 既有的「資料不足視為中性通過」一致）
+      - MACD動能強度（25分）：正值/翻紅第1根給滿分25分，收腳中給一半12.5分，翻黑/頂背離給0分
+        （理論上這兩種會先被entry_gate擋下，這裡是防禦性處理），資料不足給一半12.5分（同上，中性）
+      - 風報比強度（20分）：R1（風報比）1.5（gate最低門檻）給10分，3.0以上給滿分20分，中間線性內插
+      - 決策分數強度（20分）：decision_score 70（gate最低門檻）給10分，90以上給滿分20分，中間線性內插
+
+    五級不是這裡的重點（保留給你決定要不要分級），先只回傳連續分數＋一個簡單的A/B/C/D字母評等
+    （A≥80／B≥65／C≥50／D<50），對齊你在畫面上想看到「86/100 A級」這種呈現方式。
+
+    回傳 (score, grade, detail)，detail 是子分數明細 dict，方便顯示「這個分數是怎麼組成的」。
+
+    【需要人工確認的參數】量能2.5倍、R1的3.0、decision_score的90 這幾個「滿分」上限，都是初版
+    經驗值，建議依實際使用效果調整，跟 invalid_price 等既有參數屬於同一類。
+    """
+    def _lerp_score(value, lo, hi, max_pts, min_pts=0.0):
+        if value is None:
+            return max_pts / 2.0
+        v = _safe_float(value)
+        if v <= lo:
+            return min_pts
+        if v >= hi:
+            return max_pts
+        return min_pts + (v - lo) / (hi - lo) * (max_pts - min_pts)
+
+    vol_ma5_f = _safe_float(vol_ma5) if vol_ma5 is not None else None
+    if vol_ma5_f is not None and vol_ma5_f > 0:
+        vol_ratio = _safe_float(volume) / vol_ma5_f
+        vol_score = _lerp_score(vol_ratio, 1.0, 2.5, 35.0)
+    else:
+        vol_score = 17.5
+
+    if macd_osc_status in ("正值", "翻紅第1根"):
+        macd_score = 25.0
+    elif macd_osc_status == "收腳中":
+        macd_score = 12.5
+    elif macd_osc_status in ("翻黑",) or macd_osc_status is not None and "頂背離" in str(macd_osc_status):
+        macd_score = 0.0
+    elif macd_osc_status is None:
+        macd_score = 12.5
+    else:
+        macd_score = 12.5
+
+    r1_score = _lerp_score(r1, 1.5, 3.0, 20.0, min_pts=10.0)
+    decision_score_score = _lerp_score(decision_score, 70.0, 90.0, 20.0, min_pts=10.0)
+
+    total = vol_score + macd_score + r1_score + decision_score_score
+    total = max(0.0, min(100.0, total))
+    grade = "A" if total >= 80 else ("B" if total >= 65 else ("C" if total >= 50 else "D"))
+    detail = {"volume": round(vol_score, 1), "macd": round(macd_score, 1), "r1": round(r1_score, 1), "decision_score": round(decision_score_score, 1)}
+    return round(total, 1), grade, detail
 
 def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     """
@@ -1557,6 +1730,9 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
         valid_until = _add_business_days(data_date, 3, is_us_stock)
         reason = "Gate 與 Score 同時成立，等待價格突破"
 
+    _bq_score, _bq_grade, _bq_detail = calculate_breakout_quality_score(
+        indicators.get("volume"), _vol_ma5, macd_osc_status, indicators.get("r1"), decision_score)
+
     return {
         "signal_type": "ENTRY", "entry_price": breakout_price, "breakout_price": breakout_price,
         "pullback_low": pullback_low, "pullback_high": pullback_high, "chase_limit": chase_limit,
@@ -1568,6 +1744,7 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
             breakout_price, breakout_price - 2 * atr, portfolio_info.get("available_cash", portfolio_info.get("cap", 20000.0))
         ),
         "initial_stop": round_to_tick(breakout_price - 2 * atr, is_us_stock),
+        "breakout_quality_score": _bq_score, "breakout_quality_grade": _bq_grade,
     }
 
 def calculate_addon_shares(current_shares, current_price, current_stop, add_price, add_stop,
@@ -1636,6 +1813,8 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             held_qty, is_us_stock, plan.get("partial_exit_ratio", 0.30),
             macd_osc_status=indicators.get("macd_osc_status"),
             swing_low=indicators.get("swing_low"),
+            trend_confirmed=bool(indicators.get("trend_gate")),
+            entry_price=plan.get("entry_price"), initial_stop=plan.get("initial_stop"),
         )
         # 【V2.11.8 修正】原本只在「第一次設定」時寫入 t1_price/t2_price，之後永遠凍結不再更新——
         # 即使已經統一成同一套公式（calculate_target_plan），只要時間拉長、前高或股價變化，
@@ -1720,7 +1899,8 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
              "pullback_high": 0.0, "invalid_price": 0.0, "signal_key": "", "t1_taken": False, "t2_taken": False,
              "t1_price": 0.0, "t2_price": 0.0, "current_trailing_stop": 0.0, "initial_stop": 0.0,
              "addon_shares_approved": 0, "addon_shares_suggested": 0, "partial_exit_shares": 0, "full_exit_shares": 0,
-             "execution_date": "", "valid_until": ""},
+             "execution_date": "", "valid_until": "", "retest_min_price": 0.0, "retest_quality": "",
+             "breakout_quality_score": 0.0, "breakout_quality_grade": ""},
             data_date, f"部位已全部出清（原狀態 {plan.get('state')}），重置為 PREPARE 重新追蹤新訊號")
 
     if plan.get("state") in active_wait_states and plan.get("entry_price", 0) > 0:
@@ -1760,15 +1940,29 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
         if chase_limit > 0 and price > chase_limit and plan.get("state") != "PULLBACK_WAIT":
             return transition_state(plan, "PULLBACK_WAIT", {}, data_date, "現價超過追價上限，改為等待回測區間")
 
+        # 【V2.11.17新增，Retest Engine】追蹤PULLBACK_WAIT期間價格是否真的回測進等待區間，純粹記錄用，
+        # 不新增狀態、不影響任何轉移判斷——只在下面真的轉去ENTER_NEXT_DAY那一刻，用這份記錄附上
+        # 「這次突破前有沒有經過真實回測」的品質提示，不是「來回擺盪誤觸發」也不是「原地空等」。
+        if plan.get("state") == "PULLBACK_WAIT" and price > 0:
+            _prev_min = _safe_float(plan.get("retest_min_price"))
+            plan["retest_min_price"] = price if _prev_min <= 0 else min(_prev_min, price)
+
         if plan.get("state") in {"BREAKOUT_WAIT", "PULLBACK_WAIT"} and entry_price > 0 and price >= entry_price:
             key = f"{code}|ENTRY|{data_date}|{round(entry_price, 2)}"
             if is_duplicate_signal(plan, key):
                 return plan
             plan["signal_key"] = key
             plan["review_state"] = "PENDING"  # 【V2.11.12新增】任何新訊號（signal_key改變）一律重置為尚未確認
+            _retest_note, _retest_quality = ("", "")
+            if plan.get("state") == "PULLBACK_WAIT":
+                _retest_note, _retest_quality = classify_retest_quality(
+                    plan.get("retest_min_price"), plan.get("pullback_low"), plan.get("pullback_high"), plan.get("invalid_price"))
+            _reason = "突破/回測進場條件成立，隔日執行"
+            if _retest_note:
+                _reason += f"（{_retest_note}）"
             return transition_state(plan, "ENTER_NEXT_DAY",
-                                     {"execution_date": _next_business_day(data_date, is_us_stock)},
-                                     data_date, "突破/回測進場條件成立，隔日執行")
+                                     {"execution_date": _next_business_day(data_date, is_us_stock), "retest_quality": _retest_quality},
+                                     data_date, _reason)
         return plan
 
     # ===== 沒有既有計畫（PREPARE 且尚未有 entry_price）：檢查是否符合建立新計畫的條件 =====
@@ -1953,14 +2147,16 @@ with st.sidebar:
         st.rerun()
 
 # --- 卡片渲染邏輯 ---
-# 【V2.11.12新增】防守線來源的中文標籤，供UI顯示「這條防守線為什麼在這個位置」，不再只丟一個數字。
+# 【V2.11.12新增，V2.11.17更新標籤】防守線來源的中文標籤，供UI顯示「這條防守線為什麼在這個位置」，
+# 不再只丟一個數字。V2.11.17三層化後：initial_stop＝Level1，ratchet_ma20_atr／ratchet_swing_low
+# 在Level2、Level3都可能出現（公式相同），ratchet_price_atr只會在Level3出現。
 STOP_SOURCE_LABELS = {
     "no_position": "無持股",
-    "profit_gate": "成本−2×ATR（尚未進入棘輪模式）",
-    "locked_previous": "沿用前次防守線（本次三種候選都沒有更高）",
-    "ratchet_ma20_atr": "MA20−ATR",
-    "ratchet_price_atr": "現價−1.5×ATR",
-    "ratchet_swing_low": "近20日波段低點",
+    "initial_stop": "Level1 成本−2×ATR（尚未獲利，初始防守）",
+    "locked_previous": "沿用前次防守線（本次候選都沒有更高）",
+    "ratchet_ma20_atr": "MA20−ATR（結構防守）",
+    "ratchet_price_atr": "現價−1.5×ATR（Level3 獲利保護）",
+    "ratchet_swing_low": "近20日波段低點（結構防守）",
 }
 
 def render_stock_card(data, system_history, portfolio_data):
@@ -2110,7 +2306,15 @@ def render_stock_card(data, system_history, portfolio_data):
             except Exception as _chart_err:
                 st.caption(f"K線圖暫時無法載入：{_chart_err}")
         with tab_c3:
-            _branch_note = "（依前高壓力位）" if data.get('target_branch') == "resistance" else "（前高不明顯，改用ATR外推）"
+            _branch_note_map = {
+                "resistance": "（依前高壓力位）",
+                "atr_fallback": "（前高不明顯，改用ATR外推）",
+                "r_floor_t1": "（前高太近、值不到1.5R，改用風險倍數R floor）",
+                "profit_gate": "（獲利尚未達門檻，暫用保底值）",
+                "atr_unavailable": "（ATR資料無效，暫用保底值）",
+                "no_position": "",
+            }
+            _branch_note = _branch_note_map.get(data.get('target_branch'), "")
             _stop_source_note = STOP_SOURCE_LABELS.get(data.get('atr_stop_source'), data.get('atr_stop_source', ''))
             st.write(f"**設定成本**: {data['cost']:.2f}\n**動態防守/停損**: {data['atr_stop_price']:.2f}（來源：{_stop_source_note}）\n**第一目標 T1**: {data['t1']:.2f} {_branch_note}\n**第二目標 T2**: {data['t2']:.2f}")
             # 【V2.11.2 正式導入】波段剩餘空間%：現價距離「第一目標T1」還有多少百分比的路要走，
@@ -2199,7 +2403,18 @@ def render_stock_card(data, system_history, portfolio_data):
             if data.get('held_qty', 0) <= 0:
                 st.markdown("**空手訊號資訊**")
                 st.write(f"突破價：{data.get('plan_breakout_price', 0):.2f}　｜　追價上限：{data.get('plan_chase_limit', 0):.2f}")
+                _bq_score = data.get('plan_breakout_quality_score', 0)
+                _bq_grade = data.get('plan_breakout_quality_grade', '')
+                if _bq_grade:
+                    st.write(f"突破品質：{_bq_score:.0f}/100 {_bq_grade}級")
                 st.write(f"回測區間：{data.get('plan_pullback_low', 0):.2f} ～ {data.get('plan_pullback_high', 0):.2f}")
+                _retest_q = data.get('plan_retest_quality', '')
+                if _retest_q == "RETESTED_HELD":
+                    st.caption("✅ 回測品質：已實際拉回等待區間內確認支撐，屬真實回測後再突破")
+                elif _retest_q == "NO_RETEST":
+                    st.caption("⚠️ 回測品質：股價從未實際拉回等待區間，屬直接反彈站上（V型），未經真實回測確認")
+                elif _retest_q == "INVALID_TOUCHED":
+                    st.caption("⚠️ 回測品質：期間曾跌破失效價，訊號品質存疑")
                 st.write(f"失效價：{data.get('plan_invalid_price', 0):.2f}　｜　建議進場股數：{data.get('plan_suggested_shares', 0)} 股")
                 if _plan_state == "SUSPENDED_BY_REGIME":
                     st.warning("⏸️ 市場目前處於逆風狀態，新倉暫停，但交易計畫本身未被刪除，逆風解除後會自動恢復。")
@@ -2517,8 +2732,15 @@ else:
             # 上一次防守線（_prev_stop_for_calc）當基準，公式跟記憶體都統一。
             # atr_stop_price／take_profit_price 這兩個變數名稱保留不變，
             # 讓後面所有既有的分數/顯示邏輯不用跟著大改；take_profit_price = T1（較近的第一目標）。
-            t1, t2, _target_branch = calculate_target_plan(price, cost, atr, _t_previous_high, is_us_stock)
-            atr_stop_price, _atr_stop_source = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc, swing_low=_swing_low)
+            t1, t2, _target_branch = calculate_target_plan(price, cost, atr, _t_previous_high, is_us_stock,
+                                                             entry_price=_old_plan.get("entry_price"), initial_stop=_old_plan.get("initial_stop"))
+            # 【V2.11.18】這裡的「趨勢已確認」判斷跟後面 step3_pass（SOP三燈的趨勢燈）用同一套公式
+            # （price>MA20 且 MA10>MA20>MA60），故意在這裡重算一次而不是等 step3_pass 算完再引用，
+            # 是因為 step3_pass 定義在後面（第2773行附近）——V2.11.11 曾因為把計算搬到迴圈更前面、
+            # 卻忘記把某個變數的定義一起搬過去，導致 NameError 整批分析失敗，這裡刻意不重蹈覆轍，
+            # 用「原地重算同一條件」取代「往前搬變數定義」，公式必須跟下面 step3_pass 保持一致。
+            _ui_trend_confirmed = price > ma20 and (ma10 > ma20 > ma60)
+            atr_stop_price, _atr_stop_source = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc, swing_low=_swing_low, trend_confirmed=_ui_trend_confirmed)
 
             take_profit_price = t1
 
@@ -2818,6 +3040,9 @@ else:
                 "plan_signal_type": trade_plan_data[code]["signal_type"], "plan_signal_reason": trade_plan_data[code]["signal_reason"],
                 "plan_entry_price": trade_plan_data[code]["entry_price"], "plan_breakout_price": trade_plan_data[code]["breakout_price"],
                 "plan_pullback_low": trade_plan_data[code]["pullback_low"], "plan_pullback_high": trade_plan_data[code]["pullback_high"],
+                "plan_retest_quality": trade_plan_data[code]["retest_quality"],
+                "plan_breakout_quality_score": trade_plan_data[code]["breakout_quality_score"],
+                "plan_breakout_quality_grade": trade_plan_data[code]["breakout_quality_grade"],
                 "plan_chase_limit": trade_plan_data[code]["chase_limit"], "plan_invalid_price": trade_plan_data[code]["invalid_price"],
                 "plan_t1_price": trade_plan_data[code]["t1_price"], "plan_t2_price": trade_plan_data[code]["t2_price"],
                 "plan_t1_taken": trade_plan_data[code]["t1_taken"], "plan_t2_taken": trade_plan_data[code]["t2_taken"],
