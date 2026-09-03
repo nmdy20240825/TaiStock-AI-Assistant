@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.27"
+APP_VERSION = "V2.11.29"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -833,8 +833,9 @@ TRADE_PLAN_HEADERS = [
     "chase_limit", "invalid_price", "pullback_taken",
     # 回測品質（V2.11.17新增，Retest Engine）
     "retest_min_price", "retest_quality",
-    # 突破品質（V2.11.17新增，Breakout Quality Engine）
+    # 突破品質（V2.11.17新增，Breakout Quality Engine；V2.11.28補上四個子項，見說明書V2.11.28修復說明）
     "breakout_quality_score", "breakout_quality_grade",
+    "bq_volume", "bq_macd", "bq_r1", "bq_decision_score",
     # 停利相關
     "t1_price", "t2_price", "t1_taken", "t2_taken", "partial_exit_ratio", "partial_exit_shares",
     # 出清相關
@@ -1088,7 +1089,8 @@ def _normalize_trade_plan_row(row):
     for k in ["entry_price", "breakout_price", "pullback_low", "pullback_high", "chase_limit",
               "invalid_price", "t1_price", "t2_price", "initial_stop", "previous_trailing_stop",
               "current_trailing_stop", "max_risk_amount", "used_risk_amount", "remaining_risk_amount",
-              "retest_min_price", "breakout_quality_score"]:
+              "retest_min_price", "breakout_quality_score",
+              "bq_volume", "bq_macd", "bq_r1", "bq_decision_score"]:
         r[k] = _safe_float(r.get(k), 0.0)
     r["retest_quality"] = str(r.get("retest_quality", "") or "")
     r["breakout_quality_grade"] = str(r.get("breakout_quality_grade", "") or "")
@@ -1885,6 +1887,10 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
         ),
         "initial_stop": round_to_tick(breakout_price - 2 * atr, is_us_stock),
         "breakout_quality_score": _bq_score, "breakout_quality_grade": _bq_grade,
+        # 【V2.11.28新增】拆開突破品質分數的四個子項，供事後分析「到底是哪個子項在拖累判別力」——
+        # V2.11.17當時只存了總分，沒存明細，這次補上，不影響任何既有邏輯（純附加欄位）。
+        "bq_volume": _bq_detail.get("volume", 0), "bq_macd": _bq_detail.get("macd", 0),
+        "bq_r1": _bq_detail.get("r1", 0), "bq_decision_score": _bq_detail.get("decision_score", 0),
     }
 
 def calculate_addon_shares(current_shares, current_price, current_stop, add_price, add_stop,
@@ -2040,7 +2046,8 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
              "t1_price": 0.0, "t2_price": 0.0, "current_trailing_stop": 0.0, "initial_stop": 0.0,
              "addon_shares_approved": 0, "addon_shares_suggested": 0, "partial_exit_shares": 0, "full_exit_shares": 0,
              "execution_date": "", "valid_until": "", "retest_min_price": 0.0, "retest_quality": "",
-             "breakout_quality_score": 0.0, "breakout_quality_grade": ""},
+             "breakout_quality_score": 0.0, "breakout_quality_grade": "",
+             "bq_volume": 0.0, "bq_macd": 0.0, "bq_r1": 0.0, "bq_decision_score": 0.0},
             data_date, f"部位已全部出清（原狀態 {plan.get('state')}），重置為 PREPARE 重新追蹤新訊號")
 
     if plan.get("state") in active_wait_states and plan.get("entry_price", 0) > 0:
@@ -2402,6 +2409,9 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                     _entry_regime = calculate_regime_score(market_context)
                     open_trade = {'code': code, 'entry_date': dates[i + 1], 'entry_price': next_open,
                                    'breakout_quality_score': new_plan.get('breakout_quality_score', 0),
+                                   # 【V2.11.28新增】四個子項分數，供事後分析哪個子項在拖累整體判別力
+                                   'bq_volume': new_plan.get('bq_volume', 0), 'bq_macd': new_plan.get('bq_macd', 0),
+                                   'bq_r1': new_plan.get('bq_r1', 0), 'bq_decision_score': new_plan.get('bq_decision_score', 0),
                                    'retest_quality': '', 'adds': 0, 'partial_exits': [], 'is_us_stock': is_us_stock,
                                    'entry_regime_tw': _entry_regime['tw_regime'], 'entry_regime_us': _entry_regime['us_regime'],
                                    'entry_regime_overview': _entry_regime['overview']}
@@ -2466,6 +2476,9 @@ def _aggregate_backtest_trades(trade):
         'entry_price': entry_price, 'exit_price': exit_price, 'pnl_pct': pnl_pct,
         'holding_days': holding_days, 'adds': trade.get('adds', 0), 'partial_exits': len(trade.get('partial_exits', [])),
         't1_hit': t1_hit, 't2_hit': t2_hit, 'breakout_quality_score': trade.get('breakout_quality_score', 0),
+        # 【V2.11.28新增】突破品質分數的四個子項，供分析哪個子項在拖累整體判別力。
+        'bq_volume': trade.get('bq_volume', 0), 'bq_macd': trade.get('bq_macd', 0),
+        'bq_r1': trade.get('bq_r1', 0), 'bq_decision_score': trade.get('bq_decision_score', 0),
         # 【V2.11.26新增】進場當下的市場燈號分數，供分析「虧損是不是集中在大盤本身轉弱的時段」。
         # 依股票是台股/美股，取對應的那個子分數（跟 _regime_is_bearish() 的判斷依據一致）。
         'entry_regime_score': round(trade.get('entry_regime_us' if trade.get('is_us_stock') else 'entry_regime_tw', 0), 1),
