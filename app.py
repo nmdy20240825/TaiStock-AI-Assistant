@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.31"
+APP_VERSION = "V2.11.32"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -883,7 +883,18 @@ ALLOWED_TRANSITIONS = {
     # 逆風解除後恢復到暫停前的原狀態；出清判斷仍優先於恢復。
     "SUSPENDED_BY_REGIME": {"ENTER_NEXT_DAY", "ADD_NEXT_DAY", "HOLD", "FULL_EXIT_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "BREAKOUT_WAIT", "PULLBACK_WAIT", "PREPARE", "SUSPENDED_BY_REGIME"},
     "PARTIAL_EXIT_NEXT_DAY": {"HOLD", "FULL_EXIT_NEXT_DAY", "PREPARE", "PARTIAL_EXIT_NEXT_DAY"},
-    "FULL_EXIT_NEXT_DAY": {"PREPARE", "FULL_EXIT_NEXT_DAY"},   # 出清後歸零，重新開始追蹤新訊號
+    # 【V2.11.32修正，真實P0 bug】原本只開放到PREPARE，假設「出清訊號一定會被執行」（執行後qty
+    # 變0，才會走到下面的PREPARE歸零重置路徑）。但這個假設不成立：使用者可能沒有在建議當天執行
+    # （忘記、猶豫、或不同意），股數仍然>0；如果後續價格回到防守線之上，evaluate_trade_state()
+    # 的「持有中」分支其實已經正確判斷該回到HOLD／ADD_NEXT_DAY／PARTIAL_EXIT_NEXT_DAY（依當下條件
+    # 而定，不是固定只會是HOLD——測試時發現如果復原當下同時符合加碼資格，系統會嘗試轉去
+    # ADD_NEXT_DAY，同樣會被舊版轉移表擋下），卻被這裡擋下來，導致「交易計畫」分頁永遠卡在
+    # 「全部出清」，即使現價早已回到防守線之上、跟「AI決策與SOP」分頁（完全獨立、每次都重新計算，
+    # 沒有這個卡死問題）顯示的建議互相矛盾，使用者會看到兩個分頁給出完全相反的訊號卻不知道原因。
+    # 開放這三條路，讓「出清訊號沒有被執行、價格後來又回到防守線之上」時，能正確回到對應的持有中
+    # 狀態繼續追蹤，不會卡死；如果之後價格又真的再度跌破防守線，會產生一個全新的FULL_EXIT_NEXT_DAY
+    # 訊號，這是正常、即時反映當下價格的行為，不是「忽略風險」。
+    "FULL_EXIT_NEXT_DAY": {"PREPARE", "FULL_EXIT_NEXT_DAY", "HOLD", "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY"},
     "INVALID": {"PREPARE", "INVALID"},
     "EXPIRED": {"PREPARE", "EXPIRED"},
     "BREAKOUT_FAILED": {"PREPARE", "BREAKOUT_FAILED"},   # 突破失敗後歸零，重新開始追蹤新訊號
@@ -2066,10 +2077,18 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
                                               "addon_shares_approved": addon_shares, "signal_type": "ADD"},
                                              data_date, f"SOP三燈/信心/價格間距等品質關卡與資金風險上限均已通過，約可加碼 {addon_shares} 股")
 
+        # 【V2.11.32新增】從 FULL_EXIT_NEXT_DAY 恢復到 HOLD 時，原本的 exit_plan["signal_reason"]
+        # 是空字串（見 calculate_exit_plan 的result初始化），而 transition_state() 只在 reason
+        # 非空時才會覆蓋 plan["signal_reason"]——這代表如果不特別處理，畫面上會繼續顯示上一個
+        # 「收盤跌破移動防守線，強制全部出清」的舊文字，即使狀態已經改回HOLD，非常容易誤導使用者。
+        # 這裡明確給一個誠實反映「怎麼回事」的新理由文字。
+        _hold_reason = exit_plan["signal_reason"]
+        if plan.get("state") == "FULL_EXIT_NEXT_DAY" and not _hold_reason:
+            _hold_reason = "先前的出清訊號未被執行，現價已回到防守線之上，重新評估為持有中（若之後再度跌破，會產生新的出清訊號）"
         return transition_state(plan, "HOLD",
                                  {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"],
                                   "remaining_shares": held_qty, "addon_shares_approved": 0},
-                                 data_date, exit_plan["signal_reason"])
+                                 data_date, _hold_reason)
 
     # ===== 空手分支：先處理既有計畫（過期/失效/推進），逆風時不建立新計畫，但不刪除既有計畫 =====
     plan["last_known_qty"] = 0
