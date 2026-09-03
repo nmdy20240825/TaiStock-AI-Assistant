@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.26"
+APP_VERSION = "V2.11.27"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -2413,7 +2413,16 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                 if add_qty > 0 and qty > 0:
                     new_cost = (cost * qty + next_open * add_qty) / (qty + add_qty)
                     qty, cost = qty + add_qty, new_cost
-                    if open_trade: open_trade['adds'] += 1
+                    if open_trade:
+                        open_trade['adds'] += 1
+                        # 【V2.11.27新增】記錄每一次加碼當下的市場燈號分數，跟進場時同一個算法
+                        # （用決策當天i的market_context），供分析「加碼是不是發生在市場正在轉弱
+                        # 的時段」——這是比「進場當下分數」更精確的問題：V2.11.26驗證過進場分數
+                        # 跟輸贏基本無關，因為進場後市場才轉壞、進場分數量不到；加碼卻是「持有期間」
+                        # 才發生的決策，理論上應該要能反映當下市場環境轉差與否。
+                        _add_regime = calculate_regime_score(market_context)
+                        _add_regime_score = _add_regime['us_regime'] if is_us_stock else _add_regime['tw_regime']
+                        open_trade.setdefault('add_regime_scores', []).append(round(_add_regime_score, 1))
                 new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
             elif state == 'PARTIAL_EXIT_NEXT_DAY':
                 exit_qty = min(int(new_plan.get('partial_exit_shares', 0)), qty)
@@ -2451,6 +2460,7 @@ def _aggregate_backtest_trades(trade):
     pnl_pct = (exit_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
     t1_hit = len(trade.get('partial_exits', [])) >= 1
     t2_hit = len(trade.get('partial_exits', [])) >= 2
+    _add_scores = trade.get('add_regime_scores', [])
     return {
         'code': trade['code'], 'entry_date': trade['entry_date'], 'exit_date': trade['exit_date'],
         'entry_price': entry_price, 'exit_price': exit_price, 'pnl_pct': pnl_pct,
@@ -2460,6 +2470,11 @@ def _aggregate_backtest_trades(trade):
         # 依股票是台股/美股，取對應的那個子分數（跟 _regime_is_bearish() 的判斷依據一致）。
         'entry_regime_score': round(trade.get('entry_regime_us' if trade.get('is_us_stock') else 'entry_regime_tw', 0), 1),
         'entry_regime_overview': round(trade.get('entry_regime_overview', 0), 1),
+        # 【V2.11.27新增】這筆交易期間每一次加碼當下的市場燈號分數，取「最低分那次」跟「平均」——
+        # 最低分最能回答「這筆交易有沒有在市場明顯轉弱時還繼續加碼」這個問題；沒有加碼過的交易
+        # （adds=0）這兩欄是 None，不是0分，避免跟「加碼時剛好遇到0分」混淆。
+        'add_regime_score_min': round(min(_add_scores), 1) if _add_scores else None,
+        'add_regime_score_avg': round(sum(_add_scores) / len(_add_scores), 1) if _add_scores else None,
         'exit_reason': trade.get('exit_reason', ''), 'win': pnl_pct > 0,
     }
 
