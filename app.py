@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.23"
+APP_VERSION = "V2.11.25"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -26,6 +26,21 @@ st.markdown("""
 .block-container { padding-top: 2rem !important; padding-bottom: 2rem !important; }
 .ai-advice-box { background-color: #1e293b; padding: 15px; border-radius: 8px; border-left: 5px solid #3b82f6; margin-bottom: 15px; }
 </style>
+""", unsafe_allow_html=True)
+
+# ===== V2.11.24新增：PWA安裝支援 =====
+# 【重要】這幾行只負責讓瀏覽器/PWABuilder找得到 manifest.json 跟圖示，本身不會產生.apk檔案——
+# 產生真正能安裝的 Android 套件，還是要透過 PWABuilder.com 這個外部工具完成，見操作說明書。
+# 需要搭配 .streamlit/config.toml 裡的 enableStaticServing=true，以及 static/ 資料夾內的
+# manifest.json + 圖示檔案（見說明書第XX節PWA安裝章節的完整檔案清單與放置位置）。
+st.markdown("""
+<link rel="manifest" href="app/static/manifest.json">
+<link rel="apple-touch-icon" href="app/static/icon-192.png">
+<meta name="theme-color" content="#0f172a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="TaiStock">
 """, unsafe_allow_html=True)
 
 # --- 0-0. 簡易密碼保護（V2.10.4 新增）---
@@ -2467,6 +2482,36 @@ def calculate_backtest_metrics(trades_df):
         'stop_rate': (1 - win_rate / 100) * 100, 'max_drawdown_pct': max_drawdown, 'equity_curve': equity_curve,
     }
 
+def calculate_backtest_by_code(trades_df):
+    """
+    【V2.11.25新增】依股票代碼分組的績效拆解——回答「哪幾檔貢獻最多獲利/虧損」。
+
+    「總報酬貢獻%」是把該股票所有交易的 pnl_pct 加總，這是一個粗略估計，不是真正依資金配置
+    加權算出的貢獻度（因為回測目前還沒實作P2-2/P2-3的真實資金分配/排擠效應，見
+    calculate_backtest_metrics 的docstring），但足夠用來快速定位「這個股票池裡，哪幾檔是主要
+    賺錢引擎、哪幾檔是主要拖累」，供你決定要不要調整股票清單。
+
+    回傳依「總報酬貢獻%」由高到低排序的 DataFrame，欄位：code／交易筆數／勝率%／平均報酬%／
+    總報酬貢獻%／最大單筆獲利%／最大單筆虧損%／平均持有天數。
+    """
+    if trades_df is None or trades_df.empty:
+        return None
+    rows = []
+    for code, g in trades_df.groupby('code'):
+        wins = g[g['win']]
+        rows.append({
+            'code': code,
+            '交易筆數': len(g),
+            '勝率%': round(len(wins) / len(g) * 100, 1),
+            '平均報酬%': round(g['pnl_pct'].mean(), 2),
+            '總報酬貢獻%': round(g['pnl_pct'].sum(), 2),
+            '最大單筆獲利%': round(g['pnl_pct'].max(), 2),
+            '最大單筆虧損%': round(g['pnl_pct'].min(), 2),
+            '平均持有天數': round(g['holding_days'].mean(), 1),
+        })
+    out = pd.DataFrame(rows).sort_values('總報酬貢獻%', ascending=False).reset_index(drop=True)
+    return out
+
 def run_backtest(codes, years=2, progress_callback=None):
     """
     回測總入口。逐檔抓資料、逐檔重演狀態機，任何單一股票失敗都不會中斷整批回測（跟即時系統
@@ -3121,6 +3166,15 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
 
                 st.subheader("📉 權益曲線（模擬，逐筆交易累積報酬率）")
                 st.line_chart(_bt_metrics['equity_curve'])
+
+                st.subheader("🧩 依股票代碼分組績效")
+                st.caption(
+                    "「總報酬貢獻%」是把該股票所有交易的報酬率直接加總，用來快速看出「哪幾檔是主要"
+                    "賺錢引擎、哪幾檔是主要拖累」——這是粗略估計，不是依實際資金配置加權算出的貢獻度"
+                    "（原因同上方權益曲線的警語：目前還沒實作真實資金分配）。"
+                )
+                _bt_by_code = calculate_backtest_by_code(_bt_trades_df)
+                st.dataframe(_bt_by_code, use_container_width=True, hide_index=True)
 
                 st.subheader("📋 交易明細")
                 _bt_display_df = _bt_trades_df.sort_values('exit_date', ascending=False).copy()
