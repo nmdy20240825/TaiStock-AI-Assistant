@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.18"
+APP_VERSION = "V2.11.23"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -129,6 +129,15 @@ def calc_structural_target(high_series, current_price, atr, lookback=60, min_gap
         或現價已經站上前高），改用「現價+2倍ATR」外推。
     T2：T1 再往上延伸 2 倍 ATR。
     回傳 (t1, t2, branch)，branch 是 "resistance"（用前高）或 "atr_fallback"（用外推）。
+
+    【V2.11.22】原本唯一的呼叫端是「進場專用R1預檢」（用 current_price=突破價=前高×1.005 呼叫
+    這個函式），但那個呼叫方式有結構性瑕疵：current_price 本身就是從同一個 high_series 算出來的
+    前高推導出來的，導致 recent_high 必然小於 current_price，這個函式必然回傳 atr_fallback，
+    使得那個R1預檢永遠算出精確1.0，永遠無法通過entry_gate_pass的1.5門檻，等於「偵測新突破」功能
+    完全失效。這道關卡已經拿掉（詳見 calculate_entry_plan 的 docstring），這個函式目前沒有任何
+    呼叫端在使用，先保留函式定義本身（沒有壞，只是暫時沒人呼叫），未來若要在其他情境下（例如
+    current_price 是「現價」而非「突破價」，兩者不是同一組資料）重新使用，這個函式本身可以直接
+    沿用，不需要改動。
     """
     if atr is None or atr <= 0 or pd.isna(atr):
         return current_price, current_price, "atr_fallback"
@@ -884,14 +893,24 @@ def get_spreadsheet():
     client = get_gsheet_client()
     return client.open_by_key(st.secrets["gsheet"]["sheet_id"])
 
-def get_worksheet(name, headers):
-    """取得指定分頁；若試算表裡還沒有這個分頁，就自動建立並寫入表頭。"""
+def get_worksheet(name, headers, bootstrap_rows=None):
+    """
+    取得指定分頁；若試算表裡還沒有這個分頁，就自動建立並寫入表頭。
+
+    bootstrap_rows（V2.11.20新增）：只有在這個分頁『真的不存在、這次執行才剛被建立』時才會
+    一併寫入的預設資料列（list of list）。這個時機是唯一『毫無疑義的第一次使用』——分頁不存在，
+    絕對沒有任何既有資料可能被誤蓋。刻意不在「分頁已存在、但讀到空結果」這種情況下寫入
+    bootstrap_rows，因為那種情況無法區分「真的是空的」跟「暫時性讀取異常」，見 load_portfolio()
+    的說明。
+    """
     ss = get_spreadsheet()
     try:
         ws = ss.worksheet(name)
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=name, rows=200, cols=len(headers))
         ws.append_row(headers)
+        if bootstrap_rows:
+            ws.append_rows(bootstrap_rows)
     return ws
 
 def load_portfolio():
@@ -900,26 +919,53 @@ def load_portfolio():
 
     【V2.11.15修正，P0】原本這裡不論「分頁真的是空的（第一次使用）」還是「讀取過程發生例外
     （額度限制、網路逾時、認證失敗……）」，最後都會回傳同一份 DEFAULT_PORTFOLIO（程式碼內建的
-    示範持股），導致系統在「Google Sheets 讀取失敗」時完全沒有察覺自己拿到的是假資料，會直接拿
-    這份示範持股去跑當天完整的分析、甚至可能建立/推進交易計畫——這是系統以為自己知道使用者的
-    真實持股，但其實不知道。
+    示範持股），導致系統在「Google Sheets 讀取失敗」時完全沒有察覺自己拿到的是假資料。
+    V2.11.15 修正了「讀取過程發生例外」這一半：改回傳空 dict、把 PORTFOLIO_LOAD_OK 設為 False，
+    強制安全模式。
 
-    修正後明確拆成兩種情況：
-      1. 分頁存在、讀得到，但『真的是空的』（第一次使用）：正常 bootstrap，寫入預設持股，行為不變。
-      2. 讀取過程發生任何例外：不再假裝成功，回傳空 dict，並把 PORTFOLIO_LOAD_OK 設為 False，
-         讓主程式強制整個流程降級為安全模式（不顯示分析、禁止任何持股/交易計畫寫入）——
-         做法對齊既有的 load_trade_plan()/TRADE_PLAN_LOAD_OK 機制，兩者現在遵循同一套原則。
+    【V2.11.20修正，真實bug，P0】V2.11.15 沒有修到的另一半：原本只要 `ws.get_all_records()`
+    回傳空結果（不論是分頁『真的第一次使用』、還是分頁『明明已經有~20幾檔真實持股，這次讀取卻剛好
+    讀到空結果』），一律當成「第一次使用」寫入3檔內建示範持股。這造成一次真實的資料損毀事故：
+    使用者原本有20幾檔持股，某次讀取回傳空結果被誤判成「第一次使用」，寫入3檔示範持股後，
+    緊接著任何一次存檔動作（新增股票/刪除/加碼小工具/CSV匯入，都會呼叫 save_portfolio()）
+    就把這3檔示範持股整批覆寫回 Google Sheet，永久蓋掉原本的真實持股（`trade_plan`／`history`
+    這兩個分頁沒有這個自動bootstrap機制，因此沒有被波及，仍保有完整資料，這也是為什麼只有
+    `portfolio` 分頁受損的原因）。
+
+    修正後不再用「records是不是空的」判斷要不要bootstrap，改用「這個分頁是不是這次執行才剛被
+    建立的全新分頁」判斷（唯一不會誤判的依據——分頁不存在就是不存在，沒有模糊地帶）：
+      1. 分頁『這次執行才剛被建立』（原本完全不存在）：這是唯一毫無疑義的「第一次使用」，
+         由 get_worksheet() 的 bootstrap_rows 機制在建立分頁的當下就一併寫入預設持股。
+      2. 分頁『已經存在』，但這次讀到空結果：不再自動假設「一定是真的清空了」，因為這個假設
+         之前造成過真實的資料損毀。改成跟「讀取例外」同等級的保守處理：回傳空 dict，並把
+         PORTFOLIO_LOAD_OK 設為 False，強制安全模式（不顯示分析、禁止任何持股寫入）——
+         如果這次真的只是暫時性讀取異常，系統完全沒有寫入任何東西，下次重新整理／重新執行
+         就會自動恢復正常；如果持股真的被清空了，安全模式會提示你確認，而不是靜悄悄地
+         幫你「補」上3檔示範持股、然後在你毫不知情的情況下讓下一次存檔把這3檔永久寫回去。
     """
     global PORTFOLIO_LOAD_OK
     PORTFOLIO_LOAD_OK = True
     try:
-        ws = get_worksheet("portfolio", PORTFOLIO_HEADERS)
+        _bootstrap_rows = [[code, info["name"], info["cost"], info["cap"], info["risk"], info["status"], "", info.get("qty", 0)] for code, info in DEFAULT_PORTFOLIO.items()]
+        _existed_before = True
+        try:
+            get_spreadsheet().worksheet("portfolio")
+        except gspread.WorksheetNotFound:
+            _existed_before = False
+        ws = get_worksheet("portfolio", PORTFOLIO_HEADERS, bootstrap_rows=_bootstrap_rows)
         records = ws.get_all_records()
         if not records:
-            # 第一次使用、分頁是空的：把預設持股寫進去，讓 Google Sheet 成為資料的起點
-            rows = [[code, info["name"], info["cost"], info["cap"], info["risk"], info["status"], "", info.get("qty", 0)] for code, info in DEFAULT_PORTFOLIO.items()]
-            ws.append_rows(rows)
-            return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
+            if not _existed_before:
+                # 分頁是這次執行才剛被建立的：bootstrap_rows 已經在 get_worksheet() 裡寫入，
+                # 這裡直接回傳同一份資料即可（理論上 get_all_records() 現在應該讀得到剛寫入的
+                # 3列，走到這個分支代表寫入後立刻讀取失敗，保留防禦性判斷，仍然回傳預設持股，
+                # 不會有資料損毀風險，因為這個分頁本來就是全新的，沒有任何既有資料可能被誤蓋）
+                return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
+            # 分頁『原本就存在』，這次卻讀到空結果：無法區分「真的清空了」還是「暫時性讀取異常」，
+            # 一律當成需要人工確認的情況處理，不自動寫入任何東西，也不假裝這是正常的空持股狀態
+            PORTFOLIO_LOAD_OK = False
+            st.error("⚠️ 持股資料讀取結果異常（分頁存在，但讀不到任何資料），本次強制改為安全模式（僅檢視，不顯示任何分析，且已停用「儲存持股」以免覆蓋你在 Google Sheet 上的既有真實資料）。若這只是暫時性讀取異常，重新整理頁面即可恢復；若持股真的被清空，請先確認 Google Sheet 上的實際內容再繼續操作。")
+            return {}
         data = {}
         for row in records:
             code = str(row.get("code", "")).strip()
@@ -1361,6 +1407,64 @@ def transition_state(plan, next_state, extra_fields, data_date, reason=""):
     return plan
 
 # --- 4-5. 核心計算函式（規格書第七、八、九、十、十五節）---
+def calculate_daily_score(price, cost, ma10, ma20, ma60, macd, bias, k, d, rsi, volume, vol_ma5,
+                           atr_stop_price, take_profit_price, pivot_point, inst, is_us_stock,
+                           tw_bearish=False, us_bearish=False, vix_high=False):
+    """
+    【V2.11.21新增，從main loop抽出】決策分數（ai_score）／決策信心（confidence）／SOP三燈
+    （step1/2/3_pass）的唯一權威計算來源。
+
+    這段公式原本直接寫在主迴圈裡，只有UI一個呼叫點。這次為了建立回測系統（P2），需要在回測的
+    逐日重演迴圈裡呼叫「跟UI完全同一套」的評分公式——如果讓我在回測那邊另外抄一份公式，
+    未來只要UI這邊改了分數公式、忘記同步改回測那份，兩邊就會產生你在這次對話裡已經看過好幾次的
+    那種「兩套獨立維護、算出不同答案」的裂縫。所以直接把公式抽成這個獨立函式，UI跟回測都呼叫
+    同一份，公式改一次、兩邊同時生效，不會再有漏改的風險。
+
+    這是**純函式重構，不是行為變更**：抽出來的公式跟抽出前逐行完全一致，UI呼叫這個函式後，
+    算出來的 ai_score/confidence/step1_pass/step2_pass/step3_pass 應該跟改版前的數字分毫不差。
+
+    tw_bearish/us_bearish/vix_high：呼叫端自行判斷好的三個布林值（大盤跌破月線/那斯達克跌破月線/
+    VIX過高），取代原本直接讀 tw_trend/us_trend/vix_trend 字典的寫法，讓這個函式不依賴任何
+    外部字典結構，方便回測端用歷史資料自己組出這三個布林值。
+
+    回傳 dict：ai_score, confidence, step1_pass, step2_pass, step3_pass, macro_warnings,
+    is_bull_aligned, score_inst, score_tech, score_vol, score_risk。
+    """
+    score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0) if is_us_stock else min(inst['days'] * 5, 20) + (20 if inst['accumulated_shares'] * price >= 3000000000 else (10 if inst['accumulated_shares'] * price >= 1000000000 else 0))
+    _rsi_bull_point = 10 if (rsi > 50 and rsi <= 80) else 0
+    score_tech = (10 if k > d else 0) + _rsi_bull_point + (10 if price > ma20 else 0)
+    score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
+    score_risk = (10 if price > atr_stop_price else 0) + (5 if price >= take_profit_price or price >= cost * 1.05 else 0) if cost > 0 else 15
+
+    score_forced_zero = bool(cost > 0 and price <= atr_stop_price)
+    ai_score = 0 if score_forced_zero else min(int(score_inst + score_tech + score_vol + score_risk), 100)
+    is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
+    confidence_base = ai_score * 0.8 + (10 if is_bull_aligned else 0) + (5 if price > pivot_point else 0)
+
+    macro_warnings = []
+    if is_us_stock:
+        if us_bearish:
+            confidence_base *= 0.85
+            macro_warnings.append("⚠️ 美股大盤跌破月線，系統主動下調部位信心。")
+        if vix_high:
+            confidence_base *= 0.70
+            macro_warnings.append("🚨 VIX 恐慌指數過高，系統強制抑制進場訊號！")
+    else:
+        if tw_bearish:
+            confidence_base *= 0.85
+            macro_warnings.append("⚠️ 台股大盤跌破月線，逆勢操作風險較高。")
+
+    confidence = min(99, max(10, int(confidence_base)))
+    step1_pass = (price > ma60 and macd > 0) if is_us_stock else (inst['days'] >= 3 or inst['accumulated_shares'] * price >= 1000000000)
+    step2_pass, step3_pass = (k > d and rsi > 50 and volume > vol_ma5), (price > ma20 and is_bull_aligned)
+
+    return {
+        "ai_score": ai_score, "confidence": confidence, "step1_pass": step1_pass,
+        "step2_pass": step2_pass, "step3_pass": step3_pass, "macro_warnings": macro_warnings,
+        "is_bull_aligned": is_bull_aligned, "score_inst": score_inst, "score_tech": score_tech,
+        "score_vol": score_vol, "score_risk": score_risk,
+    }
+
 def calculate_position_size(cap, risk_pct, entry_price, stop_price, available_cash):
     """
     建議股數（規格書 15.1）：用「實際停損距離」而非單純 ATR，risk_amount/atr 的舊 bug 已在
@@ -1447,7 +1551,7 @@ def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, pr
     t2 = max(structural_t2, r_floor_t2)
     return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), branch
 
-def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=10.0, swing_low=None, trend_confirmed=False):
+def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=30.0, swing_low=None, trend_confirmed=False):
     """
     【單一防守線權威來源，V2.11.9新增，V2.11.10擴充Trend Runner多方法，V2.11.17改為三層防守，
     V2.11.18把Level1→2切換條件改為「趨勢是否形成」】
@@ -1460,7 +1564,10 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
         防守線 = max(previous_stop, cost−2×ATR)，趨勢還沒走出來前用最保守的固定緩衝，
         不做任何結構分析（此時價格結構還不夠明確，用結構支撐容易被雜訊洗）
 
-      Level 2「Structural Stop」：trend_confirmed 為 True，但獲利還沒到 profit_trigger_pct（預設10%）
+      Level 2「Structural Stop」：trend_confirmed 為 True，但獲利還沒到 profit_trigger_pct（V2.11.19
+        起預設30%，依你的指示從10%調高——原本10%太早就切進最緊的貼身防守，容易在正常回檔time
+        把趨勢股洗出場，犧牲「讓利潤奔跑」的精神。調高後結構防守的持有時間拉長，趨勢股有更多
+        空間走完整段行情，才會進入Level 3的緊縮保護）
         趨勢已經確認形成（例如站上MA20、均線多頭排列——沿用你系統既有SOP三燈的「趨勢燈」定義，
         不是另外發明一套新邏輯），但獲利還不多，還沒到「重兵保護」的程度：
         candidate = max(MA20−ATR, 波段低點(swing_low，若有提供))
@@ -1468,12 +1575,19 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
         （只用結構性方法，不用「現價−1.5×ATR」這種貼近現價的緊縮方法——趨勢剛確認、獲利還不多，
         不需要為了保護還沒賺到的利潤而把防守線收得太緊，避免正常回檔就被洗出去）
 
-      Level 3「Profit Protection Stop」：獲利 ≥ profit_trigger_pct（預設10%，不論 trend_confirmed
-        當下是True還是False——已經到手的獲利要優先保護，不因為趨勢燈臨時熄滅就放鬆防守）
+      Level 3「Profit Protection Stop」：獲利 ≥ profit_trigger_pct（V2.11.19起預設30%，不論
+        trend_confirmed 當下是True還是False——已經到手的獲利要優先保護，不因為趨勢燈臨時熄滅
+        就放鬆防守）
         candidate = max(MA20−ATR, 波段低點(swing_low，若有提供), 現價−1.5×ATR)
         new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
         （沿用V2.11.10「Trend Runner」三方法取最大值，加入「現價−1.5×ATR」這種貼近現價、
         鎖住最多獲利的候選方法）
+
+    【V2.11.19重要澄清】這裡的 profit_trigger_pct 跟 calculate_target_plan() 裡同名的
+    profit_trigger_pct 是兩個完全獨立的參數（各自函式自己的預設值，不是共用同一個全域常數）：
+    這裡的門檻只決定「防守線什麼時候收緊」，calculate_target_plan() 的門檻只決定「T1/T2什麼時候
+    開始真正計算」——依你的指示，這次只調高這裡（防守線），T1/T2的10%門檻維持不變。調整其中一個
+    不會影響另一個。
 
     trend_confirmed 建議直接傳入 SOP三燈裡的「趨勢燈」（indicators["trend_gate"]，定義為
     price>MA20 且 MA10>MA20>MA60），這是系統既有、每天都會算的判斷，不是新發明的獨立邏輯，
@@ -1682,6 +1796,18 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
       量價確認：當日成交量 ≥ 5日均量×1.5，突破沒有放量的話容易是誘多，不核准建立計畫
       MACD確認：柱狀體要是「正值」或「翻紅第1根」才算真正確認，不只是「不逆風」這種消極不擋
     這兩項資料不足（volume/vol_ma5缺失、MACD資料不足）時視為中性通過，不會誤擋新股或資料不全的情況。
+
+    【V2.11.22移除，真實P0 bug修復】原本這裡還有一道「r1（風報比）>=1.5」的進場前預檢，這道關卡
+    在數學上永遠不可能通過，等於整個「偵測全新突破」功能自V2.11.9這道關卡加入後就完全失效——
+    原因是：突破價定義為「前高×1.005」，而這道預檢拿「同一個前高」去找目標價，前高必然小於
+    「前高×1.005」，導致目標價永遠掉進備援公式（突破價+2×ATR），跟停損距離（突破價−2×ATR算出
+    的2×ATR風險）相除，永遠精確等於1.0，永遠小於1.5門檻，entry_gate_pass永遠是False，
+    calculate_entry_plan()永遠回傳None，沒有任何一筆新交易計畫能被建立。
+
+    跟你討論後決定拿掉這道關卡（而不是修補回溯窗口）：因為「剛突破的當下」本來就無法预先知道
+    後續會漲到哪，硬要在進場前算出一個「進場後才會知道」的報酬數字，本來就是在編造精確度；
+    值不值得，交給進場後持續運作的T1/T2（V2.11.18已改為R倍數+前高混合）跟分批停利機制動態決定，
+    比在進場前用一個結構性有瑕疵的公式一次性判死刑更合理。
     """
     price = _safe_float(indicators.get("price"))
     atr = _safe_float(indicators.get("atr"))
@@ -1700,7 +1826,6 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
 
     entry_gate_pass = bool(
         indicators.get("trend_gate") and indicators.get("chip_gate") and indicators.get("volume_gate")
-        and (indicators.get("r1") is not None and indicators.get("r1") >= 1.5)
         and indicators.get("market_regime") != "BEARISH"
         and not macd_blocks_entry
         and volume_confirms
@@ -2018,6 +2143,358 @@ def process_view_only(old_plan):
     不修改T1/T2、不修改防守線、不重複產生加碼/停利建議。
     """
     return dict(old_plan)
+
+# ===== V2.11.22 新增：策略回測引擎（P2）=====
+# 目的：把歷史資料逐日餵給「跟即時系統完全相同」的決策函式（calculate_daily_score／
+# calculate_entry_plan／evaluate_trade_state／calculate_exit_plan），重演系統過去每一天會做出
+# 的判斷，統計出勝率、Profit Factor、Expectancy 等真正有意義的數字，取代「猜參數」。
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_backtest_indicator_frame(code, years=2):
+    """
+    抓取單一股票的歷史OHLCV，算出回測需要的完整「因果」（只看過去、不看未來）指標序列。
+    ticker判斷邏輯沿用 fetch_stock_data_extended()，確保跟即時系統抓到同一個標的。
+    所有指標都用 rolling/ewm（天生只看過去）向量化算好整段序列一次，等同於「每天用當天以前的
+    資料重新算一次」，但快非常多——這是安全的，因為 pandas 的 rolling().mean() 在第 t 列只會
+    用到第 t 列以前(含)的資料，不會偷看未來。
+
+    回傳 (df, raw, error)：df 是處理過的因果指標框（小寫欄位），raw 是原始 yfinance 格式
+    （大寫Open/High/Low/Close，供 MACDStrategyAnalyzer 直接使用），error 是失敗原因文字。
+    """
+    try:
+        is_us = code.isalpha() or code.endswith('.US')
+        period = f"{years}y" if years != 2 else "2y"
+        if is_us:
+            raw = yf.download(code.replace('.US', ''), period=period, progress=False)
+        elif code.endswith('.TW') or code.endswith('.TWO'):
+            raw = yf.download(code, period=period, progress=False)
+        else:
+            raw = yf.download(f"{code}.TW", period=period, progress=False)
+            if raw is None or raw.empty:
+                raw = yf.download(f"{code}.TWO", period=period, progress=False)
+        raw = _trim_trailing_nan_rows(raw)
+        if raw is None or raw.empty or len(raw) < 90:
+            return None, None, f"歷史資料不足（僅{0 if raw is None else len(raw)}筆，至少需要90筆才能起算）"
+
+        c, h, l, o = raw['Close'].squeeze(), raw['High'].squeeze(), raw['Low'].squeeze(), raw['Open'].squeeze()
+        v = raw.get('Volume', pd.Series(0, index=raw.index)).squeeze()
+        if isinstance(c, pd.DataFrame): c, h, l, o, v = c.iloc[:, 0], h.iloc[:, 0], l.iloc[:, 0], o.iloc[:, 0], v.iloc[:, 0]
+
+        df = pd.DataFrame(index=raw.index)
+        df['open'], df['high'], df['low'], df['close'], df['volume'] = o, h, l, c, v
+        df['ma10'] = c.rolling(10).mean()
+        df['ma20'] = c.rolling(20).mean()
+        df['ma60'] = c.rolling(60).mean()
+        df['atr'] = calc_atr_series(h, l, c, period=14)
+        df['vol_ma5'] = v.rolling(5).mean()
+        k_series, d_series = calc_kd(h, l, c)
+        df['k'], df['d'] = k_series, d_series
+        delta = c.diff()
+        up = delta.clip(lower=0).rolling(14).mean()
+        down = -1 * delta.clip(upper=0).rolling(14).mean()
+        df['rsi'] = 100 - (100 / (1 + (up / (down + 0.001))))
+        dif, _dea, _osc = calc_macd_full_series(c)
+        df['macd'] = dif
+        df['bias'] = (c - df['ma60']) / df['ma60'] * 100
+        # previous_high／swing_low：跟即時系統 h.iloc[-61:-1]／l.iloc[-21:-1]（過去N天不含今日）
+        # 邏輯完全一致，改用 rolling+shift 向量化寫法
+        df['previous_high'] = h.rolling(60).max().shift(1)
+        df['swing_low'] = l.rolling(20).min().shift(1)
+        df['pivot_point'] = (h.shift(1) + l.shift(1) + c.shift(1)) / 3
+        df['is_us_stock'] = is_us
+        return df, raw, None
+    except Exception as e:
+        return None, None, str(e)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_institutional_history(code, years=2):
+    """
+    【回測專用】TW股法人籌碼歷史重建。即時系統的 get_institutional_data() 寫死只抓「最近30天」，
+    沒辦法回答「兩年前某一天法人連買幾天」。這裡改成一次抓整個回測區間的原始法人買賣超資料，
+    用跟 get_institutional_data() 裡 calc_trend() 完全同樣的規則（net_buy>0且streak>=0則
+    streak+=1；net_buy<0且streak<=0則streak-=1；規則被打破就從新的一天重新起算），改寫成正向
+    掃描（由舊到新），一次算出每一天的 days／accumulated_shares，數學上等效於「如果那天呼叫
+    get_institutional_data()會得到的答案」，只是一次性抓取＋本地計算，避免對FinMind API發出
+    數千次請求。美股不使用籌碼資料（回傳空表），跟 get_institutional_data() 對美股的行為一致。
+    """
+    is_us = code.isalpha() or code.endswith('.US')
+    if is_us:
+        return pd.DataFrame(columns=['days', 'accumulated_shares']), None
+    try:
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=int(years * 365.25) + 30)).strftime("%Y-%m-%d")
+        _plain_code = code.replace('.TW', '').replace('.TWO', '')
+        url = "https://api.finmindtrade.com/api/v4/data"
+        parameter = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "data_id": _plain_code, "start_date": start_date, "end_date": end_date}
+        resp = requests.get(url, params=parameter, timeout=15)
+        data = resp.json()
+        if data.get("msg") != "success" or not data.get("data"):
+            return pd.DataFrame(columns=['days', 'accumulated_shares']), "FinMind無資料或請求失敗"
+
+        df_inst = pd.DataFrame(data["data"])
+        df_inst['net_buy'] = df_inst['buy'] - df_inst['sell']
+        daily_net = df_inst.groupby('date')['net_buy'].sum().sort_index(ascending=True)
+
+        days, accumulated_shares = 0, 0.0
+        rows = []
+        for date_key, net_buy in daily_net.items():
+            net_buy = float(net_buy)
+            if net_buy > 0 and days >= 0:
+                days += 1; accumulated_shares += net_buy
+            elif net_buy < 0 and days <= 0:
+                days -= 1; accumulated_shares += net_buy
+            else:
+                days = 1 if net_buy > 0 else (-1 if net_buy < 0 else 0)
+                accumulated_shares = net_buy
+            rows.append({'date': date_key, 'days': days, 'accumulated_shares': accumulated_shares})
+        out = pd.DataFrame(rows).set_index('date')
+        out.index = pd.to_datetime(out.index)
+        return out, None
+    except Exception as e:
+        return pd.DataFrame(columns=['days', 'accumulated_shares']), str(e)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_regime_history(years=2):
+    """
+    【回測專用】抓取 ^TWII／^IXIC／^VIX 的歷史 price／MA20，回傳格式對齊 fetch_macro_data()
+    （只是整段歷史區間，不是只有「現在」）。刻意不在這裡就先算出 regime score——讓
+    evaluate_trade_state() 內部照樣呼叫 _regime_is_bearish()→calculate_regime_score()，
+    用跟即時系統完全相同的呼叫鏈，這裡只準備原始輸入，不重複計算分數邏輯本身。
+    """
+    try:
+        period = f"{years}y" if years != 2 else "2y"
+        tickers = {'TW': '^TWII', 'US': '^IXIC', 'VIX': '^VIX'}
+        raw = {}
+        for key, symbol in tickers.items():
+            _df = yf.download(symbol, period=period, progress=False)
+            _df = _trim_trailing_nan_rows(_df)
+            if _df is None or _df.empty:
+                return None, f"{key}({symbol}) 歷史資料抓取失敗"
+            _c = _df['Close'].squeeze()
+            if isinstance(_c, pd.DataFrame): _c = _c.iloc[:, 0]
+            raw[key] = pd.DataFrame({'price': _c, 'ma20': _c.rolling(20).mean()})
+        all_dates = raw['TW'].index.union(raw['US'].index).union(raw['VIX'].index)
+        for key in raw:
+            raw[key] = raw[key].reindex(all_dates).ffill()
+        merged = pd.DataFrame(index=all_dates)
+        for key in raw:
+            merged[f'{key}_price'] = raw[key]['price']
+            merged[f'{key}_ma20'] = raw[key]['ma20']
+        return merged.sort_index(), None
+    except Exception as e:
+        return None, str(e)
+
+def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000.0, risk_pct=5.0):
+    """
+    對單一股票逐日重演狀態機。核心原則：
+      - 每一天只看得到「當天以前」的資料（ind_df每一列本身就是因果的，rolling/ewm天生只看過去）
+      - 呼叫跟即時系統完全同一套函式（calculate_daily_score／calculate_entry_plan／
+        evaluate_trade_state／calculate_exit_plan），不另外寫一份簡化邏輯
+      - 訊號在「今天收盤」產生，用「隔天開盤價」模擬實際成交，對齊你系統「盤後決策、隔日執行」
+        的定位
+      - qty／cost 是這個函式自己管理的模擬帳本，不會動到真實的 Google Sheet
+
+    回傳 (trades, error)：trades 是完整交易記錄的 list of dict；error 是中途失敗原因（若有）。
+    """
+    try:
+        plan = _trade_plan_defaults(code)
+        qty, cost = 0, 0.0
+        is_us_stock = bool(ind_df['is_us_stock'].iloc[0]) if len(ind_df) else False
+        trades = []
+        open_trade = None
+
+        dates = ind_df.index
+        warmup = 60
+        n = len(dates)
+        for i in range(warmup, n - 1):
+            row = ind_df.iloc[i]
+            if pd.isna(row[['ma10', 'ma20', 'ma60', 'atr', 'k', 'd', 'rsi']]).any():
+                continue
+            price = float(row['close'])
+            today = dates[i]
+            next_open = float(ind_df.iloc[i + 1]['open'])
+            if pd.isna(next_open) or next_open <= 0:
+                continue
+            today_str = today.strftime('%Y-%m-%d')
+
+            if not is_us_stock and today in inst_df.index:
+                inst = {'days': int(inst_df.loc[today, 'days']), 'accumulated_shares': float(inst_df.loc[today, 'accumulated_shares'])}
+            else:
+                inst = {'days': 0, 'accumulated_shares': 0.0}  # 跟 get_institutional_data() 失敗時的預設值一致
+
+            if regime_df is not None and today in regime_df.index:
+                rr = regime_df.loc[today]
+                market_context = {
+                    'TW': {'price': float(rr['TW_price']), 'ma20': float(rr['TW_ma20'])},
+                    'US': {'price': float(rr['US_price']), 'ma20': float(rr['US_ma20'])},
+                    'VIX': {'price': float(rr['VIX_price']), 'ma20': float(rr['VIX_ma20'])},
+                }
+            else:
+                market_context = {'TW': {}, 'US': {}, 'VIX': {}}
+
+            # MACD日線訊號：用跟即時系統同一個 MACDStrategyAnalyzer，餵入「截至今天」的原始OHLCV
+            _slice = raw_df.iloc[:i + 1]
+            _macd_result = macd_analyzer.analyze(code, code, _slice, "日線") if len(_slice) >= macd_analyzer.min_bars else None
+            macd_osc_status = _macd_result.osc_status if _macd_result else None
+            macd_divergence_type = _macd_result.divergence_type if _macd_result else None
+
+            atr, ma20, ma60, ma10 = float(row['atr']), float(row['ma20']), float(row['ma60']), float(row['ma10'])
+            previous_high = float(row['previous_high']) if not pd.isna(row['previous_high']) else price
+            swing_low = float(row['swing_low']) if not pd.isna(row['swing_low']) else 0.0
+
+            t1, t2, _branch = calculate_target_plan(price, cost, atr, previous_high, is_us_stock,
+                                                      entry_price=plan.get('entry_price'), initial_stop=plan.get('initial_stop'))
+            trend_confirmed = price > ma20 and (ma10 > ma20 > ma60)
+            prev_stop_for_calc = plan.get('current_trailing_stop') or plan.get('initial_stop')
+            atr_stop_price, _stop_source = calculate_stop_plan(price, cost, atr, ma20, prev_stop_for_calc, swing_low=swing_low, trend_confirmed=trend_confirmed)
+
+            _score = calculate_daily_score(
+                price, cost, ma10, ma20, ma60, float(row['macd']), float(row['bias']),
+                float(row['k']), float(row['d']), float(row['rsi']), float(row['volume']), float(row['vol_ma5']),
+                atr_stop_price, t1, float(row['pivot_point']) if not pd.isna(row['pivot_point']) else price, inst, is_us_stock,
+                tw_bearish=bool(market_context['TW'].get('price', 1) < market_context['TW'].get('ma20', 0)) if market_context['TW'] else False,
+                us_bearish=bool(market_context['US'].get('price', 1) < market_context['US'].get('ma20', 0)) if market_context['US'] else False,
+                vix_high=bool(market_context.get('VIX', {}).get('price', 0) >= 25),
+            )
+            decision_score = _score['ai_score']
+
+            # 【V2.11.22移除】原本這裡算的「進場用R1」在數學上永遠精確等於1.0（見
+            # calculate_entry_plan docstring 的完整推導），已跟即時系統同步拿掉這道預檢，
+            # 這裡也同步不再計算，直接傳 None，跟即時系統維持同一套邏輯。
+            _entry_r1 = None
+
+            indicators = {
+                "code": code, "price": price, "atr": atr, "ma20": ma20, "previous_high": previous_high,
+                "decision_score": decision_score, "trend_gate": _score['step3_pass'], "chip_gate": _score['step1_pass'],
+                "volume_gate": _score['step2_pass'], "r1": _entry_r1, "is_us_stock": is_us_stock, "data_date": today_str,
+                "macd_osc_status": macd_osc_status, "macd_divergence_type": macd_divergence_type,
+                "swing_low": swing_low, "volume": float(row['volume']), "vol_ma5": float(row['vol_ma5']),
+                "prev_close": float(ind_df.iloc[i - 1]['close']) if i > 0 else price,
+            }
+            portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": qty,
+                               "available_cash": max(0.0, cap - qty * price), "addon_quality_gate": True, "confidence_multiplier": 1.0}
+
+            new_plan = evaluate_trade_state(plan, indicators, market_context, portfolio_info)
+            state = new_plan.get('state')
+
+            if state == 'ENTER_NEXT_DAY':
+                fill_qty = int(new_plan.get('suggested_shares', 0))
+                if fill_qty > 0:
+                    qty, cost = fill_qty, next_open
+                    open_trade = {'code': code, 'entry_date': dates[i + 1], 'entry_price': next_open,
+                                   'breakout_quality_score': new_plan.get('breakout_quality_score', 0),
+                                   'retest_quality': '', 'adds': 0, 'partial_exits': []}
+                    new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
+                else:
+                    new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
+            elif state == 'ADD_NEXT_DAY':
+                add_qty = int(new_plan.get('addon_shares_approved', 0))
+                if add_qty > 0 and qty > 0:
+                    new_cost = (cost * qty + next_open * add_qty) / (qty + add_qty)
+                    qty, cost = qty + add_qty, new_cost
+                    if open_trade: open_trade['adds'] += 1
+                new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
+            elif state == 'PARTIAL_EXIT_NEXT_DAY':
+                exit_qty = min(int(new_plan.get('partial_exit_shares', 0)), qty)
+                if exit_qty > 0:
+                    if open_trade: open_trade['partial_exits'].append({'date': dates[i + 1], 'price': next_open, 'qty': exit_qty})
+                    qty -= exit_qty
+                new_plan = dict(new_plan)
+                new_plan['state'] = 'HOLD' if qty > 0 else 'PREPARE'
+            elif state == 'FULL_EXIT_NEXT_DAY':
+                if open_trade and qty > 0:
+                    open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[i + 1], next_open, qty
+                    open_trade['exit_reason'] = new_plan.get('signal_reason', '')
+                    trades.append(open_trade)
+                open_trade = None
+                qty, cost = 0, 0.0
+                new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
+
+            plan = new_plan
+
+        # 回測結束時仍持有部位：以最後一天收盤價強制平倉結算，不然這筆交易無法統計進報表
+        if open_trade and qty > 0:
+            open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[-1], float(ind_df.iloc[-1]['close']), qty
+            open_trade['exit_reason'] = '回測結束強制平倉（尚未實際出場）'
+            trades.append(open_trade)
+
+        return trades, None
+    except Exception as e:
+        return [], str(e)
+
+def _aggregate_backtest_trades(trade):
+    """把一筆 open_trade 記錄（含分批加碼/分批出場）換算成單筆交易的績效指標。"""
+    entry_price = trade['entry_price']
+    exit_price = trade['exit_price']
+    holding_days = (pd.Timestamp(trade['exit_date']) - pd.Timestamp(trade['entry_date'])).days
+    pnl_pct = (exit_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+    t1_hit = len(trade.get('partial_exits', [])) >= 1
+    t2_hit = len(trade.get('partial_exits', [])) >= 2
+    return {
+        'code': trade['code'], 'entry_date': trade['entry_date'], 'exit_date': trade['exit_date'],
+        'entry_price': entry_price, 'exit_price': exit_price, 'pnl_pct': pnl_pct,
+        'holding_days': holding_days, 'adds': trade.get('adds', 0), 'partial_exits': len(trade.get('partial_exits', [])),
+        't1_hit': t1_hit, 't2_hit': t2_hit, 'breakout_quality_score': trade.get('breakout_quality_score', 0),
+        'exit_reason': trade.get('exit_reason', ''), 'win': pnl_pct > 0,
+    }
+
+def calculate_backtest_metrics(trades_df):
+    """
+    P2回測指標（規格書三十五節12個問題的具體實作）：勝率／平均獲利／平均虧損／Profit Factor／
+    Expectancy／平均持有天數／T1命中率／T2命中率／停損率（虧損出場佔比）。
+    最大回撤（基於逐筆交易累積報酬%的簡化權益曲線，不是真實資金回撤，見UI端的說明文字）跟
+    假突破率（P2-9，需要對照 BREAKOUT_FAILED 狀態，這次先不含在這份指標裡，等下一輪擴充）。
+    """
+    if trades_df is None or trades_df.empty:
+        return None
+    wins = trades_df[trades_df['win']]
+    losses = trades_df[~trades_df['win']]
+    win_rate = len(wins) / len(trades_df) * 100
+    avg_win = wins['pnl_pct'].mean() if len(wins) > 0 else 0.0
+    avg_loss = losses['pnl_pct'].mean() if len(losses) > 0 else 0.0
+    gross_profit = wins['pnl_pct'].sum() if len(wins) > 0 else 0.0
+    gross_loss = abs(losses['pnl_pct'].sum()) if len(losses) > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf') if gross_profit > 0 else 0.0
+    expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
+    equity_curve = (1 + trades_df.sort_values('exit_date')['pnl_pct'] / 100).cumprod()
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max * 100
+    max_drawdown = drawdown.min() if len(drawdown) > 0 else 0.0
+    return {
+        'total_trades': len(trades_df), 'win_rate': win_rate, 'avg_win_pct': avg_win, 'avg_loss_pct': avg_loss,
+        'profit_factor': profit_factor, 'expectancy_pct': expectancy, 'avg_holding_days': trades_df['holding_days'].mean(),
+        't1_hit_rate': trades_df['t1_hit'].mean() * 100, 't2_hit_rate': trades_df['t2_hit'].mean() * 100,
+        'stop_rate': (1 - win_rate / 100) * 100, 'max_drawdown_pct': max_drawdown, 'equity_curve': equity_curve,
+    }
+
+def run_backtest(codes, years=2, progress_callback=None):
+    """
+    回測總入口。逐檔抓資料、逐檔重演狀態機，任何單一股票失敗都不會中斷整批回測（跟即時系統
+    main loop的個股try/except防護原則一致）。回傳 (trades_df, metrics, errors)。
+    """
+    regime_df, regime_err = _fetch_regime_history(years)
+    all_trades = []
+    errors = {}
+    for idx, code in enumerate(codes):
+        if progress_callback:
+            progress_callback(idx, len(codes), code)
+        ind_df, raw_df, err = _fetch_backtest_indicator_frame(code, years)
+        if err:
+            errors[code] = f"股價資料：{err}"; continue
+        inst_df, inst_err = _fetch_institutional_history(code, years)
+        if inst_err and not (code.isalpha() or code.endswith('.US')):
+            errors[code] = f"籌碼資料：{inst_err}（仍會繼續回測，籌碼燈這段期間會偏保守判定不過關）"
+        trades, sim_err = _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df)
+        if sim_err:
+            errors.setdefault(code, ""); errors[code] += f" 模擬失敗：{sim_err}"
+            continue
+        for t in trades:
+            all_trades.append(_aggregate_backtest_trades(t))
+    trades_df = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
+    metrics = calculate_backtest_metrics(trades_df) if not trades_df.empty else None
+    if regime_err:
+        errors['__regime__'] = f"市場燈號歷史資料：{regime_err}（仍會繼續回測，市場燈號這段期間會視為中性）"
+    return trades_df, metrics, errors
 
 portfolio, system_history, trade_plan_data, today_str = load_portfolio(), load_history(), load_trade_plan(), datetime.datetime.now().strftime("%Y-%m-%d")
 migrate_trade_plan_sheet()
@@ -2584,6 +3061,79 @@ _mode_display = {"TAIWAN_CLOSE_UPDATE": "🇹🇼 台股收盤更新", "US_CLOSE
 st.caption(f"⚙️ 執行模式：**{_mode_display.get(execution_mode, execution_mode)}** ｜台股資料日期：{latest_tw_date or 'N/A'}｜美股資料日期：{latest_us_date or 'N/A'}｜市場燈號：{market_regime_label}｜上次已保存：台{saved_tw_date or 'N/A'} / 美{saved_us_date or 'N/A'}｜版本：{APP_VERSION}")
 st.divider()
 
+# --- 5-1. 策略回測（P2，V2.11.23新增）---
+with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套策略到底有沒有用", expanded=False):
+    st.caption(
+        "逐日重演過去2年的歷史資料，呼叫跟即時系統完全同一套決策函式（不是另外寫一份簡化邏輯），"
+        "統計出勝率、Profit Factor、Expectancy等真正的績效數字。**這裡跑的是模擬帳本，不會動到你"
+        "真實的 Google Sheet 持股/交易計畫資料。** 抓取歷史資料需要連網，一次跑完全部股票可能需要"
+        "數分鐘，請耐心等待，不要中途重新整理頁面。"
+    )
+    _bt_default_codes = sorted(set(list(trade_plan_data.keys()) + list(portfolio.keys())))
+    _bt_codes_input = st.text_area(
+        "回測股票代碼（逗號分隔，預設帶入你目前追蹤過的所有代碼）",
+        value=", ".join(_bt_default_codes), height=80, key="bt_codes_input"
+    )
+    _bt_run = st.button("🚀 開始回測", key="bt_run_button")
+
+    if _bt_run:
+        _bt_codes = [c.strip() for c in _bt_codes_input.split(",") if c.strip()]
+        if not _bt_codes:
+            st.warning("請至少輸入一檔股票代碼。")
+        else:
+            _bt_progress = st.progress(0, text="準備中...")
+            _bt_status = st.empty()
+
+            def _bt_progress_cb(idx, total, code):
+                _bt_progress.progress((idx + 1) / total, text=f"正在回測第 {idx + 1}/{total} 檔：{code}")
+
+            with st.spinner("回測執行中，請勿關閉頁面..."):
+                _bt_trades_df, _bt_metrics, _bt_errors = run_backtest(_bt_codes, years=2, progress_callback=_bt_progress_cb)
+            _bt_progress.progress(1.0, text="回測完成")
+
+            if _bt_errors:
+                with st.expander(f"⚠️ {len(_bt_errors)} 項資料抓取問題（不影響其他股票的回測結果）", expanded=False):
+                    for _code, _msg in _bt_errors.items():
+                        st.write(f"- **{_code}**：{_msg}")
+
+            if _bt_metrics is None:
+                st.info("這個範圍內沒有產生任何完整交易，可能是股票清單太少、資料不足，或這段期間確實沒有符合條件的訊號。")
+            else:
+                st.subheader("📈 績效總覽")
+                _m1, _m2, _m3, _m4 = st.columns(4)
+                _m1.metric("總交易筆數", f"{_bt_metrics['total_trades']}")
+                _m1.metric("勝率", f"{_bt_metrics['win_rate']:.1f}%")
+                _m2.metric("平均獲利", f"{_bt_metrics['avg_win_pct']:.1f}%")
+                _m2.metric("平均虧損", f"{_bt_metrics['avg_loss_pct']:.1f}%")
+                _m3.metric("Profit Factor", f"{_bt_metrics['profit_factor']:.2f}" if _bt_metrics['profit_factor'] != float('inf') else "∞（無虧損交易）")
+                _m3.metric("Expectancy（期望值）", f"{_bt_metrics['expectancy_pct']:.2f}%")
+                _m4.metric("平均持有天數", f"{_bt_metrics['avg_holding_days']:.0f} 天")
+                _m4.metric("最大回撤", f"{_bt_metrics['max_drawdown_pct']:.1f}%")
+                st.caption(
+                    f"T1命中率：{_bt_metrics['t1_hit_rate']:.1f}%　｜　T2命中率：{_bt_metrics['t2_hit_rate']:.1f}%　｜　"
+                    f"停損/虧損出場率：{_bt_metrics['stop_rate']:.1f}%"
+                )
+                st.caption(
+                    "⚠️ 最大回撤是用「逐筆交易累積報酬率」算出的簡化權益曲線，不是真實資金逐日回撤"
+                    "（沒有考慮同時持有多檔部位的資金排擠、也沒有考慮交易成本/滑價，屬於P2-2/P2-3尚未實作範圍，"
+                    "見說明書第14節）。"
+                )
+
+                st.subheader("📉 權益曲線（模擬，逐筆交易累積報酬率）")
+                st.line_chart(_bt_metrics['equity_curve'])
+
+                st.subheader("📋 交易明細")
+                _bt_display_df = _bt_trades_df.sort_values('exit_date', ascending=False).copy()
+                _bt_display_df['entry_date'] = pd.to_datetime(_bt_display_df['entry_date']).dt.strftime('%Y-%m-%d')
+                _bt_display_df['exit_date'] = pd.to_datetime(_bt_display_df['exit_date']).dt.strftime('%Y-%m-%d')
+                st.dataframe(_bt_display_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ 下載完整交易明細（CSV）",
+                    data=_bt_trades_df.to_csv(index=False).encode('utf-8-sig'),
+                    file_name=f"backtest_trades_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                )
+
 if not portfolio:
     if not PORTFOLIO_LOAD_OK:
         st.error("🛡️ 安全模式：持股資料本次讀取失敗，為避免用錯誤/空白資料跑分析或誤判「你目前沒有任何持股」，本次不顯示任何分析結果。請確認 Google Sheets 連線與服務帳號權限後，重新整理頁面重試。")
@@ -2755,37 +3305,22 @@ else:
                 r1, r2 = None, None
             risk_reward_ratio = r1  # 保留舊變數名，供既有「🟢進場但風報比<1」警示邏輯使用（對照T1）
 
-            score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0) if is_us_stock else min(inst['days'] * 5, 20) + (20 if inst['accumulated_shares'] * price >= 3000000000 else (10 if inst['accumulated_shares'] * price >= 1000000000 else 0))
-            # 【V2.10.7 修正】RSI>50 原本無條件+10分，但 RSI 極度過熱時（>80）已經是短線反轉風險區，
-            # 不該再算作「健康的偏多確認」，所以把這個加分的上限收窄到 50~80 之間；
-            # RSI 對趨勢分數的貢獻在 >80 時歸零，避免系統在超買區還持續給高分。
-            _rsi_bull_point = 10 if (rsi > 50 and rsi <= 80) else 0
-            score_tech = (10 if k > d else 0) + _rsi_bull_point + (10 if price > ma20 else 0)
-            score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
-            score_risk = (10 if price > atr_stop_price else 0) + (5 if price >= take_profit_price or price >= cost * 1.05 else 0) if cost > 0 else 15
-
+            # 【V2.11.21】改呼叫抽出來的 calculate_daily_score()，純函式重構，數字跟改版前逐行一致，
+            # 目的是讓回測引擎能呼叫同一份公式，不會有UI跟回測各自維護一份、算出不同答案的風險。
+            _score_result = calculate_daily_score(
+                price, cost, ma10, ma20, ma60, macd, bias, k, d, rsi, volume, vol_ma5,
+                atr_stop_price, take_profit_price, pivot_point, inst, is_us_stock,
+                tw_bearish=bool(tw_trend and "空頭" in tw_trend.get('trend', '')),
+                us_bearish=bool(us_trend and "空頭" in us_trend.get('trend', '')),
+                vix_high=bool(vix_trend and vix_trend.get('price', 0) > 25),
+            )
+            ai_score, confidence = _score_result["ai_score"], _score_result["confidence"]
+            step1_pass, step2_pass, step3_pass = _score_result["step1_pass"], _score_result["step2_pass"], _score_result["step3_pass"]
+            macro_warnings, is_bull_aligned = _score_result["macro_warnings"], _score_result["is_bull_aligned"]
+            score_inst, score_tech = _score_result["score_inst"], _score_result["score_tech"]
+            score_vol, score_risk = _score_result["score_vol"], _score_result["score_risk"]
             score_forced_zero = bool(cost > 0 and price <= atr_stop_price)
-            ai_score = 0 if score_forced_zero else min(int(score_inst + score_tech + score_vol + score_risk), 100)
-            is_bull_aligned = (ma10 > ma20 and ma20 > ma60)
-            confidence_base = ai_score * 0.8 + (10 if is_bull_aligned else 0) + (5 if price > pivot_point else 0)
 
-            # 【V2.9 修正】多個宏觀警示同時觸發時，訊息會全部保留，不再被後面的條件覆蓋掉
-            macro_warnings = []
-            if is_us_stock:
-                if us_trend and "空頭" in us_trend.get('trend', ''):
-                    confidence_base *= 0.85
-                    macro_warnings.append("⚠️ 美股大盤跌破月線，系統主動下調部位信心。")
-                if vix_trend and vix_trend.get('price', 0) > 25:
-                    confidence_base *= 0.70
-                    macro_warnings.append("🚨 VIX 恐慌指數過高，系統強制抑制進場訊號！")
-            else:
-                if tw_trend and "空頭" in tw_trend.get('trend', ''):
-                    confidence_base *= 0.85
-                    macro_warnings.append("⚠️ 台股大盤跌破月線，逆勢操作風險較高。")
-
-            confidence = min(99, max(10, int(confidence_base)))
-            step1_pass = (price > ma60 and macd > 0) if is_us_stock else (inst['days'] >= 3 or inst['accumulated_shares'] * price >= 1000000000)
-            step2_pass, step3_pass = (k > d and rsi > 50 and volume > vol_ma5), (price > ma20 and is_bull_aligned)
 
             ai_advice = []
 
@@ -2933,23 +3468,17 @@ else:
             # 是同一個數字，不會因為兩處各自重算而有微小落差。
             _plan_previous_high = _t_previous_high
 
-            # 【修正①：進場R1不該借用「持有成本」算出來的舊r1】
-            # 上面的 r1（第1868~1874行）只有 cost>0（已持有）時才有值，空手股票永遠是 None。
-            # calculate_entry_plan() 的進場閘門要求 r1>=1.5，若沿用舊r1，等於空手股票永遠無法
-            # 通過進場閘門——整個「辨識新突破」的功能形同虛設。這裡改用「跟 calculate_entry_plan()
-            # 未來會算出的突破價/初始停損完全同一套基準」重新算一次進場專用R1：
-            #   突破價＝前高×1.005（跟 calculate_entry_plan 的 breakout_price 公式一致）
-            #   初始停損＝突破價－2×ATR（跟 calculate_entry_plan 的 initial_stop 公式一致）
-            #   T1＝用 calc_structural_target 在「突破價」這個基準點上算，而不是在「現價」上算，
-            #        避免現價離前高還很遠時，算出來的T1/風險距離失真。
-            _entry_breakout_price = round_to_tick(_plan_previous_high * 1.005, is_us_stock) if _plan_previous_high > 0 else price
-            if atr > 0 and _entry_breakout_price > 0:
-                _entry_initial_stop = _entry_breakout_price - 2 * atr
-                _entry_t1, _entry_t2, _entry_target_branch = calc_structural_target(h, _entry_breakout_price, atr)
-                _entry_risk_dist = _entry_breakout_price - _entry_initial_stop  # 恆等於 2×ATR
-                _entry_r1 = (_entry_t1 - _entry_breakout_price) / _entry_risk_dist if (_entry_risk_dist > 0 and _entry_t1 > _entry_breakout_price) else None
-            else:
-                _entry_r1 = None
+            # 【V2.11.22移除，真實P0 bug修復】原本這裡算的「進場專用R1」，用來餵給
+            # calculate_entry_plan() 的 r1>=1.5 進場前預檢。這個算法在數學上永遠精確等於1.0
+            # （因為突破價＝前高×1.005，而 calc_structural_target 用「同一個前高」當基準去找
+            # 目標價，前高必然小於突破價，永遠掉進「突破價+2×ATR」備援公式，跟「突破價−2×ATR」
+            # 的風險距離相除必然等於1.0），導致entry_gate_pass自V2.11.9這道關卡加入後就永遠是
+            # False，系統完全無法偵測任何新的突破訊號。詳見說明書第16節V2.11.22項目。
+            # 跟你討論後決定拿掉這道關卡本身（見 calculate_entry_plan 的docstring），而不是修補
+            # 這個結構性有瑕疵的預檢公式，所以這裡也不再需要算這個數字，直接不傳（None），
+            # calculate_breakout_quality_score() 會把 r1=None 當成「資料不足」給中性半分處理，
+            # 不會因為少了這個數字就誤判成低分。
+            _entry_r1 = None
 
             # 【V2.11.9】_old_plan 已經在前面（第2020行附近）算好並用於防守線/T1/T2計算，這裡不用重算。
             # 【MACD深度整合】把「日線」MACD結果讀出來，餵給交易計畫狀態機。用日線而不用週線，
