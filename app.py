@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.30"
+APP_VERSION = "V2.11.31"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -1738,7 +1738,7 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
     result.update({"next_state": "HOLD", "signal_reason": "持有續抱，移動防守線持續追蹤"})
     return result
 
-def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_value, breakout_margin_atr, decision_score):
+def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_atr_ratio, breakout_margin_atr, decision_score):
     """
     【V2.11.17新增，V2.11.30重新設計，Breakout Quality Engine（P1-1）】把 is_breakout_failed() 之外
     「這次突破強不強」的判斷，從 calculate_entry_plan() 原本的純布林關卡（過關/不過關）升級成
@@ -1763,8 +1763,10 @@ def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_value, breakout_m
         給滿分30分，超過2.5倍開始隨爆量程度扣分（最極端只會腰斬到15分，不會直接歸零，避免對真正
         強勢股一竿子打死，畢竟這只是參考分數不是關卡）
       - MACD動能強度（25分，取代原本永遠滿分的死欄位）：改用柱狀體OSC的實際數值（不是「正值/
-        翻紅」這種entry_gate已經篩過一次的分類），用ATR正規化後給分——「剛轉正、動能還很弱」跟
-        「動能已經很強」這兩種都能通過entry_gate的突破訊號，在這裡才真正被區分開來
+        翻紅」這種entry_gate已經篩過一次的分類），【V2.11.31修正】用ATR正規化後才給分（不是直接
+        用OSC原始數值——原始數值天生跟股價水位成正比，股價幾千元的股票OSC本來就比股價幾十元的
+        股票大，不正規化的話分數高低反映的是股價水位而不是動能強弱，是混淆因子）——「剛轉正、
+        動能還很弱」跟「動能已經很強」這兩種都能通過entry_gate的突破訊號，在這裡才真正被區分開來
       - 突破強度（25分，取代原本永遠固定10分的死欄位r1子項）：現價收在突破價之上多遠（用ATR
         正規化），收越高代表這次突破的確認力道越強，不是勉強擦線過關
       - 決策分數強度（20分，沿用不變）：decision_score 70（gate最低門檻）給10分，90以上給滿分
@@ -1773,9 +1775,10 @@ def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_value, breakout_m
     五級不是這裡的重點，先只回傳連續分數＋一個簡單的A/B/C/D字母評等（A≥80／B≥65／C≥50／D<50）。
     回傳 (score, grade, detail)，detail 是子分數明細 dict，方便顯示「這個分數是怎麼組成的」。
 
-    【需要人工確認的參數】量能甜蜜點的1.5~1.8倍區間、2.5倍衰減起點、MACD/突破強度的ATR正規化
-    倍數上限，全部都是初版經驗值，這次回測顯示的方向性只有45~55筆的小樣本，之後有更多回測資料
-    （尤其是用了新設計之後重新跑一輪）建議再校準一次，不要當成已經驗證過的最終版本。
+    【需要人工確認的參數】量能甜蜜點的1.5~1.8倍區間、2.5倍衰減起點、突破強度的1.0倍ATR滿分門檻、
+    MACD動能強度的0.4倍ATR滿分門檻（V2.11.31新增，OSC正規化後通常小於一整根ATR，這個門檻抓得比
+    突破強度更保守），全部都是初版經驗值，這次回測顯示的方向性只有45~55筆的小樣本，之後有更多
+    回測資料建議再校準一次，不要當成已經驗證過的最終版本。
     """
     def _lerp_score(value, lo, hi, max_pts, min_pts=0.0):
         if value is None:
@@ -1807,7 +1810,13 @@ def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_value, breakout_m
         vol_score = 15.0  # 資料缺失給甜蜜點區間中段偏低的中性值，不是滿分
 
     # ---- MACD動能強度（25分）：改用OSC實際數值，不是entry_gate已經篩過的分類 ----
-    macd_score = _lerp_score(abs(macd_osc_value) if macd_osc_value is not None else None, 0.0, 1.0, 25.0, min_pts=5.0)
+    # 【V2.11.31修正】原本直接用OSC的原始數值（價格單位）去對應0~1.0這個寫死的區間，但OSC的絕對
+    # 大小天生跟股價水位成正比——股價幾千元的股票（例如台光電、聯發科）OSC原始數值本來就會比
+    # 股價幾十元的股票大上好幾倍，分數高低反映的是「這檔股票股價多高」而不是「這次動能有多強」，
+    # 是一個混淆因子。改成跟 breakout_margin 同樣的做法：用ATR正規化，讓不同股價水位的股票可以
+    # 放在同一把尺上比較（OSC本身通常小於一整根ATR，所以這裡的滿分門檻抓得比breakout_margin更
+    # 保守，見下方【需要人工確認的參數】）。
+    macd_score = _lerp_score(macd_osc_atr_ratio, 0.0, 0.4, 25.0, min_pts=5.0)
 
     # ---- 突破強度（25分）：現價收在突破價之上多少ATR ----
     breakout_score = _lerp_score(breakout_margin_atr, 0.0, 1.0, 25.0)
@@ -1898,8 +1907,12 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     # price可能還沒真的越過breakout_price（例如剛建立BREAKOUT_WAIT、還在等待階段），此時margin
     # 會是負值，calculate_breakout_quality_score內部的_lerp_score會把它壓到0分（尚無確認力道）。
     _breakout_margin_atr = (price - breakout_price) / atr if atr > 0 else None
+    # 【V2.11.31修正】macd_osc_value 是價格單位的原始數值，天生跟股價水位成正比，直接拿去打分數
+    # 會混淆「股價高低」跟「動能強弱」，這裡先用ATR正規化成跟breakout_margin同一把尺，才丟進去。
+    _macd_osc_value = indicators.get("macd_osc_value")
+    _macd_osc_atr_ratio = (abs(_macd_osc_value) / atr) if (_macd_osc_value is not None and atr > 0) else None
     _bq_score, _bq_grade, _bq_detail = calculate_breakout_quality_score(
-        indicators.get("volume"), _vol_ma5, indicators.get("macd_osc_value"), _breakout_margin_atr, decision_score)
+        indicators.get("volume"), _vol_ma5, _macd_osc_atr_ratio, _breakout_margin_atr, decision_score)
 
     return {
         "signal_type": "ENTRY", "entry_price": breakout_price, "breakout_price": breakout_price,
