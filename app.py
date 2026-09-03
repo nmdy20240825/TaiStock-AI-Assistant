@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.29"
+APP_VERSION = "V2.11.30"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -835,7 +835,7 @@ TRADE_PLAN_HEADERS = [
     "retest_min_price", "retest_quality",
     # 突破品質（V2.11.17新增，Breakout Quality Engine；V2.11.28補上四個子項，見說明書V2.11.28修復說明）
     "breakout_quality_score", "breakout_quality_grade",
-    "bq_volume", "bq_macd", "bq_r1", "bq_decision_score",
+    "bq_volume", "bq_macd", "bq_breakout_margin", "bq_decision_score",
     # 停利相關
     "t1_price", "t2_price", "t1_taken", "t2_taken", "partial_exit_ratio", "partial_exit_shares",
     # 出清相關
@@ -1090,7 +1090,7 @@ def _normalize_trade_plan_row(row):
               "invalid_price", "t1_price", "t2_price", "initial_stop", "previous_trailing_stop",
               "current_trailing_stop", "max_risk_amount", "used_risk_amount", "remaining_risk_amount",
               "retest_min_price", "breakout_quality_score",
-              "bq_volume", "bq_macd", "bq_r1", "bq_decision_score"]:
+              "bq_volume", "bq_macd", "bq_breakout_margin", "bq_decision_score"]:
         r[k] = _safe_float(r.get(k), 0.0)
     r["retest_quality"] = str(r.get("retest_quality", "") or "")
     r["breakout_quality_grade"] = str(r.get("breakout_quality_grade", "") or "")
@@ -1738,28 +1738,44 @@ def calculate_exit_plan(price, average_cost, atr, ma20, previous_trailing_stop, 
     result.update({"next_state": "HOLD", "signal_reason": "持有續抱，移動防守線持續追蹤"})
     return result
 
-def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_status, r1, decision_score):
+def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_value, breakout_margin_atr, decision_score):
     """
-    【V2.11.17新增，Breakout Quality Engine（P1-1）】把 is_breakout_failed() 之外「這次突破強不強」
-    的判斷，從 calculate_entry_plan() 原本的純布林關卡（過關/不過關）升級成 0~100 的連續分數，
-    純粹是「這次通過關卡的訊號有多強」的參考指標，**不是新的關卡**——entry_gate 有沒有通過、
-    要不要建立這筆計畫，完全不受這個分數影響，這裡只是替已經通過關卡的訊號多附上一個強度分數。
+    【V2.11.17新增，V2.11.30重新設計，Breakout Quality Engine（P1-1）】把 is_breakout_failed() 之外
+    「這次突破強不強」的判斷，從 calculate_entry_plan() 原本的純布林關卡（過關/不過關）升級成
+    0~100 的連續分數，純粹是「這次通過關卡的訊號有多強」的參考指標，**不是新的關卡**——entry_gate
+    有沒有通過、要不要建立這筆計畫，完全不受這個分數影響，這裡只是替已經通過關卡的訊號多附上一個
+    強度分數。
 
-    四個子分數（權重合計100）：
-      - 量能強度（35分）：當日成交量／5日均量，1.0倍以下0分，2.5倍以上滿分35分，中間線性內插；
-        vol_ma5缺失時給17.5分（半分，跟 calculate_entry_plan() 既有的「資料不足視為中性通過」一致）
-      - MACD動能強度（25分）：正值/翻紅第1根給滿分25分，收腳中給一半12.5分，翻黑/頂背離給0分
-        （理論上這兩種會先被entry_gate擋下，這裡是防禦性處理），資料不足給一半12.5分（同上，中性）
-      - 風報比強度（20分）：R1（風報比）1.5（gate最低門檻）給10分，3.0以上給滿分20分，中間線性內插
-      - 決策分數強度（20分）：decision_score 70（gate最低門檻）給10分，90以上給滿分20分，中間線性內插
+    【V2.11.30重新設計的原因】跑了兩輪真實回測（45~55筆交易）後，用逐項拆解發現舊版四個子項裡
+    有兩個是「死欄位」、一個是雜訊、一個方向是反的，總分完全沒有應有的判別力：
+      - 舊版「風報比子項」（20分）：V2.11.22已經把進場R1預檢整個拿掉，這個子項的輸入自此永遠是
+        None，55筆交易裡固定給10分，沒有任何一次例外——這20分對總分零貢獻
+      - 舊版「MACD子項」（25分）：entry_gate本身就已經要求MACD必須是「正值」或「翻紅第1根」才會
+        放行進場，代表能出現在計畫裡的每一筆交易，這個子項本來就已經被entry_gate篩過一次、永遠
+        滿分25——這25分本質上是在重複測試entry_gate已經測過的同一件事，對總分同樣零貢獻
+      - 舊版「量能子項」（35分，佔比最高）：假設「量能倍數越高分數越高」，但回測顯示相關係數是
+        負的（-0.305）——量能分數最高的10筆交易勝率只有20%，最低的10筆反而50%，方向整個是反的。
+        合理的推測（非確定因果）：極端爆量可能代表「衝刺竭盡／出貨」而非「健康承接」，原本的
+        線性假設本身就有問題
 
-    五級不是這裡的重點（保留給你決定要不要分級），先只回傳連續分數＋一個簡單的A/B/C/D字母評等
-    （A≥80／B≥65／C≥50／D<50），對齊你在畫面上想看到「86/100 A級」這種呈現方式。
+    這次改成三個真正有機會互相區分的子項（合計100分）：
+      - 量能甜蜜點（30分）：不再是「越大越好」，改成鐘形曲線——1.0倍以下0分，1.5~1.8倍區間最健康
+        給滿分30分，超過2.5倍開始隨爆量程度扣分（最極端只會腰斬到15分，不會直接歸零，避免對真正
+        強勢股一竿子打死，畢竟這只是參考分數不是關卡）
+      - MACD動能強度（25分，取代原本永遠滿分的死欄位）：改用柱狀體OSC的實際數值（不是「正值/
+        翻紅」這種entry_gate已經篩過一次的分類），用ATR正規化後給分——「剛轉正、動能還很弱」跟
+        「動能已經很強」這兩種都能通過entry_gate的突破訊號，在這裡才真正被區分開來
+      - 突破強度（25分，取代原本永遠固定10分的死欄位r1子項）：現價收在突破價之上多遠（用ATR
+        正規化），收越高代表這次突破的確認力道越強，不是勉強擦線過關
+      - 決策分數強度（20分，沿用不變）：decision_score 70（gate最低門檻）給10分，90以上給滿分
+        20分，中間線性內插
 
+    五級不是這裡的重點，先只回傳連續分數＋一個簡單的A/B/C/D字母評等（A≥80／B≥65／C≥50／D<50）。
     回傳 (score, grade, detail)，detail 是子分數明細 dict，方便顯示「這個分數是怎麼組成的」。
 
-    【需要人工確認的參數】量能2.5倍、R1的3.0、decision_score的90 這幾個「滿分」上限，都是初版
-    經驗值，建議依實際使用效果調整，跟 invalid_price 等既有參數屬於同一類。
+    【需要人工確認的參數】量能甜蜜點的1.5~1.8倍區間、2.5倍衰減起點、MACD/突破強度的ATR正規化
+    倍數上限，全部都是初版經驗值，這次回測顯示的方向性只有45~55筆的小樣本，之後有更多回測資料
+    （尤其是用了新設計之後重新跑一輪）建議再校準一次，不要當成已經驗證過的最終版本。
     """
     def _lerp_score(value, lo, hi, max_pts, min_pts=0.0):
         if value is None:
@@ -1771,31 +1787,37 @@ def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_status, r1, decis
             return max_pts
         return min_pts + (v - lo) / (hi - lo) * (max_pts - min_pts)
 
+    # ---- 量能甜蜜點（30分）----
     vol_ma5_f = _safe_float(vol_ma5) if vol_ma5 is not None else None
     if vol_ma5_f is not None and vol_ma5_f > 0:
         vol_ratio = _safe_float(volume) / vol_ma5_f
-        vol_score = _lerp_score(vol_ratio, 1.0, 2.5, 35.0)
+        if vol_ratio <= 1.0:
+            vol_score = 0.0
+        elif vol_ratio <= 1.5:
+            vol_score = _lerp_score(vol_ratio, 1.0, 1.5, 30.0)
+        elif vol_ratio <= 1.8:
+            vol_score = 30.0
+        elif vol_ratio <= 2.5:
+            vol_score = 30.0 - _lerp_score(vol_ratio, 1.8, 2.5, 10.0)  # 30分緩降到20分
+        else:
+            # 2.5倍以上持續扣分，但設下限15分，避免對真正的強勢股一竿子打死
+            _over = min(_safe_float(vol_ratio) - 2.5, 2.5)  # 最多再看2.5倍的超額部分（即5倍封頂）
+            vol_score = max(15.0, 20.0 - _over / 2.5 * 5.0)
     else:
-        vol_score = 17.5
+        vol_score = 15.0  # 資料缺失給甜蜜點區間中段偏低的中性值，不是滿分
 
-    if macd_osc_status in ("正值", "翻紅第1根"):
-        macd_score = 25.0
-    elif macd_osc_status == "收腳中":
-        macd_score = 12.5
-    elif macd_osc_status in ("翻黑",) or macd_osc_status is not None and "頂背離" in str(macd_osc_status):
-        macd_score = 0.0
-    elif macd_osc_status is None:
-        macd_score = 12.5
-    else:
-        macd_score = 12.5
+    # ---- MACD動能強度（25分）：改用OSC實際數值，不是entry_gate已經篩過的分類 ----
+    macd_score = _lerp_score(abs(macd_osc_value) if macd_osc_value is not None else None, 0.0, 1.0, 25.0, min_pts=5.0)
 
-    r1_score = _lerp_score(r1, 1.5, 3.0, 20.0, min_pts=10.0)
+    # ---- 突破強度（25分）：現價收在突破價之上多少ATR ----
+    breakout_score = _lerp_score(breakout_margin_atr, 0.0, 1.0, 25.0)
+
     decision_score_score = _lerp_score(decision_score, 70.0, 90.0, 20.0, min_pts=10.0)
 
-    total = vol_score + macd_score + r1_score + decision_score_score
+    total = vol_score + macd_score + breakout_score + decision_score_score
     total = max(0.0, min(100.0, total))
     grade = "A" if total >= 80 else ("B" if total >= 65 else ("C" if total >= 50 else "D"))
-    detail = {"volume": round(vol_score, 1), "macd": round(macd_score, 1), "r1": round(r1_score, 1), "decision_score": round(decision_score_score, 1)}
+    detail = {"volume": round(vol_score, 1), "macd": round(macd_score, 1), "breakout_margin": round(breakout_score, 1), "decision_score": round(decision_score_score, 1)}
     return round(total, 1), grade, detail
 
 def calculate_entry_plan(code, indicators, portfolio_info, market_context):
@@ -1872,8 +1894,12 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
         valid_until = _add_business_days(data_date, 3, is_us_stock)
         reason = "Gate 與 Score 同時成立，等待價格突破"
 
+    # 【V2.11.30】breakout_margin_atr：現價收在突破價之上多少倍ATR，取代已移除的r1當突破強度指標；
+    # price可能還沒真的越過breakout_price（例如剛建立BREAKOUT_WAIT、還在等待階段），此時margin
+    # 會是負值，calculate_breakout_quality_score內部的_lerp_score會把它壓到0分（尚無確認力道）。
+    _breakout_margin_atr = (price - breakout_price) / atr if atr > 0 else None
     _bq_score, _bq_grade, _bq_detail = calculate_breakout_quality_score(
-        indicators.get("volume"), _vol_ma5, macd_osc_status, indicators.get("r1"), decision_score)
+        indicators.get("volume"), _vol_ma5, indicators.get("macd_osc_value"), _breakout_margin_atr, decision_score)
 
     return {
         "signal_type": "ENTRY", "entry_price": breakout_price, "breakout_price": breakout_price,
@@ -1887,10 +1913,12 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
         ),
         "initial_stop": round_to_tick(breakout_price - 2 * atr, is_us_stock),
         "breakout_quality_score": _bq_score, "breakout_quality_grade": _bq_grade,
-        # 【V2.11.28新增】拆開突破品質分數的四個子項，供事後分析「到底是哪個子項在拖累判別力」——
-        # V2.11.17當時只存了總分，沒存明細，這次補上，不影響任何既有邏輯（純附加欄位）。
+        # 【V2.11.28新增，V2.11.30重新設計】拆開突破品質分數的子項，供事後分析各子項的判別力。
+        # V2.11.30把 bq_r1 改名成 bq_breakout_margin（原本的r1子項已經是死欄位，改用突破強度取代，
+        # 見 calculate_breakout_quality_score 的docstring），bq_macd 名稱沿用但底層算法已經改用
+        # OSC實際數值，不再是entry_gate已經篩過的分類。
         "bq_volume": _bq_detail.get("volume", 0), "bq_macd": _bq_detail.get("macd", 0),
-        "bq_r1": _bq_detail.get("r1", 0), "bq_decision_score": _bq_detail.get("decision_score", 0),
+        "bq_breakout_margin": _bq_detail.get("breakout_margin", 0), "bq_decision_score": _bq_detail.get("decision_score", 0),
     }
 
 def calculate_addon_shares(current_shares, current_price, current_stop, add_price, add_stop,
@@ -2047,7 +2075,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
              "addon_shares_approved": 0, "addon_shares_suggested": 0, "partial_exit_shares": 0, "full_exit_shares": 0,
              "execution_date": "", "valid_until": "", "retest_min_price": 0.0, "retest_quality": "",
              "breakout_quality_score": 0.0, "breakout_quality_grade": "",
-             "bq_volume": 0.0, "bq_macd": 0.0, "bq_r1": 0.0, "bq_decision_score": 0.0},
+             "bq_volume": 0.0, "bq_macd": 0.0, "bq_breakout_margin": 0.0, "bq_decision_score": 0.0},
             data_date, f"部位已全部出清（原狀態 {plan.get('state')}），重置為 PREPARE 重新追蹤新訊號")
 
     if plan.get("state") in active_wait_states and plan.get("entry_price", 0) > 0:
@@ -2359,6 +2387,7 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
             _macd_result = macd_analyzer.analyze(code, code, _slice, "日線") if len(_slice) >= macd_analyzer.min_bars else None
             macd_osc_status = _macd_result.osc_status if _macd_result else None
             macd_divergence_type = _macd_result.divergence_type if _macd_result else None
+            macd_osc_value = _macd_result.osc if _macd_result else None
 
             atr, ma20, ma60, ma10 = float(row['atr']), float(row['ma20']), float(row['ma60']), float(row['ma10'])
             previous_high = float(row['previous_high']) if not pd.isna(row['previous_high']) else price
@@ -2390,6 +2419,7 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                 "decision_score": decision_score, "trend_gate": _score['step3_pass'], "chip_gate": _score['step1_pass'],
                 "volume_gate": _score['step2_pass'], "r1": _entry_r1, "is_us_stock": is_us_stock, "data_date": today_str,
                 "macd_osc_status": macd_osc_status, "macd_divergence_type": macd_divergence_type,
+                "macd_osc_value": macd_osc_value,
                 "swing_low": swing_low, "volume": float(row['volume']), "vol_ma5": float(row['vol_ma5']),
                 "prev_close": float(ind_df.iloc[i - 1]['close']) if i > 0 else price,
             }
@@ -2409,9 +2439,9 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                     _entry_regime = calculate_regime_score(market_context)
                     open_trade = {'code': code, 'entry_date': dates[i + 1], 'entry_price': next_open,
                                    'breakout_quality_score': new_plan.get('breakout_quality_score', 0),
-                                   # 【V2.11.28新增】四個子項分數，供事後分析哪個子項在拖累整體判別力
+                                   # 【V2.11.28新增，V2.11.30改名】子項分數，供事後分析哪個子項在拖累整體判別力
                                    'bq_volume': new_plan.get('bq_volume', 0), 'bq_macd': new_plan.get('bq_macd', 0),
-                                   'bq_r1': new_plan.get('bq_r1', 0), 'bq_decision_score': new_plan.get('bq_decision_score', 0),
+                                   'bq_breakout_margin': new_plan.get('bq_breakout_margin', 0), 'bq_decision_score': new_plan.get('bq_decision_score', 0),
                                    'retest_quality': '', 'adds': 0, 'partial_exits': [], 'is_us_stock': is_us_stock,
                                    'entry_regime_tw': _entry_regime['tw_regime'], 'entry_regime_us': _entry_regime['us_regime'],
                                    'entry_regime_overview': _entry_regime['overview']}
@@ -2476,9 +2506,9 @@ def _aggregate_backtest_trades(trade):
         'entry_price': entry_price, 'exit_price': exit_price, 'pnl_pct': pnl_pct,
         'holding_days': holding_days, 'adds': trade.get('adds', 0), 'partial_exits': len(trade.get('partial_exits', [])),
         't1_hit': t1_hit, 't2_hit': t2_hit, 'breakout_quality_score': trade.get('breakout_quality_score', 0),
-        # 【V2.11.28新增】突破品質分數的四個子項，供分析哪個子項在拖累整體判別力。
+        # 【V2.11.28新增，V2.11.30改名】突破品質分數的子項，供分析哪個子項在拖累整體判別力。
         'bq_volume': trade.get('bq_volume', 0), 'bq_macd': trade.get('bq_macd', 0),
-        'bq_r1': trade.get('bq_r1', 0), 'bq_decision_score': trade.get('bq_decision_score', 0),
+        'bq_breakout_margin': trade.get('bq_breakout_margin', 0), 'bq_decision_score': trade.get('bq_decision_score', 0),
         # 【V2.11.26新增】進場當下的市場燈號分數，供分析「虧損是不是集中在大盤本身轉弱的時段」。
         # 依股票是台股/美股，取對應的那個子分數（跟 _regime_is_bearish() 的判斷依據一致）。
         'entry_regime_score': round(trade.get('entry_regime_us' if trade.get('is_us_stock') else 'entry_regime_tw', 0), 1),
@@ -3595,6 +3625,9 @@ else:
             # 資料不足（error不為None）時視為中性（None），不影響任何判斷，不會誤擋。
             _macd_osc_status = _macd_daily_result.osc_status if _macd_daily_result.error is None else None
             _macd_divergence_type = _macd_daily_result.divergence_type if _macd_daily_result.error is None else None
+            # 【V2.11.30新增】柱狀體OSC的實際數值，供 calculate_breakout_quality_score() 的MACD動能
+            # 強度子項使用（不再用entry_gate已經篩過一次的正值/翻紅分類，改用連續數值才有區分度）。
+            _macd_osc_value = _macd_daily_result.osc if _macd_daily_result.error is None else None
 
             _plan_indicators = {
                 "code": code, "price": price, "atr": atr, "ma20": ma20, "previous_high": _plan_previous_high,
@@ -3602,6 +3635,7 @@ else:
                 "r1": _entry_r1, "market_regime": "BEARISH" if _regime_is_bearish(macro_data, is_us_stock) else "NORMAL",
                 "is_us_stock": is_us_stock, "data_date": _plan_data_date,
                 "macd_osc_status": _macd_osc_status, "macd_divergence_type": _macd_divergence_type,
+                "macd_osc_value": _macd_osc_value,
                 "swing_low": _swing_low, "volume": volume, "vol_ma5": vol_ma5,
                 "prev_close": float(c.iloc[-2]) if len(c) >= 2 else price,
             }
