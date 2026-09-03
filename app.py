@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.25"
+APP_VERSION = "V2.11.26"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -2396,9 +2396,15 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                 fill_qty = int(new_plan.get('suggested_shares', 0))
                 if fill_qty > 0:
                     qty, cost = fill_qty, next_open
+                    # 【V2.11.26新增】記錄進場當下的市場燈號分數，供事後分析「虧損交易是不是集中在
+                    # 大盤本身就轉弱的時段」——用進場決策當天（i）的 market_context 算分數，不是
+                    # 隔天實際成交那天，因為決策本身是「今天收盤」做的，這才是當時系統看到的市場環境。
+                    _entry_regime = calculate_regime_score(market_context)
                     open_trade = {'code': code, 'entry_date': dates[i + 1], 'entry_price': next_open,
                                    'breakout_quality_score': new_plan.get('breakout_quality_score', 0),
-                                   'retest_quality': '', 'adds': 0, 'partial_exits': []}
+                                   'retest_quality': '', 'adds': 0, 'partial_exits': [], 'is_us_stock': is_us_stock,
+                                   'entry_regime_tw': _entry_regime['tw_regime'], 'entry_regime_us': _entry_regime['us_regime'],
+                                   'entry_regime_overview': _entry_regime['overview']}
                     new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
                 else:
                     new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
@@ -2450,6 +2456,10 @@ def _aggregate_backtest_trades(trade):
         'entry_price': entry_price, 'exit_price': exit_price, 'pnl_pct': pnl_pct,
         'holding_days': holding_days, 'adds': trade.get('adds', 0), 'partial_exits': len(trade.get('partial_exits', [])),
         't1_hit': t1_hit, 't2_hit': t2_hit, 'breakout_quality_score': trade.get('breakout_quality_score', 0),
+        # 【V2.11.26新增】進場當下的市場燈號分數，供分析「虧損是不是集中在大盤本身轉弱的時段」。
+        # 依股票是台股/美股，取對應的那個子分數（跟 _regime_is_bearish() 的判斷依據一致）。
+        'entry_regime_score': round(trade.get('entry_regime_us' if trade.get('is_us_stock') else 'entry_regime_tw', 0), 1),
+        'entry_regime_overview': round(trade.get('entry_regime_overview', 0), 1),
         'exit_reason': trade.get('exit_reason', ''), 'win': pnl_pct > 0,
     }
 
@@ -2459,6 +2469,11 @@ def calculate_backtest_metrics(trades_df):
     Expectancy／平均持有天數／T1命中率／T2命中率／停損率（虧損出場佔比）。
     最大回撤（基於逐筆交易累積報酬%的簡化權益曲線，不是真實資金回撤，見UI端的說明文字）跟
     假突破率（P2-9，需要對照 BREAKOUT_FAILED 狀態，這次先不含在這份指標裡，等下一輪擴充）。
+
+    【V2.11.26新增】avg_regime_score_win／avg_regime_score_loss：贏的交易 vs 輸的交易，進場當下
+    平均的市場燈號分數各是多少。用來直接檢驗「虧損是不是集中在大盤本身轉弱的時段」這個假設——
+    如果輸的交易平均進場分數明顯低於贏的交易，代表逆風攔截的門檻可能設得不夠嚴；如果兩者分數
+    差不多，代表虧損不是市場環境造成的，是個股/訊號本身的問題。
     """
     if trades_df is None or trades_df.empty:
         return None
@@ -2480,6 +2495,8 @@ def calculate_backtest_metrics(trades_df):
         'profit_factor': profit_factor, 'expectancy_pct': expectancy, 'avg_holding_days': trades_df['holding_days'].mean(),
         't1_hit_rate': trades_df['t1_hit'].mean() * 100, 't2_hit_rate': trades_df['t2_hit'].mean() * 100,
         'stop_rate': (1 - win_rate / 100) * 100, 'max_drawdown_pct': max_drawdown, 'equity_curve': equity_curve,
+        'avg_regime_score_win': wins['entry_regime_score'].mean() if len(wins) > 0 and 'entry_regime_score' in trades_df.columns else None,
+        'avg_regime_score_loss': losses['entry_regime_score'].mean() if len(losses) > 0 and 'entry_regime_score' in trades_df.columns else None,
     }
 
 def calculate_backtest_by_code(trades_df):
@@ -3158,6 +3175,15 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                     f"T1命中率：{_bt_metrics['t1_hit_rate']:.1f}%　｜　T2命中率：{_bt_metrics['t2_hit_rate']:.1f}%　｜　"
                     f"停損/虧損出場率：{_bt_metrics['stop_rate']:.1f}%"
                 )
+                if _bt_metrics.get('avg_regime_score_win') is not None or _bt_metrics.get('avg_regime_score_loss') is not None:
+                    _rw = _bt_metrics.get('avg_regime_score_win')
+                    _rl = _bt_metrics.get('avg_regime_score_loss')
+                    st.caption(
+                        f"🌡️ 進場當下市場燈號分數：贏的交易平均 {f'{_rw:.1f}' if _rw is not None else 'N/A'} 分　"
+                        f"｜　輸的交易平均 {f'{_rl:.1f}' if _rl is not None else 'N/A'} 分　"
+                        "（分數越低代表大盤當時越弱，見「依股票代碼分組績效」下方交易明細的 `entry_regime_score` 欄位；"
+                        "0~100分級距見說明書第14節Market Regime Score說明）"
+                    )
                 st.caption(
                     "⚠️ 最大回撤是用「逐筆交易累積報酬率」算出的簡化權益曲線，不是真實資金逐日回撤"
                     "（沒有考慮同時持有多檔部位的資金排擠、也沒有考慮交易成本/滑價，屬於P2-2/P2-3尚未實作範圍，"
