@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.35"
+APP_VERSION = "V2.11.36"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -1619,10 +1619,10 @@ def calculate_target_plan(price, cost, atr, previous_high, is_us_stock=False, pr
     t2 = max(structural_t2, r_floor_t2)
     return round_to_tick(t1, is_us_stock), round_to_tick(t2, is_us_stock), branch
 
-def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=30.0, swing_low=None, trend_confirmed=False):
+def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigger_pct=30.0, swing_low=None, trend_confirmed=False, profit_protection_atr_multiple=1.0):
     """
     【單一防守線權威來源，V2.11.9新增，V2.11.10擴充Trend Runner多方法，V2.11.17改為三層防守，
-    V2.11.18把Level1→2切換條件改為「趨勢是否形成」】
+    V2.11.18把Level1→2切換條件改為「趨勢是否形成」，V2.11.36收緊Level3的ATR倍數】
 
     【V2.11.18】依你的指示，把 Level1→2 的切換條件從「獲利%」改成「趨勢是否形成」，Level2→3
     則維持用「獲利%」不變——這兩段各自代表不同的問題，適合用不同的判斷依據：
@@ -1640,16 +1640,26 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
         不是另外發明一套新邏輯），但獲利還不多，還沒到「重兵保護」的程度：
         candidate = max(MA20−ATR, 波段低點(swing_low，若有提供))
         new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
-        （只用結構性方法，不用「現價−1.5×ATR」這種貼近現價的緊縮方法——趨勢剛確認、獲利還不多，
+        （只用結構性方法，不用「現價−X×ATR」這種貼近現價的緊縮方法——趨勢剛確認、獲利還不多，
         不需要為了保護還沒賺到的利潤而把防守線收得太緊，避免正常回檔就被洗出去）
 
       Level 3「Profit Protection Stop」：獲利 ≥ profit_trigger_pct（V2.11.19起預設30%，不論
         trend_confirmed 當下是True還是False——已經到手的獲利要優先保護，不因為趨勢燈臨時熄滅
         就放鬆防守）
-        candidate = max(MA20−ATR, 波段低點(swing_low，若有提供), 現價−1.5×ATR)
+        candidate = max(MA20−ATR, 波段低點(swing_low，若有提供), 現價−profit_protection_atr_multiple×ATR)
         new_stop = max(previous_stop 或 cost−2×ATR起點, candidate)
-        （沿用V2.11.10「Trend Runner」三方法取最大值，加入「現價−1.5×ATR」這種貼近現價、
+        （沿用V2.11.10「Trend Runner」三方法取最大值，加入「現價−X×ATR」這種貼近現價、
         鎖住最多獲利的候選方法）
+
+    【V2.11.36修正，依MFE/MAE回測證據調整】profit_protection_atr_multiple 從原本固定寫死的1.5
+    改成可傳入的參數，預設值同時從1.5調緊為1.0。調整依據：V2.11.35新增的MFE/MAE追蹤，用48筆
+    真實回測資料顯示「贏的交易平均最高曾浮盈到35.2%，實際出場只拿到21.1%，回吐了14.1個百分點
+    （約40%的峰值獲利被吐回去）」，而輸的交易那邊MAE（-9.8%）跟實際平均虧損（-8.3%）差距不大，
+    代表初始停損（Level1的2×ATR）執行得還算確實——這代表問題比較可能出在Level3「已經賺錢之後
+    要不要收緊防守線」這一段，不是「一開始的停損」，所以這次只收緊Level3的倍數，Level1的
+    2×ATR跟Level2都沒有變動。收緊到1.0×ATR是否真的能縮小回吐缺口、同時不會讓太多原本能延續的
+    趨勢股提早出場，需要重新跑一輪回測比較前後的Expectancy/回吐缺口才能確認，屬於
+    【需要人工確認的參數】，這次的1.0只是根據現有證據的一次調整嘗試，不是最終定案。
 
     【V2.11.19重要澄清】這裡的 profit_trigger_pct 跟 calculate_target_plan() 裡同名的
     profit_trigger_pct 是兩個完全獨立的參數（各自函式自己的預設值，不是共用同一個全域常數）：
@@ -1691,7 +1701,7 @@ def calculate_stop_plan(price, cost, atr, ma20, previous_stop=None, profit_trigg
         base = prev if prev > 0 else flat_stop
         _candidates = {
             "ratchet_ma20_atr": _safe_float(ma20) - _safe_float(atr),
-            "ratchet_price_atr": _safe_float(price) - 1.5 * _safe_float(atr),
+            "ratchet_price_atr": _safe_float(price) - profit_protection_atr_multiple * _safe_float(atr),
         }
         if swing_low is not None and _safe_float(swing_low) > 0:
             _candidates["ratchet_swing_low"] = _safe_float(swing_low)
@@ -2904,7 +2914,7 @@ STOP_SOURCE_LABELS = {
     "initial_stop": "Level1 成本−2×ATR（尚未獲利，初始防守）",
     "locked_previous": "沿用前次防守線（本次候選都沒有更高）",
     "ratchet_ma20_atr": "MA20−ATR（結構防守）",
-    "ratchet_price_atr": "現價−1.5×ATR（Level3 獲利保護）",
+    "ratchet_price_atr": "現價−1.0×ATR（Level3 獲利保護，V2.11.36收緊）",
     "ratchet_swing_low": "近20日波段低點（結構防守）",
 }
 
