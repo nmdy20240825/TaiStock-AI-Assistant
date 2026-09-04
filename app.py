@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.38"
+APP_VERSION = "V2.11.40"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -840,6 +840,10 @@ from google.oauth2.service_account import Credentials
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 PORTFOLIO_HEADERS = ["code", "name", "cost", "cap", "risk", "status", "break_date", "qty"]
 HISTORY_HEADERS = ["code", "date", "score", "status", "price"]
+# 【V2.11.39新增，Decision Log】純append-only的人工決策紀錄，記錄「系統建議 vs 你實際執行了什麼」
+# ——系統自己的建議/理由已經存在 trade_plan 分頁（state／signal_reason），這裡只補系統不可能
+# 知道的那一半：你有沒有真的照做、實際成交價位、偏離的原因。
+DECISION_LOG_HEADERS = ["log_date", "code", "system_suggestion", "action_taken", "actual_price", "reason", "logged_at"]
 
 DEFAULT_PORTFOLIO = {
     "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active", "qty": 0},
@@ -1107,6 +1111,38 @@ def save_history(data):
         ws.update(rows)
     except Exception as e:
         st.error(f"⚠️ 寫入 Google Sheet 歷史資料失敗：{e}")
+
+def load_decision_log():
+    """
+    讀取決策日誌分頁，回傳 list of dict，新到舊排序（最新的紀錄看起來比較方便）。
+    這是純append-only的人工紀錄，不需要像 portfolio/trade_plan 那樣做正規化/schema比對，
+    讀取失敗時安靜回傳空列表即可（這個分頁純粹是給使用者自己回顧用，不是任何決策邏輯的輸入，
+    讀取失敗不影響任何交易判斷，不需要比照 portfolio/trade_plan 的安全模式機制）。
+    """
+    try:
+        ws = get_worksheet("decision_log", DECISION_LOG_HEADERS)
+        records = ws.get_all_records()
+        return list(reversed(records))
+    except Exception as e:
+        st.error(f"⚠️ 讀取決策日誌失敗：{e}")
+        return []
+
+def append_decision_log(log_date, code, system_suggestion, action_taken, actual_price, reason):
+    """
+    新增一筆決策日誌記錄。刻意用 append_row()（只新增一行）而不是 clear()+update()（整批清空
+    重寫）——這是純append-only的紀錄，每次只新增一行，用append天生就不會有「清空成功、寫入
+    失敗」的資料損毀窗口期（這正是V2.11.15/20修過的那類真實bug的成因，這裡從設計上直接避開，
+    不需要再套用同一套安全模式機制）。
+    """
+    try:
+        ws = get_worksheet("decision_log", DECISION_LOG_HEADERS)
+        ws.append_row([log_date, str(code), system_suggestion, action_taken,
+                        actual_price if actual_price else "", reason or "",
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
+        return True
+    except Exception as e:
+        st.error(f"⚠️ 寫入決策日誌失敗：{e}")
+        return False
 
 # --- 4-1. trade_plan 分頁讀寫（V2.11.x 新增）---
 def _normalize_trade_plan_row(row):
@@ -3284,6 +3320,33 @@ def render_stock_card(data, system_history, portfolio_data):
                 if _plan_state == "FULL_EXIT_NEXT_DAY":
                     st.error(f"🔴 建議全部出清股數：{data.get('plan_full_exit_shares', 0)} 股（下一交易日執行）\n⚠️ 系統不保證一定能以防守觸發價成交，實際成交價可能因跳空而偏離，請留意跳空風險。")
 
+            # 【V2.11.39新增，V2.11.40擴充選項，Decision Log】只在系統真的要求你做決定的狀態才顯示
+            # 這個記錄小工具，平常的PREPARE/HOLD不需要記錄什麼。系統自己的建議/理由已經存在
+            # trade_plan分頁裡，這裡只補系統不可能知道的那一半：你有沒有真的照做、實際成交價、
+            # 偏離的原因。
+            _actionable_states = {"ENTER_NEXT_DAY", "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "BREAKOUT_FAILED"}
+            if _plan_state in _actionable_states:
+                with st.expander("📝 記錄我的決定（供之後回顧用，不影響系統判斷）"):
+                    st.caption(f"系統建議：{_state_label_map.get(_plan_state, _plan_state)}｜{data.get('plan_signal_reason', '')}")
+                    # 【V2.11.40】出場類訊號（分批/全部出清）跟進場類訊號（進場/加碼/突破失敗）的
+                    # 「沒做」意義不一樣——出場訊號沒做＝續抱；進場訊號沒做＝放棄這次機會。用不同的
+                    # 選項組合，記錄起來才準確，不用勉強套同一組選項。
+                    if _plan_state in ("PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY"):
+                        _log_options = ["完全照做", "延後出場", "部分出場/股數不同", "續抱未出場"]
+                    else:
+                        _log_options = ["完全照做", "延後執行", "部分執行/股數不同", "沒有進場/加碼"]
+                    _log_action = st.radio("我實際上", _log_options, key=f"log_action_{data['code']}", horizontal=True)
+                    _log_price_col, _log_reason_col = st.columns(2)
+                    _log_price = _log_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_{data['code']}")
+                    _log_reason = _log_reason_col.text_input("原因（選填，例如：延後/沒做/續抱的理由）", key=f"log_reason_{data['code']}")
+                    if st.button("儲存這筆紀錄", key=f"log_submit_{data['code']}"):
+                        _ok = append_decision_log(
+                            today_str, data['code'], f"{_plan_state}：{data.get('plan_signal_reason', '')}",
+                            _log_action, _log_price if _log_price > 0 else None, _log_reason,
+                        )
+                        if _ok:
+                            st.success("已記錄")
+
         with tab_c6:
             # 【新增】MACD 動能變化與背離分析：日線／週線分開顯示，格式對照四大模組
             # （技術指標現況診斷／訊號層級評估／交易決策建議／風險過濾提醒）。
@@ -3566,6 +3629,29 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                     file_name=f"backtest_trades_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                 )
+
+# --- 5-2. 決策日誌（V2.11.39新增）---
+# 每一檔股票的「🗓️交易計畫」分頁，遇到系統要求你做決定的狀態時，會出現「📝記錄我的決定」小工具，
+# 這裡是彙總所有已經記錄過的內容，供你事後回顧、下載帶去分析。
+with st.expander("📝 決策日誌 — 系統建議 vs 你實際執行了什麼", expanded=False):
+    st.caption(
+        "在各股票的「🗓️交易計畫」分頁，遇到系統要求你做決定的狀態（進場/加碼/出場等）時，"
+        "會出現「記錄我的決定」小工具，填完按儲存就會累積在這裡。系統自己的建議/理由已經存在"
+        "trade_plan分頁裡，這裡只補系統不可能知道的那一半：你有沒有真的照做、實際成交價、"
+        "偏離的原因。建議累積幾週到幾個月後，下載下來回顧或帶去分析。"
+    )
+    _decision_log_data = load_decision_log()
+    if not _decision_log_data:
+        st.info("目前還沒有任何紀錄。到某檔股票的「🗓️交易計畫」分頁，遇到需要決定的訊號時，展開「📝記錄我的決定」開始記錄。")
+    else:
+        _log_df = pd.DataFrame(_decision_log_data)
+        st.dataframe(_log_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ 下載決策日誌（CSV）",
+            data=_log_df.to_csv(index=False).encode('utf-8-sig'),
+            file_name=f"decision_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
 
 if not portfolio:
     if not PORTFOLIO_LOAD_OK:
