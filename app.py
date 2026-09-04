@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.40"
+APP_VERSION = "V2.11.41"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -845,6 +845,15 @@ HISTORY_HEADERS = ["code", "date", "score", "status", "price"]
 # 知道的那一半：你有沒有真的照做、實際成交價位、偏離的原因。
 DECISION_LOG_HEADERS = ["log_date", "code", "system_suggestion", "action_taken", "actual_price", "reason", "logged_at"]
 
+# 【V2.11.41新增，Trade Plan Snapshot】每次某檔股票的資料日期真的往前推進到新的一天時，把「前一天
+# 最終確定版」的計畫內容凍結存一份，不管之後同一天內盤中重新評估幾次、覆寫幾次，都不會動到這份
+# 已經凍結的舊快照——解決「盤中打開App，發現昨晚看到的計畫已經被當天盤中還沒收盤的資料覆寫掉」
+# 這個真實操作痛點。純append-only，只新增不覆寫。
+TRADE_PLAN_SNAPSHOT_HEADERS = ["code", "snapshot_date", "state", "signal_reason", "entry_price", "breakout_price",
+                               "chase_limit", "invalid_price", "t1_price", "t2_price", "current_trailing_stop",
+                               "current_trailing_stop_source", "suggested_shares", "addon_shares_approved",
+                               "partial_exit_shares", "full_exit_shares", "saved_at"]
+
 DEFAULT_PORTFOLIO = {
     "3035": {"name": "智原", "cost": 300.0, "cap": 20000, "risk": 5.0, "status": "Active", "qty": 0},
     "2317": {"name": "鴻海", "cost": 210.0, "cap": 20000, "risk": 5.0, "status": "Active", "qty": 0},
@@ -1142,6 +1151,51 @@ def append_decision_log(log_date, code, system_suggestion, action_taken, actual_
         return True
     except Exception as e:
         st.error(f"⚠️ 寫入決策日誌失敗：{e}")
+        return False
+
+def load_trade_plan_snapshots():
+    """
+    讀取所有交易計畫快照，回傳 dict：{code: 該股票最新的一筆快照(dict)}，只保留每檔股票「最新」
+    的一筆——使用者要看的是「上一個已經確定的版本」，不需要看到完整歷史，只需要最近一筆。
+    純讀取失敗時安靜回傳空dict即可，這個分頁只是給使用者比對用，不是任何決策邏輯的輸入。
+    """
+    try:
+        ws = get_worksheet("trade_plan_snapshot", TRADE_PLAN_SNAPSHOT_HEADERS)
+        records = ws.get_all_records()
+        latest = {}
+        for row in records:
+            code = str(row.get("code", "")).strip()
+            if not code: continue
+            # records 是照試算表由上到下的順序（也就是append的先後順序），後面出現的會覆蓋前面的，
+            # 天然就會留下「最新一筆」，不需要額外排序
+            latest[code] = row
+        return latest
+    except Exception as e:
+        st.error(f"⚠️ 讀取交易計畫快照失敗：{e}")
+        return {}
+
+def append_trade_plan_snapshot(code, plan):
+    """
+    把「即將被覆寫掉的前一天最終確定版」凍結存一份。呼叫時機是：偵測到這檔股票的資料日期真的
+    要往前推進到新的一天（不是同一天內的盤中重新評估）——這樣存下來的，正好就是「前一天收盤後
+    最後一次確定的計畫內容」，不管當天之後盤中重新評估、覆寫幾次，這份快照都不會被動到。
+    刻意用 append_row()（純append-only），理由跟 append_decision_log() 一樣：避免「清空重寫」
+    類型的資料損毀風險，這裡從設計上直接避開。
+    """
+    try:
+        ws = get_worksheet("trade_plan_snapshot", TRADE_PLAN_SNAPSHOT_HEADERS)
+        ws.append_row([
+            str(code), plan.get("taiwan_data_date", ""), plan.get("state", ""), plan.get("signal_reason", ""),
+            plan.get("entry_price", 0), plan.get("breakout_price", 0), plan.get("chase_limit", 0),
+            plan.get("invalid_price", 0), plan.get("t1_price", 0), plan.get("t2_price", 0),
+            plan.get("current_trailing_stop", 0), plan.get("current_trailing_stop_source", ""),
+            plan.get("suggested_shares", 0), plan.get("addon_shares_approved", 0),
+            plan.get("partial_exit_shares", 0), plan.get("full_exit_shares", 0),
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        ])
+        return True
+    except Exception as e:
+        st.error(f"⚠️ 寫入交易計畫快照失敗：{e}")
         return False
 
 # --- 4-1. trade_plan 分頁讀寫（V2.11.x 新增）---
@@ -2903,6 +2957,7 @@ def run_backtest(codes, years=2, progress_callback=None):
     return trades_df, metrics, errors
 
 portfolio, system_history, trade_plan_data, today_str = load_portfolio(), load_history(), load_trade_plan(), datetime.datetime.now().strftime("%Y-%m-%d")
+trade_plan_snapshots = load_trade_plan_snapshots()  # 【V2.11.41新增】每檔股票「前一個確定版」的凍結快照
 migrate_trade_plan_sheet()
 
 # --- 5. 側邊欄 UI ---
@@ -3251,6 +3306,27 @@ def render_stock_card(data, system_history, portfolio_data):
             st.markdown(f"**交易計畫狀態**：{_state_label_map.get(_plan_state, _plan_state)}")
             if data.get('plan_signal_reason'):
                 st.caption(f"📝 {data['plan_signal_reason']}")
+
+            # 【V2.11.41新增，Trade Plan Snapshot】只在「今天這根K棒可能還在變動」時才顯示，
+            # 提醒你上面看到的這個版本可能是盤中還沒收盤的資料算出來的，附上「前一個確定版」讓你
+            # 對照——平常（收盤後、或開盤前查看）不需要看這個，上面顯示的本來就是確定版，加這個
+            # 提示反而多餘。
+            if data.get('is_today_bar'):
+                _snap = trade_plan_snapshots.get(str(data['code']))
+                if _snap:
+                    with st.expander(f"🔒 上一個確定版（{_snap.get('snapshot_date', '—')} 收盤後）— 目前這個版本可能還會變動"):
+                        st.caption("上面顯示的計畫，是用今天盤中還沒收盤的資料算出來的，之後可能還會變。這裡是上一個交易日收盤後確定、且從未被覆寫過的版本：")
+                        st.write(f"**狀態**：{_state_label_map.get(_snap.get('state', ''), _snap.get('state', ''))}")
+                        if _snap.get('signal_reason'):
+                            st.caption(f"📝 {_snap['signal_reason']}")
+                        st.write(f"T1：{_snap.get('t1_price', '—')}　｜　T2：{_snap.get('t2_price', '—')}　｜　移動防守線：{_snap.get('current_trailing_stop', '—')}")
+                        if str(_snap.get('addon_shares_approved', '') or '') not in ('', '0'):
+                            st.write(f"建議加碼股數：{_snap['addon_shares_approved']}")
+                        if str(_snap.get('partial_exit_shares', '') or '') not in ('', '0'):
+                            st.write(f"建議分批出場股數：{_snap['partial_exit_shares']}")
+                        if str(_snap.get('full_exit_shares', '') or '') not in ('', '0'):
+                            st.write(f"建議全部出清股數：{_snap['full_exit_shares']}")
+                        st.caption(f"（快照時間：{_snap.get('saved_at', '—')}）")
 
             # 【V2.11.12新增，第六點簡化版】人工覆核：只記錄「有沒有看過」，不記錄「同意/拒絕」
             # （那個判斷本來就會反映在你有沒有去改股數上，不需要再另外記錄一次主觀決定）。
@@ -4055,6 +4131,15 @@ else:
             if execution_mode == TAIWAN_CLOSE_UPDATE or _force_intraday_recheck or (not _old_plan.get("taiwan_data_date") and _plan_data_date):
                 # 台股有新日K、今天K棒尚未收斂需要持續追蹤、或這檔股票從未被 evaluate 過（首次遷移/新增持股的一次性 bootstrap）
                 _new_plan = process_taiwan_close_update(_old_plan, _plan_indicators, macro_data, _plan_portfolio_info)
+                # 【V2.11.41新增，Trade Plan Snapshot】在覆寫日期之前，先檢查這是不是「真的推進到
+                # 新的一天」（不是同一天內的盤中重複評估）——如果是，把_old_plan（前一天最終確定的
+                # 內容）凍結存一份快照，這樣不管接下來當天盤中重新評估幾次、覆寫幾次，使用者都還能
+                # 回頭看到「前一天收盤後」那個版本，解決「盤中打開App，昨晚看到的計畫已經被當天
+                # 盤中還沒收盤的資料覆寫掉」這個真實操作痛點。只在日期真的前進時觸發一次，同一天內
+                # 重複的盤中重新評估（_old_plan的taiwan_data_date已經等於今天）不會重複快照。
+                _old_data_date = _old_plan.get("taiwan_data_date", "")
+                if _old_data_date and _plan_data_date and _old_data_date != _plan_data_date:
+                    append_trade_plan_snapshot(code, _old_plan)
                 _new_plan["taiwan_data_date"] = _plan_data_date
                 if latest_us_date:
                     _new_plan["us_data_date"] = latest_us_date
