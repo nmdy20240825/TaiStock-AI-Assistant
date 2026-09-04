@@ -4,6 +4,7 @@ import yfinance as yf
 import numpy as np
 import requests
 import datetime
+from zoneinfo import ZoneInfo
 import json
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Literal, Dict, Any, List, Tuple
@@ -13,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.32"
+APP_VERSION = "V2.11.35"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -604,6 +605,38 @@ US_MARKET_HOLIDAYS = {
     "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
     "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
 }
+
+def _is_market_session_open(is_us_stock, now=None):
+    """
+    【V2.11.33新增】判斷「現在」這個當下，對應市場是不是還在正式交易時段中，用來修正
+    is_today_bar 原本「只比日期、不比時間」的真實bug（收盤幾個小時後系統還誤判「可能還在
+    交易時段中」，因為原本只看抓到的資料日期是不是今天，完全沒管現在幾點）。
+
+    台股：09:00~13:30（Asia/Taipei）；美股：09:30~16:00（America/New_York，zoneinfo會自動
+    處理日光節約時間EST/EDT轉換，不需要手動判斷該用UTC-4還是UTC-5）。週末一律視為休市。
+
+    這裡刻意不比對 US_MARKET_HOLIDAYS／TW_MARKET_HOLIDAYS（國定假日休市）——盤中時段判斷
+    只是給「這根K棒的數字還會不會變動」這個提醒用的參考資訊，不是硬性關卡，國定假日當天
+    抓到的資料本來就會是前一個交易日的舊資料（日期對不上今天），is_today_bar 的日期比對
+    那一半自然就會是False，不需要在這裡重複判斷假日。
+
+    now：可傳入已經算好的 timezone-aware datetime 重複使用，避免呼叫端重複呼叫 now()；
+    不傳的話這裡自己算一次。
+    """
+    tz = ZoneInfo("America/New_York") if is_us_stock else ZoneInfo("Asia/Taipei")
+    if now is None:
+        now = datetime.datetime.now(tz)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    if now.weekday() >= 5:  # 週六(5)/週日(6)
+        return False
+    if is_us_stock:
+        open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    else:
+        open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        close_t = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    return open_t <= now <= close_t
 
 def _next_business_day(date_str, is_us_stock=False):
     """回傳輸入日期之後的下一個交易日（排除週末，並依 is_us_stock 對照台股或美股的靜態假日表；
@@ -1213,6 +1246,13 @@ def detect_update_mode(latest_tw_date, latest_us_date, saved_tw_date, saved_us_d
 REGIME_BEARISH_THRESHOLD = 40.0  # 【V2.11.16新增，需要人工確認的參數】分數低於此視為「逆風」，
 # 攔截新倉與加碼；對應五級分類中的「逆風」與「極端逆風」兩級，數值跟舊版二元條件的臨界點相近
 # （見 calculate_regime_score 內的映射說明），是初版經驗值，建議依實際使用效果調整。
+
+BREAKOUT_QUALITY_GATE_THRESHOLD = 50.0  # 【V2.11.34新增，需要人工確認的參數】突破品質分數
+# （calculate_breakout_quality_score，V2.11.30/31重新設計後）低於此門檻時，暫緩確認進場，
+# 留在BREAKOUT_WAIT/PULLBACK_WAIT繼續觀察，不會強制進場也不會被砍掉追蹤。50分對應五級評等
+# 的C/D級分界，是刻意保守的起始值（只擋最明顯偏弱的訊號），依據V2.11.30/31用45~55筆小樣本
+# 驗證出量能甜蜜點/突破強度子項有正相關（相關係數約0.17~0.26，屬中等偏弱訊號，不是強力保證），
+# 屬於初版經驗值，建議之後用更大樣本的回測結果重新校準這個門檻。
 
 def calculate_regime_score(macro_data):
     """
@@ -1901,19 +1941,6 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     # 屬於【需要人工確認的參數】，請依實際回測結果調整。
     invalid_price = round_to_tick(max(previous_high - 1.0 * atr, 0), is_us_stock)
 
-    if price > chase_limit > 0:
-        state = "PULLBACK_WAIT"
-        valid_until = _add_business_days(data_date, 5, is_us_stock)
-        reason = "現價已超過追價上限，改為等待回測區間"
-    elif price >= breakout_price > 0:
-        state = "ENTER_NEXT_DAY"
-        valid_until = _add_business_days(data_date, 3, is_us_stock)
-        reason = "突破確認且未超過追價上限，隔日執行進場"
-    else:
-        state = "BREAKOUT_WAIT"
-        valid_until = _add_business_days(data_date, 3, is_us_stock)
-        reason = "Gate 與 Score 同時成立，等待價格突破"
-
     # 【V2.11.30】breakout_margin_atr：現價收在突破價之上多少倍ATR，取代已移除的r1當突破強度指標；
     # price可能還沒真的越過breakout_price（例如剛建立BREAKOUT_WAIT、還在等待階段），此時margin
     # 會是負值，calculate_breakout_quality_score內部的_lerp_score會把它壓到0分（尚無確認力道）。
@@ -1924,6 +1951,30 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     _macd_osc_atr_ratio = (abs(_macd_osc_value) / atr) if (_macd_osc_value is not None and atr > 0) else None
     _bq_score, _bq_grade, _bq_detail = calculate_breakout_quality_score(
         indicators.get("volume"), _vol_ma5, _macd_osc_atr_ratio, _breakout_margin_atr, decision_score)
+
+    if price > chase_limit > 0:
+        state = "PULLBACK_WAIT"
+        valid_until = _add_business_days(data_date, 5, is_us_stock)
+        reason = "現價已超過追價上限，改為等待回測區間"
+    elif price >= breakout_price > 0:
+        # 【V2.11.34新增，Breakout Quality Gate】品質分數未達門檻時，先不直接確認進場，改成
+        # BREAKOUT_WAIT繼續追蹤觀察——這裡是「這次剛好第一次偵測到時，價格已經越過突破價」的
+        # 情境，這時候的品質分數是有意義的（breakout_margin_atr是真實數字，不是等待階段的0），
+        # 可以直接拿來判斷。之後如果分數改善（例如量能持續放大），會在evaluate_trade_state()的
+        # WAIT→ENTER_NEXT_DAY重新確認流程裡用當天最新資料重算一次品質，不是延用這裡凍結的舊分數
+        # （那個分數只在「這一天首次建立計畫」時有意義，之後每天狀況都在變，應該重新判斷）。
+        if _bq_score < BREAKOUT_QUALITY_GATE_THRESHOLD:
+            state = "BREAKOUT_WAIT"
+            valid_until = _add_business_days(data_date, 3, is_us_stock)
+            reason = f"突破確認但品質分數{_bq_score:.0f}分未達{BREAKOUT_QUALITY_GATE_THRESHOLD:.0f}分門檻，先追蹤觀察，不強制進場"
+        else:
+            state = "ENTER_NEXT_DAY"
+            valid_until = _add_business_days(data_date, 3, is_us_stock)
+            reason = "突破確認且未超過追價上限，隔日執行進場"
+    else:
+        state = "BREAKOUT_WAIT"
+        valid_until = _add_business_days(data_date, 3, is_us_stock)
+        reason = "Gate 與 Score 同時成立，等待價格突破"
 
     return {
         "signal_type": "ENTRY", "entry_price": breakout_price, "breakout_price": breakout_price,
@@ -2155,6 +2206,21 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             plan["retest_min_price"] = price if _prev_min <= 0 else min(_prev_min, price)
 
         if plan.get("state") in {"BREAKOUT_WAIT", "PULLBACK_WAIT"} and entry_price > 0 and price >= entry_price:
+            # 【V2.11.34新增，Breakout Quality Gate】用「今天」的最新資料重新算一次品質分數，不是
+            # 沿用建立BREAKOUT_WAIT/PULLBACK_WAIT當時凍結的舊分數——那是計畫剛建立那天的快照，
+            # 量能/MACD/決策分數每天都在變，確認進場前應該看「現在」的品質，不是好幾天前的舊資料。
+            _atr_now = _safe_float(indicators.get("atr"))
+            _reconfirm_margin_atr = (price - entry_price) / _atr_now if _atr_now > 0 else None
+            _reconfirm_macd_value = indicators.get("macd_osc_value")
+            _reconfirm_macd_ratio = (abs(_reconfirm_macd_value) / _atr_now) if (_reconfirm_macd_value is not None and _atr_now > 0) else None
+            _reconfirm_score, _reconfirm_grade, _reconfirm_detail = calculate_breakout_quality_score(
+                indicators.get("volume"), indicators.get("vol_ma5"), _reconfirm_macd_ratio, _reconfirm_margin_atr, indicators.get("decision_score"))
+            if _reconfirm_score < BREAKOUT_QUALITY_GATE_THRESHOLD:
+                # 品質還沒到，留在原狀態（BREAKOUT_WAIT／PULLBACK_WAIT）繼續觀察，不強制進場、
+                # 也不砍掉這筆追蹤。既有的 is_signal_invalid（跌破失效價）／valid_until（有效期限
+                # 到期）機制完全不受影響、照常運作，不會因為這道品質關卡而讓計畫無限期卡死。
+                return plan
+
             key = f"{code}|ENTRY|{data_date}|{round(entry_price, 2)}"
             if is_duplicate_signal(plan, key):
                 return plan
@@ -2168,7 +2234,12 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             if _retest_note:
                 _reason += f"（{_retest_note}）"
             return transition_state(plan, "ENTER_NEXT_DAY",
-                                     {"execution_date": _next_business_day(data_date, is_us_stock), "retest_quality": _retest_quality},
+                                     {"execution_date": _next_business_day(data_date, is_us_stock), "retest_quality": _retest_quality,
+                                      # 用重新確認當下的分數覆蓋掉建立計畫當天的舊快照，反映真正進場那一刻的品質；
+                                      # 子項明細一併更新，避免「總分是新的、拆解明細卻是舊的」互相對不上
+                                      "breakout_quality_score": _reconfirm_score, "breakout_quality_grade": _reconfirm_grade,
+                                      "bq_volume": _reconfirm_detail.get("volume", 0), "bq_macd": _reconfirm_detail.get("macd", 0),
+                                      "bq_breakout_margin": _reconfirm_detail.get("breakout_margin", 0), "bq_decision_score": _reconfirm_detail.get("decision_score", 0)},
                                      data_date, _reason)
         return plan
 
@@ -2399,6 +2470,17 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                 continue
             today_str = today.strftime('%Y-%m-%d')
 
+            # 【V2.11.35新增，MFE/MAE】如果現在有持有中的部位，用「今天」的High/Low更新這筆交易
+            # 持有期間曾經到過的最高/最低價——這裡用的是進場後第一次輪到「今天」被當作當下日期處理
+            # 的那一天開始（也就是實際成交隔天起），不含成交前的等待期間（那時候還沒有部位）。
+            if open_trade is not None:
+                _day_high = _safe_float(row.get('high'))
+                _day_low = _safe_float(row.get('low'))
+                if _day_high > 0:
+                    open_trade['mfe_price'] = max(open_trade['mfe_price'], _day_high)
+                if _day_low > 0:
+                    open_trade['mae_price'] = min(open_trade['mae_price'], _day_low)
+
             if not is_us_stock and today in inst_df.index:
                 inst = {'days': int(inst_df.loc[today, 'days']), 'accumulated_shares': float(inst_df.loc[today, 'accumulated_shares'])}
             else:
@@ -2474,9 +2556,12 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                                    # 【V2.11.28新增，V2.11.30改名】子項分數，供事後分析哪個子項在拖累整體判別力
                                    'bq_volume': new_plan.get('bq_volume', 0), 'bq_macd': new_plan.get('bq_macd', 0),
                                    'bq_breakout_margin': new_plan.get('bq_breakout_margin', 0), 'bq_decision_score': new_plan.get('bq_decision_score', 0),
-                                   'retest_quality': '', 'adds': 0, 'partial_exits': [], 'is_us_stock': is_us_stock,
+                                   'retest_quality': new_plan.get('retest_quality', ''), 'adds': 0, 'partial_exits': [], 'is_us_stock': is_us_stock,
                                    'entry_regime_tw': _entry_regime['tw_regime'], 'entry_regime_us': _entry_regime['us_regime'],
-                                   'entry_regime_overview': _entry_regime['overview']}
+                                   'entry_regime_overview': _entry_regime['overview'],
+                                   # 【V2.11.35新增，MFE/MAE】用進場成交價當起點，之後每天用當天的
+                                   # High/Low更新，追蹤持有期間「最高曾經浮盈到哪」跟「最深曾經浮虧到哪」。
+                                   'mfe_price': next_open, 'mae_price': next_open}
                     new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
                 else:
                     new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
@@ -2533,11 +2618,28 @@ def _aggregate_backtest_trades(trade):
     t1_hit = len(trade.get('partial_exits', [])) >= 1
     t2_hit = len(trade.get('partial_exits', [])) >= 2
     _add_scores = trade.get('add_regime_scores', [])
+    # 【V2.11.35新增，MFE/MAE】把持有期間追蹤到的最高/最低價，換算成相對進場價的百分比。
+    # MFE（Maximum Favorable Excursion）：這筆交易期間「曾經浮盈到最多」是多少%，用來檢驗
+    # 「停利設定是不是抓在對的位置」（例如：如果很多交易MFE遠高於實際出場的獲利%，代表利潤
+    # 沒有被有效鎖住，回吐了很多）。
+    # MAE（Maximum Adverse Excursion）：這筆交易期間「曾經浮虧到最深」是多少%（負值），用來
+    # 檢驗「停損設定是不是抓在對的位置」（例如：如果最終獲利的交易，MAE也顯示曾經大幅虧損過
+    # 又拉回來，代表停損可能設太緊、容易把之後會成功的交易洗掉；反過來說，如果最終虧損的交易
+    # MAE都很淺，代表停損抓得早、防守有發揮作用）。
+    _mfe_price = trade.get('mfe_price', entry_price)
+    _mae_price = trade.get('mae_price', entry_price)
+    mfe_pct = (_mfe_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+    mae_pct = (_mae_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
     return {
         'code': trade['code'], 'entry_date': trade['entry_date'], 'exit_date': trade['exit_date'],
         'entry_price': entry_price, 'exit_price': exit_price, 'pnl_pct': pnl_pct,
+        'mfe_pct': round(mfe_pct, 2), 'mae_pct': round(mae_pct, 2),
         'holding_days': holding_days, 'adds': trade.get('adds', 0), 'partial_exits': len(trade.get('partial_exits', [])),
         't1_hit': t1_hit, 't2_hit': t2_hit, 'breakout_quality_score': trade.get('breakout_quality_score', 0),
+        # 【V2.11.34修正】retest_quality 原本在回測裡一直是空字串（寫死，忘記接上實際算出來的值），
+        # 這次修正為讀取 evaluate_trade_state() 真正算出的分類（RETESTED_HELD／NO_RETEST／
+        # INVALID_TOUCHED／空字串代表這筆交易不是走PULLBACK_WAIT路徑，沒有回測品質可判斷）。
+        'retest_quality': trade.get('retest_quality', ''),
         # 【V2.11.28新增，V2.11.30改名】突破品質分數的子項，供分析哪個子項在拖累整體判別力。
         'bq_volume': trade.get('bq_volume', 0), 'bq_macd': trade.get('bq_macd', 0),
         'bq_breakout_margin': trade.get('bq_breakout_margin', 0), 'bq_decision_score': trade.get('bq_decision_score', 0),
@@ -2564,6 +2666,20 @@ def calculate_backtest_metrics(trades_df):
     平均的市場燈號分數各是多少。用來直接檢驗「虧損是不是集中在大盤本身轉弱的時段」這個假設——
     如果輸的交易平均進場分數明顯低於贏的交易，代表逆風攔截的門檻可能設得不夠嚴；如果兩者分數
     差不多，代表虧損不是市場環境造成的，是個股/訊號本身的問題。
+
+    【V2.11.35新增，MFE/MAE總覽】用來檢驗「停損/停利設定到底抓得準不準」，這是30年資深操盤手
+    校準風控參數最基本的工具，比單純調整倍數參數更有根據：
+      - avg_mfe_win／avg_win_pct 的差距（「獲利回吐」缺口）：贏的交易平均「曾經浮盈到最多」是
+        多少%，跟「實際出場拿到」多少%之間的差距。如果缺口很大，代表移動防守線可能太鬆，
+        利潤在拉回時被吐回去太多，沒有確實鎖住；缺口很小，代表停利機制抓得緊，獲利保護得好。
+      - avg_mae_loss：輸的交易平均「曾經浮虧到最深」是多少%（負值）。理論上這個數字應該
+        接近初始停損的理論距離（約-2×ATR換算成的百分比）；如果實際MAE比理論停損距離深很多，
+        代表停損可能沒有確實執行、或有跳空造成的滑價；如果MAE遠比理論停損距離淺，代表停損
+        可能設太緊，還沒真正跌到理論停損價，其他機制（例如MACD翻黑）就先出場了。
+      - avg_mae_win：贏的交易在最終獲利之前，平均「曾經浮虧到最深」是多少%。如果這個數字
+        明顯偏深（例如超過-5%），代表這些最終賺錢的交易一路上經歷過不小的帳面虧損才翻正——
+        如果停損設更緊，這些交易可能會提早被洗出場、變成虧損，這是判斷「停損是不是設太緊」
+        的直接證據（比單純猜測「10天內停損的都是0%勝率」更精確）。
     """
     if trades_df is None or trades_df.empty:
         return None
@@ -2580,6 +2696,7 @@ def calculate_backtest_metrics(trades_df):
     running_max = equity_curve.cummax()
     drawdown = (equity_curve - running_max) / running_max * 100
     max_drawdown = drawdown.min() if len(drawdown) > 0 else 0.0
+    _has_mfe_mae = 'mfe_pct' in trades_df.columns and 'mae_pct' in trades_df.columns
     return {
         'total_trades': len(trades_df), 'win_rate': win_rate, 'avg_win_pct': avg_win, 'avg_loss_pct': avg_loss,
         'profit_factor': profit_factor, 'expectancy_pct': expectancy, 'avg_holding_days': trades_df['holding_days'].mean(),
@@ -2587,6 +2704,9 @@ def calculate_backtest_metrics(trades_df):
         'stop_rate': (1 - win_rate / 100) * 100, 'max_drawdown_pct': max_drawdown, 'equity_curve': equity_curve,
         'avg_regime_score_win': wins['entry_regime_score'].mean() if len(wins) > 0 and 'entry_regime_score' in trades_df.columns else None,
         'avg_regime_score_loss': losses['entry_regime_score'].mean() if len(losses) > 0 and 'entry_regime_score' in trades_df.columns else None,
+        'avg_mfe_win': wins['mfe_pct'].mean() if len(wins) > 0 and _has_mfe_mae else None,
+        'avg_mae_win': wins['mae_pct'].mean() if len(wins) > 0 and _has_mfe_mae else None,
+        'avg_mae_loss': losses['mae_pct'].mean() if len(losses) > 0 and _has_mfe_mae else None,
     }
 
 def calculate_backtest_by_code(trades_df):
@@ -3274,6 +3394,18 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                         "（分數越低代表大盤當時越弱，見「依股票代碼分組績效」下方交易明細的 `entry_regime_score` 欄位；"
                         "0~100分級距見說明書第14節Market Regime Score說明）"
                     )
+                if _bt_metrics.get('avg_mfe_win') is not None:
+                    _mfe_w = _bt_metrics.get('avg_mfe_win')
+                    _mae_w = _bt_metrics.get('avg_mae_win')
+                    _mae_l = _bt_metrics.get('avg_mae_loss')
+                    _giveback = _mfe_w - _bt_metrics['avg_win_pct']
+                    st.caption(
+                        f"📐 MFE/MAE：贏的交易平均最高曾浮盈 {_mfe_w:.1f}%（實際出場拿到{_bt_metrics['avg_win_pct']:.1f}%，"
+                        f"回吐約{_giveback:.1f}個百分點）｜贏的交易平均最深曾浮虧 {_mae_w:.1f}%　"
+                        f"｜　輸的交易平均最深曾浮虧 {f'{_mae_l:.1f}%' if _mae_l is not None else 'N/A'}　"
+                        "（回吐缺口大代表停利可能太鬆；贏的交易MAE很深代表停損可能設太緊，容易把後來會成功的交易洗掉；"
+                        "輸的交易MAE可以拿來對照理論停損距離，看停損有沒有確實執行）"
+                    )
                 st.caption(
                     "⚠️ 最大回撤是用「逐筆交易累積報酬率」算出的簡化權益曲線，不是真實資金逐日回撤"
                     "（沒有考慮同時持有多檔部位的資金排擠、也沒有考慮交易成本/滑價，屬於P2-2/P2-3尚未實作範圍，"
@@ -3350,12 +3482,23 @@ else:
             if isinstance(c, pd.DataFrame): c, h, l, v = c.iloc[:, 0], h.iloc[:, 0], l.iloc[:, 0], v.iloc[:, 0]
 
             price, volume, vol_ma5 = float(c.iloc[-1]), float(v.iloc[-1]), float(v.rolling(5).mean().iloc[-1])
-            # 【V2.11.2 新增】未完成K棒提醒（輕量版）：如果抓到的最後一筆資料日期是「今天」，
-            # 代表這根K棒可能還在交易時段中持續變動（尤其影響量能、KD、RSI），收盤後數字才會定案。
+            # 【V2.11.2 新增，V2.11.33修正真實bug】未完成K棒提醒：如果抓到的最後一筆資料日期是
+            # 「今天」，代表這根K棒可能還在交易時段中持續變動（尤其影響量能、KD、RSI），收盤後
+            # 數字才會定案。
+            # 【V2.11.33修正】原本只比較日期（今天 vs K棒日期），完全沒有比較時間，導致收盤後很久
+            # （例如下午5點，台股13:30早就收盤）系統還誤判「可能還在交易時段中」——因為
+            # datetime.datetime.now() 用的是伺服器當地時間，跟股市實際開盤時段完全是兩回事，
+            # 光看日期不看時鐘完全無法判斷「現在到底收盤了沒」。改成同時比較日期「和」市場實際
+            # 交易時段（台股09:00~13:30／美股09:30~16:00，用zoneinfo正確處理時區與日光節約時間），
+            # 兩者都符合才視為「今天這根K棒可能還在變動」，收盤後即使日期還是今天，也會正確判定
+            # 為已經定案的資料。
+            _is_us_stock_for_freshness = code.isalpha() or code.endswith('.US')
+            _market_tz = ZoneInfo("America/New_York") if _is_us_stock_for_freshness else ZoneInfo("Asia/Taipei")
+            _market_now = datetime.datetime.now(_market_tz)
             _last_bar_date = pd.Timestamp(df.index[-1])
             if _last_bar_date.tzinfo is not None:
                 _last_bar_date = _last_bar_date.tz_localize(None)
-            is_today_bar = _last_bar_date.date() == datetime.datetime.now().date()
+            is_today_bar = _last_bar_date.date() == _market_now.date() and _is_market_session_open(_is_us_stock_for_freshness, _market_now)
             pivot_point = (float(h.iloc[-2]) + float(l.iloc[-2]) + float(c.iloc[-2])) / 3 if len(h) >= 2 else price
             pivot_status = "🟢 站上" if price > pivot_point else "🔴 未站上"
 
