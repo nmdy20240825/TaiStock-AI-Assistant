@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.36"
+APP_VERSION = "V2.11.37"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -2719,6 +2719,55 @@ def calculate_backtest_metrics(trades_df):
         'avg_mae_loss': losses['mae_pct'].mean() if len(losses) > 0 and _has_mfe_mae else None,
     }
 
+def calculate_walk_forward_split(trades_df, n_periods=2):
+    """
+    【V2.11.37新增】把交易明細依「進場日期」切成N個時間段，各自完整算一次
+    calculate_backtest_metrics()，用來檢驗策略表現是不是集中在某一段特定期間（過度擬合的
+    警訊），還是在不同時間段都維持一致的方向。
+
+    【重要澄清】這不是嚴謹學術定義的「walk-forward optimization」（那需要自動在每一段用不同
+    參數重新尋優、再用下一段驗證，工程量大很多）。這裡做的是更務實的「跨時段一致性檢查」：
+    用同一組固定參數（你已經手動決定好的那些），檢查策略在不同時間段的表現是不是穩定——如果
+    表現高度集中在其中一段、另一段明顯轉差甚至由正轉負，代表你目前看到的整體正期望值可能
+    只是某幾筆特定交易撐起來的，不是策略本身穩定的優勢；如果各段方向一致，才比較有信心這個
+    優勢不是單一時段的偶然。
+
+    依「進場日期」的時間範圍等分成n_periods段（預設2段，前半/後半），不是依交易筆數等分——
+    因為進場日期在時間軸上的分布不一定均勻，依日期切才能真正反映「不同時間段」的意思。
+
+    回傳每個時間段的 list of dict：{period_label, start_date, end_date, trade_count, metrics}，
+    metrics 是該段的完整 calculate_backtest_metrics() 結果（該段沒有任何交易時為 None）。
+    """
+    if trades_df is None or trades_df.empty:
+        return []
+    df = trades_df.copy()
+    df['entry_date'] = pd.to_datetime(df['entry_date'])
+    df = df.sort_values('entry_date').reset_index(drop=True)
+
+    min_date, max_date = df['entry_date'].min(), df['entry_date'].max()
+    total_days = (max_date - min_date).days
+    if total_days <= 0:
+        return [{'period_label': '全部（時間範圍過短無法切分）', 'start_date': min_date.strftime('%Y-%m-%d'),
+                  'end_date': max_date.strftime('%Y-%m-%d'), 'trade_count': len(df), 'metrics': calculate_backtest_metrics(df)}]
+
+    boundaries = [min_date + pd.Timedelta(days=total_days * i / n_periods) for i in range(n_periods + 1)]
+
+    segments = []
+    for idx in range(n_periods):
+        start, end = boundaries[idx], boundaries[idx + 1]
+        if idx == n_periods - 1:
+            mask = (df['entry_date'] >= start) & (df['entry_date'] <= end)
+        else:
+            mask = (df['entry_date'] >= start) & (df['entry_date'] < end)
+        segment_df = df[mask]
+        metrics = calculate_backtest_metrics(segment_df) if not segment_df.empty else None
+        segments.append({
+            'period_label': f"第{idx + 1}段（{'較早' if idx == 0 else '較晚'}）" if n_periods == 2 else f"第{idx + 1}段",
+            'start_date': start.strftime('%Y-%m-%d'), 'end_date': end.strftime('%Y-%m-%d'),
+            'trade_count': len(segment_df), 'metrics': metrics,
+        })
+    return segments
+
 def calculate_backtest_by_code(trades_df):
     """
     【V2.11.25新增】依股票代碼分組的績效拆解——回答「哪幾檔貢獻最多獲利/虧損」。
@@ -3424,6 +3473,39 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
 
                 st.subheader("📉 權益曲線（模擬，逐筆交易累積報酬率）")
                 st.line_chart(_bt_metrics['equity_curve'])
+
+                st.subheader("🧪 跨時段一致性檢查")
+                st.caption(
+                    "把交易依進場日期切成前後兩段，各自獨立算一次完整績效，檢查表現是不是集中在"
+                    "某一段特定期間（過度擬合的警訊），還是不同時間段都維持一致的方向。**這不是"
+                    "嚴謹學術定義的walk-forward optimization**（那需要每段自動重新尋優參數），"
+                    "是更務實的一致性檢查：用你現在這組固定參數，看不同時段表現穩不穩定。"
+                )
+                _wf_segments = calculate_walk_forward_split(_bt_trades_df, n_periods=2)
+                if len(_wf_segments) < 2:
+                    st.info("交易數量或時間範圍不足，無法切成兩段比較。")
+                else:
+                    _wf_cols = st.columns(len(_wf_segments))
+                    for _seg, _col in zip(_wf_segments, _wf_cols):
+                        with _col:
+                            st.markdown(f"**{_seg['period_label']}**　{_seg['start_date']} ～ {_seg['end_date']}")
+                            if _seg['metrics'] is None:
+                                st.write(f"這段沒有任何交易（共{_seg['trade_count']}筆）")
+                            else:
+                                _m = _seg['metrics']
+                                st.metric("交易筆數", _seg['trade_count'])
+                                st.metric("勝率", f"{_m['win_rate']:.1f}%")
+                                st.metric("Profit Factor", f"{_m['profit_factor']:.2f}" if _m['profit_factor'] != float('inf') else "∞")
+                                st.metric("Expectancy", f"{_m['expectancy_pct']:.2f}%")
+                    _valid_segs = [s for s in _wf_segments if s['metrics'] is not None]
+                    if len(_valid_segs) >= 2:
+                        _exps = [s['metrics']['expectancy_pct'] for s in _valid_segs]
+                        if all(e > 0 for e in _exps):
+                            st.caption("✅ 各時間段的期望值都是正的，方向一致，比較不像是單一時段偶然撐起來的結果。")
+                        elif all(e < 0 for e in _exps):
+                            st.caption("⚠️ 各時間段的期望值都是負的——這組參數在這整段回測期間可能本來就沒有優勢。")
+                        else:
+                            st.caption("⚠️ 各時間段的期望值方向不一致（有正有負），目前看到的整體正期望值，可能是被表現特別好的那一段拉高的，建議謹慎看待，不要照單全收。")
 
                 st.subheader("🧩 依股票代碼分組績效")
                 st.caption(
