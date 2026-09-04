@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.37"
+APP_VERSION = "V2.11.38"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -1254,6 +1254,32 @@ BREAKOUT_QUALITY_GATE_THRESHOLD = 50.0  # 【V2.11.34新增，需要人工確認
 # 驗證出量能甜蜜點/突破強度子項有正相關（相關係數約0.17~0.26，屬中等偏弱訊號，不是強力保證），
 # 屬於初版經驗值，建議之後用更大樣本的回測結果重新校準這個門檻。
 
+REGIME_NEUTRAL_ZONE_UPPER = 60.0  # 【V2.11.38新增，需要人工確認的參數】市場燈號分數在
+# REGIME_BEARISH_THRESHOLD（40分）到這個數字之間，視為「中性」——還沒到逆風攔截的地步，
+# 但也稱不上明確偏多。用V2.11.37的跨時段一致性檢查發現：回測期間市場燈號平均59分的那一段
+# Expectancy是負的（-1.93%），平均73分的那一段是強烈正值（+7.82%），兩者差距懸殊——代表
+# 目前系統可能只在「明確偏多」的環境下才有優勢，中性環境下容易虧錢，但entry_gate原本只有
+# 「低於40分才攔截」這一道關卡，40~100分之間完全一視同仁放行，沒有區分「還可以」跟「真的
+# 很好」。60分是初版經驗值，取跨時段檢查裡兩段平均分數（59分/73分）中間值附近，抓一個大致
+# 的分界，之後應該用更多樣本重新校準。
+BREAKOUT_QUALITY_GATE_THRESHOLD_NEUTRAL = 65.0  # 【V2.11.38新增，需要人工確認的參數】市場燈號
+# 分數落在「中性區」（REGIME_BEARISH_THRESHOLD~REGIME_NEUTRAL_ZONE_UPPER之間）時，改用這個
+# 較高的品質門檻（原本50分提高到65分，對應五級評等的B/C分界），只放行更扎實的訊號，不是完全
+# 不能進場——呼應V2.11.16設計Market Regime Score五級分類時「中性應該降低部位」的構想，但沒有
+# 直接動部位大小計算（風險較高），改用「拉高品質要求」這個更小範圍的方式間接做到類似效果。
+
+def _breakout_quality_gate_threshold_for_regime(regime_score):
+    """
+    【V2.11.38新增】依市場燈號分數決定這次要用哪個突破品質門檻，不再是「逆風才擋、其他所有
+    情況一視同仁」的二元處理。regime_score < REGIME_BEARISH_THRESHOLD 的情況理論上已經在更早
+    的 _regime_is_bearish() 那一關就被攔截、不會走到品質門檻這一步，這裡列出來是防禦性判斷。
+    """
+    if regime_score is None:
+        return BREAKOUT_QUALITY_GATE_THRESHOLD  # 資料缺失時用基礎門檻，不额外收緊也不放寬
+    if regime_score >= REGIME_NEUTRAL_ZONE_UPPER:
+        return BREAKOUT_QUALITY_GATE_THRESHOLD
+    return BREAKOUT_QUALITY_GATE_THRESHOLD_NEUTRAL
+
 def calculate_regime_score(macro_data):
     """
     【V2.11.16新增，Market Regime Score】把「順風/逆風」從二元開關改成 0~100 分的連續分數，
@@ -1967,16 +1993,23 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
         valid_until = _add_business_days(data_date, 5, is_us_stock)
         reason = "現價已超過追價上限，改為等待回測區間"
     elif price >= breakout_price > 0:
-        # 【V2.11.34新增，Breakout Quality Gate】品質分數未達門檻時，先不直接確認進場，改成
-        # BREAKOUT_WAIT繼續追蹤觀察——這裡是「這次剛好第一次偵測到時，價格已經越過突破價」的
-        # 情境，這時候的品質分數是有意義的（breakout_margin_atr是真實數字，不是等待階段的0），
-        # 可以直接拿來判斷。之後如果分數改善（例如量能持續放大），會在evaluate_trade_state()的
-        # WAIT→ENTER_NEXT_DAY重新確認流程裡用當天最新資料重算一次品質，不是延用這裡凍結的舊分數
-        # （那個分數只在「這一天首次建立計畫」時有意義，之後每天狀況都在變，應該重新判斷）。
-        if _bq_score < BREAKOUT_QUALITY_GATE_THRESHOLD:
+        # 【V2.11.34新增，Breakout Quality Gate；V2.11.38改為依市場燈號分兩級門檻】品質分數未達
+        # 門檻時，先不直接確認進場，改成BREAKOUT_WAIT繼續追蹤觀察——這裡是「這次剛好第一次偵測到
+        # 時，價格已經越過突破價」的情境，這時候的品質分數是有意義的（breakout_margin_atr是真實
+        # 數字，不是等待階段的0），可以直接拿來判斷。之後如果分數改善（例如量能持續放大），會在
+        # evaluate_trade_state()的WAIT→ENTER_NEXT_DAY重新確認流程裡用當天最新資料重算一次品質，
+        # 不是延用這裡凍結的舊分數（那個分數只在「這一天首次建立計畫」時有意義，之後每天狀況都在
+        # 變，應該重新判斷）。
+        # 【V2.11.38】門檻本身不再是單一固定值：市場燈號處於中性區間時，改用較高的門檻
+        # （BREAKOUT_QUALITY_GATE_THRESHOLD_NEUTRAL），只放行更扎實的訊號；明確偏多以上維持
+        # 原本基礎門檻。理由見該常數的說明（V2.11.37跨時段一致性檢查發現中性市場的期望值是負的）。
+        _regime_scores_here = calculate_regime_score(market_context)
+        _regime_score_here = _regime_scores_here["us_regime"] if is_us_stock else _regime_scores_here["tw_regime"]
+        _quality_threshold_here = _breakout_quality_gate_threshold_for_regime(_regime_score_here)
+        if _bq_score < _quality_threshold_here:
             state = "BREAKOUT_WAIT"
             valid_until = _add_business_days(data_date, 3, is_us_stock)
-            reason = f"突破確認但品質分數{_bq_score:.0f}分未達{BREAKOUT_QUALITY_GATE_THRESHOLD:.0f}分門檻，先追蹤觀察，不強制進場"
+            reason = f"突破確認但品質分數{_bq_score:.0f}分未達門檻{_quality_threshold_here:.0f}分（市場燈號{_regime_score_here:.0f}分），先追蹤觀察，不強制進場"
         else:
             state = "ENTER_NEXT_DAY"
             valid_until = _add_business_days(data_date, 3, is_us_stock)
@@ -2225,7 +2258,13 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             _reconfirm_macd_ratio = (abs(_reconfirm_macd_value) / _atr_now) if (_reconfirm_macd_value is not None and _atr_now > 0) else None
             _reconfirm_score, _reconfirm_grade, _reconfirm_detail = calculate_breakout_quality_score(
                 indicators.get("volume"), indicators.get("vol_ma5"), _reconfirm_macd_ratio, _reconfirm_margin_atr, indicators.get("decision_score"))
-            if _reconfirm_score < BREAKOUT_QUALITY_GATE_THRESHOLD:
+            # 【V2.11.38新增】門檻依當下市場燈號分數分兩級，理由見
+            # _breakout_quality_gate_threshold_for_regime() 的說明（V2.11.37跨時段一致性檢查
+            # 發現中性市場的期望值是負的）。
+            _reconfirm_regime_scores = calculate_regime_score(market_context)
+            _reconfirm_regime_score = _reconfirm_regime_scores["us_regime"] if is_us_stock else _reconfirm_regime_scores["tw_regime"]
+            _reconfirm_threshold = _breakout_quality_gate_threshold_for_regime(_reconfirm_regime_score)
+            if _reconfirm_score < _reconfirm_threshold:
                 # 品質還沒到，留在原狀態（BREAKOUT_WAIT／PULLBACK_WAIT）繼續觀察，不強制進場、
                 # 也不砍掉這筆追蹤。既有的 is_signal_invalid（跌破失效價）／valid_until（有效期限
                 # 到期）機制完全不受影響、照常運作，不會因為這道品質關卡而讓計畫無限期卡死。
