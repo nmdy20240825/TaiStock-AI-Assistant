@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.46"
+APP_VERSION = "V2.11.47"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -3458,9 +3458,9 @@ def render_stock_card(data, system_history, portfolio_data):
                     # 「沒做」意義不一樣——出場訊號沒做＝續抱；進場訊號沒做＝放棄這次機會。用不同的
                     # 選項組合，記錄起來才準確，不用勉強套同一組選項。
                     if _plan_state in ("PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY"):
-                        _log_options = ["完全照做", "延後出場", "部分出場/股數不同", "續抱未出場"]
+                        _log_options = ["完全照做", "延後出場", "部分出場/股數不同", "有下單但未成交", "續抱未出場"]
                     else:
-                        _log_options = ["完全照做", "延後執行", "部分執行/股數不同", "沒有進場/加碼"]
+                        _log_options = ["完全照做", "延後執行", "部分執行/股數不同", "有下單但未成交", "沒有進場/加碼"]
                     _log_action = st.radio("我實際上", _log_options, key=f"log_action_{data['code']}", horizontal=True)
                     _log_price_col, _log_reason_col = st.columns(2)
                     _log_price = _log_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_{data['code']}")
@@ -3488,9 +3488,9 @@ def render_stock_card(data, system_history, portfolio_data):
                         st.caption("目前畫面顯示的狀態可能是盤中還沒收盤的資料算出來的，跟昨晚不一樣，這裡記錄的是你依照昨晚確定版實際做了什麼。")
                         _snap_state = _log_snap.get('state', '')
                         if _snap_state in ("PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY"):
-                            _log_options2 = ["完全照做", "延後出場", "部分出場/股數不同", "續抱未出場"]
+                            _log_options2 = ["完全照做", "延後出場", "部分出場/股數不同", "有下單但未成交", "續抱未出場"]
                         else:
-                            _log_options2 = ["完全照做", "延後執行", "部分執行/股數不同", "沒有進場/加碼"]
+                            _log_options2 = ["完全照做", "延後執行", "部分執行/股數不同", "有下單但未成交", "沒有進場/加碼"]
                         _log_action2 = st.radio("我實際上", _log_options2, key=f"log_action_snap_{data['code']}", horizontal=True)
                         _log_price_col2, _log_reason_col2 = st.columns(2)
                         _log_price2 = _log_price_col2.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_snap_{data['code']}")
