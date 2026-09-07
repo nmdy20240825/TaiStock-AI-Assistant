@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.47"
+APP_VERSION = "V2.11.48"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -3472,20 +3472,29 @@ def render_stock_card(data, system_history, portfolio_data):
                         )
                         if _ok:
                             st.success("已記錄")
-            elif data.get('is_today_bar'):
-                # 【V2.11.46新增，修復真實使用缺口】上面那個記錄小工具原本只看「今天即時畫面」的
-                # 狀態——但盤中如果股價已經回到防守線之上，即時重算可能會變成HOLD這種非actionable
-                # 狀態，導致小工具直接消失，即使昨晚確定版明明是要求你做決定的狀態（例如創意3443
-                # 這個真實案例：昨晚確定版是「分批出場」，但盤中股價又漲上去，即時畫面變成
-                # 「持有續抱」）。這種情況下，你該執行、也該記錄的是「昨晚確定版」的建議，不是
-                # 「現在這個可能還會變的畫面」，所以這裡改成去查昨晚的凍結快照，只要快照本身是
-                # actionable狀態、且真的跟現在的即時狀態不一樣，一樣提供記錄小工具，但明確標示
-                # 這是根據「昨晚確定版」而不是「現在畫面」。
+            else:
+                # 【V2.11.46新增，V2.11.48修正真實使用缺口】上面那個記錄小工具原本只看「今天即時
+                # 畫面」的狀態——但即時畫面跟凍結快照不一致的狀況，不是只有「盤中」才會發生：
+                # 使用者實際回報過一個更完整的情境——早上照昨天的確定版掛單，但到收盤都沒成交，
+                # 收盤後（已經不是is_today_bar）上線，系統這時候已經重新算出「今天」的最新狀態
+                # （可能已經變成HOLD），使用者想記錄「今天早上照著昨天的計畫做了什麼」，卻連備援
+                # 小工具都找不到——因為V2.11.46的備援條件寫死只在is_today_bar為True（盤中）才會
+                # 觸發，收盤後這個條件就是False，備援跟著一起消失。
+                # 這裡拿掉is_today_bar這個限制，只要「即時狀態不是actionable」就一律檢查快照，不分
+                # 盤中或收盤後；改用「快照日期夠新」當篩選條件（在today_str往前5天內），避免因為
+                # 拿掉時間限制之後，讓好幾週前的舊快照也一直跳出來，造成畫面雜訊。
                 _log_snap = trade_plan_snapshots.get(str(data['code']))
-                if _log_snap and _log_snap.get('state') in _actionable_states:
+                _snap_date_str = _log_snap.get('snapshot_date', '') if _log_snap else ''
+                _snap_is_recent = False
+                if _snap_date_str:
+                    try:
+                        _snap_is_recent = (datetime.datetime.strptime(today_str, "%Y-%m-%d") - datetime.datetime.strptime(_snap_date_str, "%Y-%m-%d")).days <= 5
+                    except Exception:
+                        _snap_is_recent = False
+                if _log_snap and _log_snap.get('state') in _actionable_states and _snap_is_recent:
                     with st.expander(f"📝 記錄我的決定（依據{_log_snap.get('snapshot_date', '—')}收盤確定版，非目前畫面）"):
-                        st.caption(f"昨晚確定版建議：{_state_label_map.get(_log_snap.get('state', ''), _log_snap.get('state', ''))}｜{_log_snap.get('signal_reason', '')}")
-                        st.caption("目前畫面顯示的狀態可能是盤中還沒收盤的資料算出來的，跟昨晚不一樣，這裡記錄的是你依照昨晚確定版實際做了什麼。")
+                        st.caption(f"上一次確定版建議：{_state_label_map.get(_log_snap.get('state', ''), _log_snap.get('state', ''))}｜{_log_snap.get('signal_reason', '')}")
+                        st.caption("目前畫面顯示的狀態已經跟這份不一樣了（可能是盤中重算，或收盤後已經推進到更新的一天），這裡記錄的是你依照上面這份確定版實際做了什麼。")
                         _snap_state = _log_snap.get('state', '')
                         if _snap_state in ("PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY"):
                             _log_options2 = ["完全照做", "延後出場", "部分出場/股數不同", "有下單但未成交", "續抱未出場"]
