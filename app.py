@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.45"
+APP_VERSION = "V2.11.46"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -3472,6 +3472,36 @@ def render_stock_card(data, system_history, portfolio_data):
                         )
                         if _ok:
                             st.success("已記錄")
+            elif data.get('is_today_bar'):
+                # 【V2.11.46新增，修復真實使用缺口】上面那個記錄小工具原本只看「今天即時畫面」的
+                # 狀態——但盤中如果股價已經回到防守線之上，即時重算可能會變成HOLD這種非actionable
+                # 狀態，導致小工具直接消失，即使昨晚確定版明明是要求你做決定的狀態（例如創意3443
+                # 這個真實案例：昨晚確定版是「分批出場」，但盤中股價又漲上去，即時畫面變成
+                # 「持有續抱」）。這種情況下，你該執行、也該記錄的是「昨晚確定版」的建議，不是
+                # 「現在這個可能還會變的畫面」，所以這裡改成去查昨晚的凍結快照，只要快照本身是
+                # actionable狀態、且真的跟現在的即時狀態不一樣，一樣提供記錄小工具，但明確標示
+                # 這是根據「昨晚確定版」而不是「現在畫面」。
+                _log_snap = trade_plan_snapshots.get(str(data['code']))
+                if _log_snap and _log_snap.get('state') in _actionable_states:
+                    with st.expander(f"📝 記錄我的決定（依據{_log_snap.get('snapshot_date', '—')}收盤確定版，非目前畫面）"):
+                        st.caption(f"昨晚確定版建議：{_state_label_map.get(_log_snap.get('state', ''), _log_snap.get('state', ''))}｜{_log_snap.get('signal_reason', '')}")
+                        st.caption("目前畫面顯示的狀態可能是盤中還沒收盤的資料算出來的，跟昨晚不一樣，這裡記錄的是你依照昨晚確定版實際做了什麼。")
+                        _snap_state = _log_snap.get('state', '')
+                        if _snap_state in ("PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY"):
+                            _log_options2 = ["完全照做", "延後出場", "部分出場/股數不同", "續抱未出場"]
+                        else:
+                            _log_options2 = ["完全照做", "延後執行", "部分執行/股數不同", "沒有進場/加碼"]
+                        _log_action2 = st.radio("我實際上", _log_options2, key=f"log_action_snap_{data['code']}", horizontal=True)
+                        _log_price_col2, _log_reason_col2 = st.columns(2)
+                        _log_price2 = _log_price_col2.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_snap_{data['code']}")
+                        _log_reason2 = _log_reason_col2.text_input("原因（選填）", key=f"log_reason_snap_{data['code']}")
+                        if st.button("儲存這筆紀錄", key=f"log_submit_snap_{data['code']}"):
+                            _ok2 = append_decision_log(
+                                today_str, data['code'], f"{_snap_state}（昨晚確定版）：{_log_snap.get('signal_reason', '')}",
+                                _log_action2, _log_price2 if _log_price2 > 0 else None, _log_reason2,
+                            )
+                            if _ok2:
+                                st.success("已記錄")
 
         with tab_c6:
             # 【新增】MACD 動能變化與背離分析：日線／週線分開顯示，格式對照四大模組
