@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.41"
+APP_VERSION = "V2.11.43"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -736,14 +736,24 @@ def _trim_trailing_nan_rows(df, max_trim=3, min_keep=60):
 
 @st.cache_data(ttl=300)
 def fetch_stock_data(code):
+    """
+    【V2.11.42修正】明確加上 auto_adjust=True。原本沒有指定這個參數，yfinance 回傳的股價
+    是否已經還原股利/股票分割，完全取決於當下安裝的 yfinance 版本預設值（不同版本的預設值
+    不一樣，行為不確定）。如果剛好是「不還原」的版本，台股在除息日附近，Close/High/Low
+    會出現一個假的跳空缺口——這本身不影響「今天」這一天的真實成交價（今天的價格本來就
+    沒有調整前後的差異），但會扭曲用「過去N天」計算的指標（MA20/60、ATR、前高、波段低點），
+    在除息日之後的一段時間內（約MA60的暖身期長度）可能讓這些指標失真，進而影響進出場判斷。
+    明確指定 auto_adjust=True，確保不管安裝的yfinance版本是哪一個，行為都一致、正確地還原
+    股利/分割，不再依賴不確定的預設值。
+    """
     try:
         if code.isalpha() or code.endswith('.US'):
-            df = yf.download(code.replace('.US', ''), period="6mo", progress=False)
+            df = yf.download(code.replace('.US', ''), period="6mo", progress=False, auto_adjust=True)
         elif code.endswith('.TW') or code.endswith('.TWO'):
-            df = yf.download(code, period="6mo", progress=False)
+            df = yf.download(code, period="6mo", progress=False, auto_adjust=True)
         else:
-            df_tw = yf.download(f"{code}.TW", period="6mo", progress=False)
-            df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="6mo", progress=False)
+            df_tw = yf.download(f"{code}.TW", period="6mo", progress=False, auto_adjust=True)
+            df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="6mo", progress=False, auto_adjust=True)
         return _trim_trailing_nan_rows(df)
     except Exception: return pd.DataFrame()
 
@@ -754,15 +764,18 @@ def fetch_stock_data_extended(code):
     （約26根週K），對週線 MACD（EMA26+訊號9）而言暖身期完全不夠，週線分析會永遠卡在「資料不足」。
     這裡另開一個獨立、較長快取時間（30分鐘）的抓取函式，抓 2 年資料，跟 fetch_stock_data()
     完全分開快取、互不影響，不會改變既有日線指標/K線圖/任何既有功能的行為或抓取頻率。
+
+    【V2.11.42修正】同 fetch_stock_data()，明確加上 auto_adjust=True，理由見該函式docstring。
+    這裡跨度2年，涵蓋除息事件的機率比6個月的日線資料更高，這個修正的影響也更明顯。
     """
     try:
         if code.isalpha() or code.endswith('.US'):
-            df = yf.download(code.replace('.US', ''), period="2y", progress=False)
+            df = yf.download(code.replace('.US', ''), period="2y", progress=False, auto_adjust=True)
         elif code.endswith('.TW') or code.endswith('.TWO'):
-            df = yf.download(code, period="2y", progress=False)
+            df = yf.download(code, period="2y", progress=False, auto_adjust=True)
         else:
-            df_tw = yf.download(f"{code}.TW", period="2y", progress=False)
-            df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="2y", progress=False)
+            df_tw = yf.download(f"{code}.TW", period="2y", progress=False, auto_adjust=True)
+            df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="2y", progress=False, auto_adjust=True)
         return _trim_trailing_nan_rows(df)
     except Exception:
         return pd.DataFrame()
@@ -2452,18 +2465,24 @@ def _fetch_backtest_indicator_frame(code, years=2):
 
     回傳 (df, raw, error)：df 是處理過的因果指標框（小寫欄位），raw 是原始 yfinance 格式
     （大寫Open/High/Low/Close，供 MACDStrategyAnalyzer 直接使用），error 是失敗原因文字。
+
+    【V2.11.42修正】明確加上 auto_adjust=True，理由跟 fetch_stock_data() 相同（見該函式
+    docstring），但這裡影響更大：回測跨度長達2年，遠比即時系統的6個月／週線的2年更容易涵蓋到
+    除息事件，如果沒有正確還原股利，回測算出來的MA/ATR/前高/波段低點在除息日附近會被扭曲，
+    可能產生不該出現的假訊號，直接影響回測結果的可信度——這是我們一路驗證回測系統時，
+    之前沒有檢查過的一個資料正確性缺口。
     """
     try:
         is_us = code.isalpha() or code.endswith('.US')
         period = f"{years}y" if years != 2 else "2y"
         if is_us:
-            raw = yf.download(code.replace('.US', ''), period=period, progress=False)
+            raw = yf.download(code.replace('.US', ''), period=period, progress=False, auto_adjust=True)
         elif code.endswith('.TW') or code.endswith('.TWO'):
-            raw = yf.download(code, period=period, progress=False)
+            raw = yf.download(code, period=period, progress=False, auto_adjust=True)
         else:
-            raw = yf.download(f"{code}.TW", period=period, progress=False)
+            raw = yf.download(f"{code}.TW", period=period, progress=False, auto_adjust=True)
             if raw is None or raw.empty:
-                raw = yf.download(f"{code}.TWO", period=period, progress=False)
+                raw = yf.download(f"{code}.TWO", period=period, progress=False, auto_adjust=True)
         raw = _trim_trailing_nan_rows(raw)
         if raw is None or raw.empty or len(raw) < 90:
             return None, None, f"歷史資料不足（僅{0 if raw is None else len(raw)}筆，至少需要90筆才能起算）"
@@ -3358,6 +3377,18 @@ def render_stock_card(data, system_history, portfolio_data):
             # 對美股會不準。改成依這張卡片的股票代號判斷市場，跟其他地方判斷 is_us_stock 的方式一致。
             _card_is_us_stock = str(data.get('code', '')).isalpha() or str(data.get('code', '')).endswith('.US')
             st.write(f"**目前執行模式**：{_mode_display.get(execution_mode, execution_mode)}\n**下一交易日**：{_next_business_day(data.get('plan_taiwan_data_date') or today_str, _card_is_us_stock) or '—'}")
+
+            # 【V2.11.43新增，懶人包摘要】把「建議股數」跟「該對照的價位」合併成單一句話，放在
+            # 最上面，不用再往下翻、跨區塊對照。下面原本的詳細分區（空手訊號資訊／持倉計畫資訊）
+            # 完整保留不變，這裡純粹是額外多加一個「一眼看懂」的摘要，不影響任何既有顯示內容。
+            if _plan_state == "ENTER_NEXT_DAY":
+                st.info(f"📋 **建議進場：{data.get('plan_suggested_shares', 0)} 股　｜　參考價位：{data.get('plan_breakout_price', 0):.2f} ～ {data.get('plan_chase_limit', 0):.2f}**（突破價～追價上限，開盤價超過上限則不追）")
+            elif _plan_state == "ADD_NEXT_DAY":
+                st.info(f"📋 **建議加碼：{data.get('plan_addon_shares_approved', 0)} 股　｜　隔日開盤附近執行**（加碼是條件達成即執行，沒有特定價位區間）")
+            elif _plan_state == "PARTIAL_EXIT_NEXT_DAY":
+                st.info(f"📋 **建議分批停利：{data.get('plan_partial_exit_shares', 0)} 股　｜　參考價位：T1 {data.get('plan_t1_price', 0):.2f} ／ T2 {data.get('plan_t2_price', 0):.2f}**")
+            elif _plan_state == "FULL_EXIT_NEXT_DAY":
+                st.info(f"📋 **建議全部出清：{data.get('plan_full_exit_shares', 0)} 股　｜　參考價位：防守線 {data.get('plan_current_trailing_stop', 0):.2f}**（實際成交價可能因跳空而偏離，見下方警語）")
 
             if data.get('held_qty', 0) <= 0:
                 st.markdown("**空手訊號資訊**")
