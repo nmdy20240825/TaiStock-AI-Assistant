@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.43"
+APP_VERSION = "V2.11.45"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -3381,12 +3381,31 @@ def render_stock_card(data, system_history, portfolio_data):
             # 【V2.11.43新增，懶人包摘要】把「建議股數」跟「該對照的價位」合併成單一句話，放在
             # 最上面，不用再往下翻、跨區塊對照。下面原本的詳細分區（空手訊號資訊／持倉計畫資訊）
             # 完整保留不變，這裡純粹是額外多加一個「一眼看懂」的摘要，不影響任何既有顯示內容。
+            # 【V2.11.45修正】依你的要求：不管哪種情況，只要有建議股數異動，都要提供一個可對照的
+            # 價位，不要出現「沒有價位」這種空白。對「條件觸發、本來就沒有目標價」的情況（加碼、
+            # MACD轉弱提前停利），改用「現價」當參考——這裡要非常清楚標示這是「參考」不是「目標」：
+            # 這幾種訊號本來就是「條件成立、隔天開盤就執行」，不是「等股價漲到/跌到某個價位才動作」，
+            # 用現價當參考只是讓你有一個大概的數字可以對照，實際成交價會是隔天開盤價，不會剛好等於
+            # 現在看到的這個數字，跟「突破價～追價上限」「T1/T2」這種真正的價位門檻，意義不一樣。
+            _cur_price = _safe_float(data.get('price', 0))
             if _plan_state == "ENTER_NEXT_DAY":
                 st.info(f"📋 **建議進場：{data.get('plan_suggested_shares', 0)} 股　｜　參考價位：{data.get('plan_breakout_price', 0):.2f} ～ {data.get('plan_chase_limit', 0):.2f}**（突破價～追價上限，開盤價超過上限則不追）")
             elif _plan_state == "ADD_NEXT_DAY":
-                st.info(f"📋 **建議加碼：{data.get('plan_addon_shares_approved', 0)} 股　｜　隔日開盤附近執行**（加碼是條件達成即執行，沒有特定價位區間）")
+                st.info(f"📋 **建議加碼：{data.get('plan_addon_shares_approved', 0)} 股　｜　參考現價：{_cur_price:.2f}**（加碼是條件達成即執行，沒有目標價門檻，隔日開盤附近成交，價格會跟現價略有出入）")
             elif _plan_state == "PARTIAL_EXIT_NEXT_DAY":
-                st.info(f"📋 **建議分批停利：{data.get('plan_partial_exit_shares', 0)} 股　｜　參考價位：T1 {data.get('plan_t1_price', 0):.2f} ／ T2 {data.get('plan_t2_price', 0):.2f}**")
+                # 分批停利有兩種完全不同的觸發原因，不能一律顯示T1/T2：T1_PARTIAL_EXIT／
+                # T2_PARTIAL_EXIT 是「真的漲到目標價」觸發，T1/T2就是該對照的價位；但
+                # MACD_REVERSAL_T1／MACD_REVERSAL_T2 是「還沒漲到目標價，MACD轉弱提前停利」，
+                # 本質上跟加碼一樣是「條件成立就執行」，改用現價當參考，不能顯示T1/T2誤導成
+                # 「要等漲到那個價位」。
+                _partial_signal_type = data.get('plan_signal_type', '')
+                if _partial_signal_type in ('T1_PARTIAL_EXIT', 'T2_PARTIAL_EXIT'):
+                    _partial_target = data.get('plan_t1_price', 0) if _partial_signal_type == 'T1_PARTIAL_EXIT' else data.get('plan_t2_price', 0)
+                    st.info(f"📋 **建議分批停利：{data.get('plan_partial_exit_shares', 0)} 股　｜　參考價位：{_partial_target:.2f}**（已觸及{'T1' if _partial_signal_type == 'T1_PARTIAL_EXIT' else 'T2'}目標價）")
+                elif _partial_signal_type in ('MACD_REVERSAL_T1', 'MACD_REVERSAL_T2'):
+                    st.info(f"📋 **建議分批停利：{data.get('plan_partial_exit_shares', 0)} 股　｜　參考現價：{_cur_price:.2f}**（尚未到達{'T1' if _partial_signal_type == 'MACD_REVERSAL_T1' else 'T2'}，是MACD轉弱提前停利，沒有目標價門檻，隔日開盤附近執行）")
+                else:
+                    st.info(f"📋 **建議分批停利：{data.get('plan_partial_exit_shares', 0)} 股　｜　參考價位：T1 {data.get('plan_t1_price', 0):.2f} ／ T2 {data.get('plan_t2_price', 0):.2f}**")
             elif _plan_state == "FULL_EXIT_NEXT_DAY":
                 st.info(f"📋 **建議全部出清：{data.get('plan_full_exit_shares', 0)} 股　｜　參考價位：防守線 {data.get('plan_current_trailing_stop', 0):.2f}**（實際成交價可能因跳空而偏離，見下方警語）")
 
