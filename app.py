@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.48"
+APP_VERSION = "V2.11.49"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -856,7 +856,29 @@ HISTORY_HEADERS = ["code", "date", "score", "status", "price"]
 # 【V2.11.39新增，Decision Log】純append-only的人工決策紀錄，記錄「系統建議 vs 你實際執行了什麼」
 # ——系統自己的建議/理由已經存在 trade_plan 分頁（state／signal_reason），這裡只補系統不可能
 # 知道的那一半：你有沒有真的照做、實際成交價位、偏離的原因。
-DECISION_LOG_HEADERS = ["log_date", "code", "system_suggestion", "action_taken", "actual_price", "reason", "logged_at"]
+DECISION_LOG_HEADERS = ["log_date", "code", "system_suggestion", "action_taken", "actual_price", "reason", "logged_at", "actual_shares"]
+# 【V2.11.49新增欄位放在最後，不是照邏輯上「自然」的位置插在actual_price前面——這是刻意的】
+# get_worksheet() 只有在分頁「第一次被建立」時才會寫入表頭，已經存在的分頁（例如V2.11.39上線
+# 後已經實際用過決策日誌的使用者）表頭不會自動更新。如果新欄位插在中間，對這些已經有舊表頭
+# （7欄，沒有actual_shares）的分頁來說，append_row()新寫入的8個值會對不上舊表頭的欄位順序，
+# 導致新資料在舊表頭下全部錯位、欄位意義全部跑掉。放在最後，舊有的7個欄位順序完全不受影響，
+# 新增的這個值只是多出一欄（沒有表頭標籤，但資料本身沒有錯位），搭配下面
+# _ensure_decision_log_header() 的自動補表頭機制，把缺的表頭名稱補上即可修復顯示，不需要動到
+#任何既有資料列。
+
+def _ensure_decision_log_header(ws):
+    """
+    【V2.11.49新增】自我修復：檢查 decision_log 分頁實際的表頭列，如果是V2.11.39~48時期建立的
+    舊版7欄表頭（沒有 actual_shares），就把缺的表頭名稱直接補上去（只更新表頭那一列的儲存格，
+    不會動到任何一筆既有資料）。新建立的分頁（get_worksheet內部已經會用最新的
+    DECISION_LOG_HEADERS 當表頭）不會觸發這裡，這裡只處理「已經存在、表頭是舊版」的情況。
+    """
+    try:
+        current_header = ws.row_values(1)
+        if current_header and len(current_header) < len(DECISION_LOG_HEADERS) and current_header == DECISION_LOG_HEADERS[:len(current_header)]:
+            ws.update(f"A1:{chr(64 + len(DECISION_LOG_HEADERS))}1", [DECISION_LOG_HEADERS])
+    except Exception:
+        pass  # 表頭補不上不影響資料寫入本身，安靜失敗即可，不阻擋使用者記錄
 
 # 【V2.11.41新增，Trade Plan Snapshot】每次某檔股票的資料日期真的往前推進到新的一天時，把「前一天
 # 最終確定版」的計畫內容凍結存一份，不管之後同一天內盤中重新評估幾次、覆寫幾次，都不會動到這份
@@ -1149,18 +1171,27 @@ def load_decision_log():
         st.error(f"⚠️ 讀取決策日誌失敗：{e}")
         return []
 
-def append_decision_log(log_date, code, system_suggestion, action_taken, actual_price, reason):
+def append_decision_log(log_date, code, system_suggestion, action_taken, actual_shares, actual_price, reason):
     """
     新增一筆決策日誌記錄。刻意用 append_row()（只新增一行）而不是 clear()+update()（整批清空
     重寫）——這是純append-only的紀錄，每次只新增一行，用append天生就不會有「清空成功、寫入
     失敗」的資料損毀窗口期（這正是V2.11.15/20修過的那類真實bug的成因，這裡從設計上直接避開，
     不需要再套用同一套安全模式機制）。
+
+    【V2.11.49新增】actual_shares：實際成交股數，跟 actual_price 分開記錄。原本只有價位欄位，
+    「有下單但未成交」這個選項填了原因也沒地方明講「0股成交」；「部分執行/股數不同」也只能
+    寫在自由文字的原因欄位裡，不夠精確。這裡明確加一個數字欄位，跟actual_price同樣是選填
+    （None代表沒填），未成交的情況可以直接填0，比留白或寫在原因欄位裡更清楚、之後也比較方便
+    拿來統計分析。這個欄位刻意放在 DECISION_LOG_HEADERS 清單的最後（不是邏輯上「自然」的
+    actual_price旁邊），理由見該常數的說明——確保已經有舊表頭的分頁不會發生欄位錯位。
     """
     try:
         ws = get_worksheet("decision_log", DECISION_LOG_HEADERS)
+        _ensure_decision_log_header(ws)
         ws.append_row([log_date, str(code), system_suggestion, action_taken,
                         actual_price if actual_price else "", reason or "",
-                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        actual_shares if actual_shares is not None else ""])
         return True
     except Exception as e:
         st.error(f"⚠️ 寫入決策日誌失敗：{e}")
@@ -3462,13 +3493,17 @@ def render_stock_card(data, system_history, portfolio_data):
                     else:
                         _log_options = ["完全照做", "延後執行", "部分執行/股數不同", "有下單但未成交", "沒有進場/加碼"]
                     _log_action = st.radio("我實際上", _log_options, key=f"log_action_{data['code']}", horizontal=True)
-                    _log_price_col, _log_reason_col = st.columns(2)
+                    # 【V2.11.49新增】實際成交股數，跟實際價位分開填——「有下單但未成交」可以直接
+                    # 填0（明確記錄「這次是0股成交」，比留白清楚）；「部分執行/股數不同」可以填
+                    # 實際成交的數量，不用只靠自由文字的原因欄位描述。
+                    _log_shares_col, _log_price_col, _log_reason_col = st.columns(3)
+                    _log_shares = _log_shares_col.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"log_shares_{data['code']}")
                     _log_price = _log_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_{data['code']}")
                     _log_reason = _log_reason_col.text_input("原因（選填，例如：延後/沒做/續抱的理由）", key=f"log_reason_{data['code']}")
                     if st.button("儲存這筆紀錄", key=f"log_submit_{data['code']}"):
                         _ok = append_decision_log(
                             today_str, data['code'], f"{_plan_state}：{data.get('plan_signal_reason', '')}",
-                            _log_action, _log_price if _log_price > 0 else None, _log_reason,
+                            _log_action, _log_shares, _log_price if _log_price > 0 else None, _log_reason,
                         )
                         if _ok:
                             st.success("已記錄")
@@ -3501,13 +3536,14 @@ def render_stock_card(data, system_history, portfolio_data):
                         else:
                             _log_options2 = ["完全照做", "延後執行", "部分執行/股數不同", "有下單但未成交", "沒有進場/加碼"]
                         _log_action2 = st.radio("我實際上", _log_options2, key=f"log_action_snap_{data['code']}", horizontal=True)
-                        _log_price_col2, _log_reason_col2 = st.columns(2)
+                        _log_shares_col2, _log_price_col2, _log_reason_col2 = st.columns(3)
+                        _log_shares2 = _log_shares_col2.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"log_shares_snap_{data['code']}")
                         _log_price2 = _log_price_col2.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_snap_{data['code']}")
                         _log_reason2 = _log_reason_col2.text_input("原因（選填）", key=f"log_reason_snap_{data['code']}")
                         if st.button("儲存這筆紀錄", key=f"log_submit_snap_{data['code']}"):
                             _ok2 = append_decision_log(
                                 today_str, data['code'], f"{_snap_state}（昨晚確定版）：{_log_snap.get('signal_reason', '')}",
-                                _log_action2, _log_price2 if _log_price2 > 0 else None, _log_reason2,
+                                _log_action2, _log_shares2, _log_price2 if _log_price2 > 0 else None, _log_reason2,
                             )
                             if _ok2:
                                 st.success("已記錄")
