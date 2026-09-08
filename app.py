@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.49"
+APP_VERSION = "V2.11.52"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -693,14 +693,64 @@ def round_to_tick(price, is_us_stock=False):
     return round(round(p / tick) * tick, 2)
 
 # --- 1. 大盤宏觀環境抓取 ---
+def _fetch_tw_index_finmind():
+    """
+    【V2.11.50新增】用FinMind的 TaiwanStockPrice 資料集（data_id="TAIEX"）抓台股加權指數，
+    當作 yfinance（^TWII）的優先來源。
+
+    背景：使用者實際回報，台股加權指數的資料日期常常落後1個交易日，即使是收盤後好幾個小時才
+    查看也一樣。查證後確認這是 yfinance／Yahoo Finance 對非美股「指數」資料的已知限制（國際
+    指數的資料管線本來就比美股指數慢，這不是我們程式碼的bug）。查了FinMind官方文件，
+    TaiwanStockPrice 這個資料集官方寫明「更新時間：星期一至五17:30」——也就是收盤（13:30）後
+    大約4小時內，當天資料就會更新好，理論上比yfinance對^TWII的延遲更即時。這個判斷是根據
+    FinMind官方文件查證，不是我們自己實際連線測試過的結果，需要在有網路的正式環境實測才能
+    確認真的有解決延遲問題。
+
+    這個函式失敗（連線失敗、資料格式跟預期不符、筆數不夠）時一律回傳 None，讓呼叫端
+    fetch_macro_data() 自動退回原本的yfinance抓法，不會讓大盤資料整個抓不到。
+
+    回傳格式對齊 fetch_macro_data() 原本從yfinance拿到的DataFrame：以日期為索引、
+    有一欄「Close」（大寫，英文），這樣呼叫端不需要因為資料來源不同而另外寫一套處理邏輯。
+    """
+    try:
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=100)).strftime("%Y-%m-%d")
+        url = "https://api.finmindtrade.com/api/v4/data"
+        parameter = {"dataset": "TaiwanStockPrice", "data_id": "TAIEX", "start_date": start_date, "end_date": end_date}
+        resp = requests.get(url, params=parameter, timeout=5)
+        data = resp.json()
+        if data.get("msg") != "success" or not data.get("data"):
+            return None
+        df = pd.DataFrame(data["data"])
+        if df.empty or "close" not in df.columns or "date" not in df.columns:
+            return None
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df = df.rename(columns={"close": "Close"})
+        if len(df) < 20:  # 不夠算MA20，視為資料不足
+            return None
+        return df[["Close"]]
+    except Exception:
+        return None
+
 @st.cache_data(ttl=1800)
 def fetch_macro_data():
     tickers = {'TW': '^TWII', 'US': '^IXIC', 'VIX': '^VIX'}
     macro_status = {}
     for key, symbol in tickers.items():
         try:
-            df = yf.download(symbol, period="3mo", progress=False)
-            df = _trim_trailing_nan_rows(df)  # 同樣防範 Yahoo 尾端佔位空列的問題
+            df = None
+            source = "yfinance"
+            if key == 'TW':
+                # 【V2.11.50新增】台股加權指數優先試FinMind，理由跟已知限制見
+                # _fetch_tw_index_finmind() 的說明；失敗才退回原本的yfinance抓法。
+                _fm_df = _fetch_tw_index_finmind()
+                if _fm_df is not None:
+                    df, source = _fm_df, "finmind"
+            if df is None:
+                df = yf.download(symbol, period="3mo", progress=False)
+                df = _trim_trailing_nan_rows(df)  # 同樣防範 Yahoo 尾端佔位空列的問題
+                source = "yfinance"
             if df is not None and not df.empty:
                 c_series = df['Close'].squeeze()
                 if isinstance(c_series, pd.DataFrame): c_series = c_series.iloc[:, 0]
@@ -709,7 +759,9 @@ def fetch_macro_data():
                 # 【V2.10.8 新增】記錄這筆資料實際對應的交易日期，讓畫面上能顯示「資料日期」，
                 # 使用者才能自己判斷這是不是最新資料，而不是完全信任一個數字。
                 _asof = df.index[-1]
-                macro_status[key] = {'price': c, 'ma20': ma20, 'trend': '🟢 多頭' if c > ma20 else '🔴 空頭', 'asof': _asof}
+                # 【V2.11.50新增】source：這筆資料實際是從哪個來源拿到的（finmind／yfinance），
+                # 純附加欄位，供之後除錯/確認備援有沒有真的生效使用，不影響任何既有判斷邏輯。
+                macro_status[key] = {'price': c, 'ma20': ma20, 'trend': '🟢 多頭' if c > ma20 else '🔴 空頭', 'asof': _asof, 'source': source}
         except Exception:
             macro_status[key] = None
     return macro_status
