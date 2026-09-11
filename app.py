@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.53"
+APP_VERSION = "V2.11.54"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -2384,7 +2384,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             {"entry_price": 0.0, "breakout_price": 0.0, "chase_limit": 0.0, "pullback_low": 0.0,
              "pullback_high": 0.0, "invalid_price": 0.0, "signal_key": "", "t1_taken": False, "t2_taken": False,
              "t1_price": 0.0, "t2_price": 0.0, "current_trailing_stop": 0.0, "initial_stop": 0.0,
-             "addon_shares_approved": 0, "addon_shares_suggested": 0, "partial_exit_shares": 0, "full_exit_shares": 0,
+             "suggested_shares": 0, "addon_shares_approved": 0, "addon_shares_suggested": 0, "partial_exit_shares": 0, "full_exit_shares": 0,
              "execution_date": "", "valid_until": "", "retest_min_price": 0.0, "retest_quality": "",
              "breakout_quality_score": 0.0, "breakout_quality_grade": "",
              "bq_volume": 0.0, "bq_macd": 0.0, "bq_breakout_margin": 0.0, "bq_decision_score": 0.0},
