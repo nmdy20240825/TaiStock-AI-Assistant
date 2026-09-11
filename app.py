@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.52"
+APP_VERSION = "V2.11.53"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -4113,9 +4113,17 @@ else:
             elif cost > 0 and price < cost:
                 final_status = "⚠️ 帳面虧損"
                 ai_advice = ["✓ 建議：注意資金控管，跌破防守線前最後警戒", f"✓ 依據：現價跌破設定成本 ({cost:.2f})", "✓ 狀態：已產生實質帳面虧損，紀律優先", f"🎯 決策信心：0% (防禦狀態)"]
-            elif cost > 0 and price >= cost * 1.10:
+            elif cost > 0 and price >= cost * 1.30:
+                # 【V2.11.53修正】原本這裡寫死是 cost*1.10（獲利超過10%），跟「交易計畫」分頁的
+                # calculate_stop_plan() 早在V2.11.19就已經把同類型的獲利保護門檻從10%調高到30%，
+                # 但這裡是完全獨立的另一套系統（AI決策與SOP分頁自己的建議文字生成邏輯，跟正式的
+                # trade_plan狀態機是兩條分開的程式碼路徑），從來沒有跟著同步更新過，導致兩個分頁
+                # 對「獲利多少該進入重兵保護模式」顯示不一致的門檻，容易讓使用者誤以為系統邏輯
+                # 前後矛盾。這裡改成30%，跟交易計畫分頁對齊；如果之後calculate_stop_plan()的
+                # profit_trigger_pct又調整，記得這裡也要跟著手動同步（兩邊目前沒有共用同一個
+                # 全域常數，是各自獨立的程式碼路徑）。
                 final_status = "🔥 利潤奔跑"
-                ai_advice = ["✓ 建議：獲利續抱，不預設高點", f"✓ 依據：防守點上調至月線 ({atr_stop_price:.1f})", "✓ 狀態：獲利超過 10%", f"🎯 決策信心：{confidence}% (趨勢保護)"]
+                ai_advice = ["✓ 建議：獲利續抱，不預設高點", f"✓ 依據：防守點上調至月線 ({atr_stop_price:.1f})", "✓ 狀態：獲利超過 30%", f"🎯 決策信心：{confidence}% (趨勢保護)"]
             elif cost > 0 and price >= cost * 1.05:
                 final_status = "🟡 接近停利"
                 ai_advice = ["✓ 建議：將停損點無條件上調至成本價", "✓ 依據：獲利空間已拉開", "✓ 狀態：確保此交易立於不敗", f"🎯 決策信心：{confidence}%"]
