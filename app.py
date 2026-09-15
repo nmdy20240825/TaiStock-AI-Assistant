@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.54"
+APP_VERSION = "V2.11.56"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -3600,6 +3600,27 @@ def render_stock_card(data, system_history, portfolio_data):
                             if _ok2:
                                 st.success("已記錄")
 
+            # 【V2.11.56新增，補記其他操作】上面兩個記錄小工具，都只在「系統當下（或昨晚確定版）
+            # 有主動建議動作」時才會出現——但實際交易常常會遇到「系統完全沒建議、是你自己判斷該
+            # 進場/加碼/減碼/出清，而且已經做了」的情況，這種操作目前完全沒有地方可以記錄。這裡
+            # 新增一個**不管系統目前是什麼狀態、永遠都會顯示**的補記工具，專門給「系統沒主動建議、
+            # 你自己做的操作」使用。跟上面兩個小工具共用同一份 decision_log，只是 system_suggestion
+            # 欄位會清楚標示「無系統建議」，方便之後回顧時分辨這幾筆是你自己的判斷，不是照系統訊號做的。
+            with st.expander("📝 補記其他操作（系統沒有主動建議、我自己判斷做的操作）"):
+                st.caption("系統目前/昨晚都沒有對這檔股票發出對應的建議，但我自己判斷做了某個操作，用這裡記錄下來。")
+                _adhoc_action = st.selectbox("我做了什麼", ["新增進場", "加碼", "減碼/部分賣出", "全部賣出", "其他"], key=f"adhoc_action_{data['code']}")
+                _adhoc_shares_col, _adhoc_price_col = st.columns(2)
+                _adhoc_shares = _adhoc_shares_col.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"adhoc_shares_{data['code']}")
+                _adhoc_price = _adhoc_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"adhoc_price_{data['code']}")
+                _adhoc_reason = st.text_input("為什麼這樣做（建議填寫，之後回顧會需要）", key=f"adhoc_reason_{data['code']}")
+                if st.button("儲存這筆紀錄", key=f"adhoc_submit_{data['code']}"):
+                    _ok3 = append_decision_log(
+                        today_str, data['code'], "（無系統建議，使用者主動操作）",
+                        _adhoc_action, _adhoc_shares, _adhoc_price if _adhoc_price > 0 else None, _adhoc_reason,
+                    )
+                    if _ok3:
+                        st.success("已記錄")
+
         with tab_c6:
             # 【新增】MACD 動能變化與背離分析：日線／週線分開顯示，格式對照四大模組
             # （技術指標現況診斷／訊號層級評估／交易決策建議／風險過濾提醒）。
@@ -4325,6 +4346,27 @@ else:
                 _old_data_date = _old_plan.get("taiwan_data_date", "")
                 if _old_data_date and _plan_data_date and _old_data_date != _plan_data_date:
                     append_trade_plan_snapshot(code, _old_plan)
+                    # 【V2.11.55修正，真實使用缺口】trade_plan_snapshots 這個字典是整個頁面一開始
+                    # 執行時就讀好的（見檔案開頭 trade_plan_snapshots = load_trade_plan_snapshots()），
+                    # 如果「今天第一次真正推進日期」剛好就發生在這次執行過程中（例如使用者今天第一次
+                    # 打開頁面剛好是盤中、也是今天第一次觸發評估的那一刻），快照雖然已經正確寫進
+                    # Google Sheet，但這次執行後面用來畫卡片的 trade_plan_snapshots 變數，用的還是
+                    # 執行一開始讀到的舊版本（還沒看到剛剛這行新增的快照），導致同一次畫面上，備援
+                    # 記錄小工具找不到東西可以顯示——快照明明剛寫進去，只是這次畫面來不及看到它。
+                    # 這裡直接同步更新記憶體裡的這份字典，讓同一次執行後面畫卡片的地方，能立刻看到
+                    # 剛剛才寫入的這筆快照，不用等到下一次重新整理頁面才看得到。
+                    trade_plan_snapshots[str(code)] = {
+                        "code": str(code), "snapshot_date": _old_plan.get("taiwan_data_date", ""),
+                        "state": _old_plan.get("state", ""), "signal_reason": _old_plan.get("signal_reason", ""),
+                        "entry_price": _old_plan.get("entry_price", 0), "breakout_price": _old_plan.get("breakout_price", 0),
+                        "chase_limit": _old_plan.get("chase_limit", 0), "invalid_price": _old_plan.get("invalid_price", 0),
+                        "t1_price": _old_plan.get("t1_price", 0), "t2_price": _old_plan.get("t2_price", 0),
+                        "current_trailing_stop": _old_plan.get("current_trailing_stop", 0),
+                        "current_trailing_stop_source": _old_plan.get("current_trailing_stop_source", ""),
+                        "suggested_shares": _old_plan.get("suggested_shares", 0), "addon_shares_approved": _old_plan.get("addon_shares_approved", 0),
+                        "partial_exit_shares": _old_plan.get("partial_exit_shares", 0), "full_exit_shares": _old_plan.get("full_exit_shares", 0),
+                        "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
                 _new_plan["taiwan_data_date"] = _plan_data_date
                 if latest_us_date:
                     _new_plan["us_data_date"] = latest_us_date
