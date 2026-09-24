@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.56"
+APP_VERSION = "V2.11.59"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -126,16 +126,31 @@ def compute_signal_backtest(history):
 
 def calc_atr_series(h, l, c, period=14):
     """
-    【V2.11.2 新增】完整 ATR 序列（不只是最後一個數值），供移動停利棘輪計算使用。
-    公式：真實波幅 TR = max(當日高-當日低, |當日高-前日收|, |當日低-前日收|)，
-    再取 period 天滾動平均。
+    【V2.11.2 新增，V2.11.57修正平滑方式】完整 ATR 序列（不只是最後一個數值），供移動停利棘輪
+    計算使用。
+    公式：真實波幅 TR = max(當日高-當日低, |當日高-前日收|, |當日低-前日收|)。
+
+    【V2.11.57修正】TR算出來之後怎麼平滑成ATR，原本用簡單移動平均（rolling().mean()，14天內
+    每一天權重完全相等，滿14天的舊資料一滾出視窗就整個消失，數值容易在極端波動日出現／消失的
+    那一刻跳動）。業界慣用的標準ATR，是Welles Wilder提出的平滑法（RMA，一種特殊的指數平滑），
+    給越近期的資料越高權重、越久遠的資料權重平滑遞減，不會有「滿14天後突然消失」這種斷崖式的
+    跳動。這裡改用 ewm(alpha=1/period, adjust=False).mean()，是pandas裡最通用、也是大多數
+    交易平台/程式庫實際採用的Wilder RMA近似寫法（只有暖身期最初幾筆的起始權重跟教科書上
+    Wilder的原始遞迴公式有極小差異，穩定後的數值等價）。
+
+    【重要，需要人工確認的影響範圍】這個函式算出來的ATR，是系統裡幾乎所有風險計算的基礎：
+    三層移動防守線、T1/T2目標價的R倍數換算、突破品質分數裡的突破強度與MACD動能強度子項（都靠
+    ATR正規化）都直接依賴這個數字。V2.11.30~38那一整輪的回測校準（品質分數門檻50/65分、V2.11.36
+    收緊到1.0×ATR的停利保護倍數等），全部是用「改版前的SMA版ATR」算出來的——換成RMA之後，
+    ATR的實際數值會有小幅位移，這些門檻是否還是最適合的數字，理論上需要重新用回測驗證，這次
+    只先把ATR本身的計算方式改成業界標準寫法，沒有連動重新調整任何依賴ATR的門檻參數。
     """
     prev_close = c.shift(1)
     tr1 = h - l
     tr2 = (h - prev_close).abs()
     tr3 = (l - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 def calc_structural_target(high_series, current_price, atr, lookback=60, min_gap_atr_multiple=1.0):
     """
@@ -733,6 +748,49 @@ def _fetch_tw_index_finmind():
     except Exception:
         return None
 
+def _fetch_tw_stock_finmind(code, days=400):
+    """
+    【V2.11.59新增】用FinMind的 TaiwanStockPrice 資料集抓個股OHLCV，當作yfinance完全抓不到
+    資料時的備援來源（不是像加權指數那樣優先使用，這裡是次要備援，理由見下方說明）。
+
+    背景：待辦清單裡「個股股價目前完全依賴yfinance單一來源」這一項，原始動機是「單點故障
+    風險」（yfinance/Yahoo整個掛掉時，個股完全沒有備援），不是像加權指數那次一樣是「資料
+    有延遲」的問題——目前沒有使用者回報個股資料本身有延遲。
+
+    【這裡刻意設計成「次要備援」而不是「優先來源」，這點跟V2.11.50的加權指數備援不一樣】
+    V2.11.42已經驗證過yfinance搭配auto_adjust=True能正確還原股利/股票分割，這對個股指標
+    計算（MA/ATR/前高）的正確性很重要。FinMind的TaiwanStockPrice資料集是否也提供股利還原後
+    的價格，沒有查證過、不確定——如果FinMind回傳的是未還原的原始股價，把它設成「優先來源」
+    反而會讓V2.11.42修好的除息失真問題在個股身上捲土重來。為了避免這個風險，這裡改成只有在
+    yfinance「完全抓不到資料」（連線失敗、回傳空值）時才使用FinMind當救急備援，正常情況下
+    完全不影響既有的yfinance資料品質；只有在yfinance整個掛掉、原本會直接顯示「資料抓取失敗」
+    的情況下，FinMind能抓到未還原股利的資料至少比完全沒有資料可用好。
+
+    回傳格式對齊yfinance：Open/High/Low/Close/Volume（大寫欄位），供三個呼叫端直接使用，
+    不需要因為來源不同另外寫處理邏輯。失敗時一律回傳None，呼叫端會維持原本「資料抓取失敗」
+    的處理方式，不影響既有行為。
+    """
+    try:
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+        url = "https://api.finmindtrade.com/api/v4/data"
+        parameter = {"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date, "end_date": end_date}
+        resp = requests.get(url, params=parameter, timeout=5)
+        data = resp.json()
+        if data.get("msg") != "success" or not data.get("data"):
+            return None
+        df = pd.DataFrame(data["data"])
+        _required_cols = {"date", "open", "max", "min", "close", "Trading_Volume"}
+        if df.empty or not _required_cols.issubset(df.columns):
+            return None
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df = df.rename(columns={"open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
+        df = df[["Open", "High", "Low", "Close", "Volume"]]
+        return df if len(df) > 0 else None
+    except Exception:
+        return None
+
 @st.cache_data(ttl=1800)
 def fetch_macro_data():
     tickers = {'TW': '^TWII', 'US': '^IXIC', 'VIX': '^VIX'}
@@ -797,16 +855,25 @@ def fetch_stock_data(code):
     在除息日之後的一段時間內（約MA60的暖身期長度）可能讓這些指標失真，進而影響進出場判斷。
     明確指定 auto_adjust=True，確保不管安裝的yfinance版本是哪一個，行為都一致、正確地還原
     股利/分割，不再依賴不確定的預設值。
+
+    【V2.11.59新增】台股（非美股）如果yfinance完全抓不到資料（連線失敗、回傳空值），改用
+    FinMind當救急備援，理由跟設計考量見 _fetch_tw_stock_finmind() 的說明——這裡刻意只在
+    yfinance完全失敗時才用，正常情況下不影響既有的yfinance資料來源與股利還原品質。
     """
     try:
         if code.isalpha() or code.endswith('.US'):
             df = yf.download(code.replace('.US', ''), period="6mo", progress=False, auto_adjust=True)
+            return _trim_trailing_nan_rows(df)
         elif code.endswith('.TW') or code.endswith('.TWO'):
             df = yf.download(code, period="6mo", progress=False, auto_adjust=True)
         else:
             df_tw = yf.download(f"{code}.TW", period="6mo", progress=False, auto_adjust=True)
             df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="6mo", progress=False, auto_adjust=True)
-        return _trim_trailing_nan_rows(df)
+        df = _trim_trailing_nan_rows(df)
+        if df is None or df.empty:
+            _bare_code = code.replace('.TW', '').replace('.TWO', '')
+            df = _fetch_tw_stock_finmind(_bare_code, days=200)
+        return df if df is not None else pd.DataFrame()
     except Exception: return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
@@ -819,16 +886,23 @@ def fetch_stock_data_extended(code):
 
     【V2.11.42修正】同 fetch_stock_data()，明確加上 auto_adjust=True，理由見該函式docstring。
     這裡跨度2年，涵蓋除息事件的機率比6個月的日線資料更高，這個修正的影響也更明顯。
+
+    【V2.11.59新增】同 fetch_stock_data()，台股在yfinance完全抓不到資料時，改用FinMind救急備援。
     """
     try:
         if code.isalpha() or code.endswith('.US'):
             df = yf.download(code.replace('.US', ''), period="2y", progress=False, auto_adjust=True)
+            return _trim_trailing_nan_rows(df)
         elif code.endswith('.TW') or code.endswith('.TWO'):
             df = yf.download(code, period="2y", progress=False, auto_adjust=True)
         else:
             df_tw = yf.download(f"{code}.TW", period="2y", progress=False, auto_adjust=True)
             df = df_tw if (df_tw is not None and not df_tw.empty and len(df_tw) > 0) else yf.download(f"{code}.TWO", period="2y", progress=False, auto_adjust=True)
-        return _trim_trailing_nan_rows(df)
+        df = _trim_trailing_nan_rows(df)
+        if df is None or df.empty:
+            _bare_code = code.replace('.TW', '').replace('.TWO', '')
+            df = _fetch_tw_stock_finmind(_bare_code, days=730)
+        return df if df is not None else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -1270,29 +1344,59 @@ def load_trade_plan_snapshots():
         st.error(f"⚠️ 讀取交易計畫快照失敗：{e}")
         return {}
 
-def append_trade_plan_snapshot(code, plan):
+def cleanup_old_trade_plan_snapshots(days_to_keep=30):
     """
-    把「即將被覆寫掉的前一天最終確定版」凍結存一份。呼叫時機是：偵測到這檔股票的資料日期真的
-    要往前推進到新的一天（不是同一天內的盤中重新評估）——這樣存下來的，正好就是「前一天收盤後
-    最後一次確定的計畫內容」，不管當天之後盤中重新評估、覆寫幾次，這份快照都不會被動到。
-    刻意用 append_row()（純append-only），理由跟 append_decision_log() 一樣：避免「清空重寫」
-    類型的資料損毀風險，這裡從設計上直接避開。
+    【V2.11.58新增】清理交易計畫快照分頁裡過舊的資料列。這個分頁從V2.11.41上線以來刻意設計成
+    純append-only（只新增、不清除），理由是避免「清空重寫」類型的資料損毀窗口期——但也因此，
+    只要使用者持續使用，這個分頁會無限期累積下去，從來沒有清除機制。
+
+    【重要，這個函式本身就是那個「有風險的清空重寫」操作】跟append_trade_plan_snapshot()刻意
+    避開清空重寫不同，「清除舊資料」這件事，本質上就是需要「讀取全部→篩選→整批覆寫」，沒有
+    純append-only的寫法可以做到。為了把風險降到最低：
+    1. 只在使用者手動按下按鈕時才會執行，不會在背景自動、默默執行；
+    2. 一定先把資料完整讀進記憶體、確認讀取成功，才會做任何清空動作——讀取失敗就直接中止，
+       不會動到任何既有資料，不會有「清空成功、寫入失敗」的中間態；
+    3. 篩選邏輯只看 snapshot_date 是否在保留天數內，保留天數內的資料逐字不動地寫回去，不會有
+       任何資料被誤改內容（只有「留下」或「不留」兩種結果，沒有中間的資料轉換）。
+
+    回傳 (成功與否, 清掉幾筆, 剩下幾筆) 的 tuple，讓呼叫端可以把結果告訴使用者。
     """
     try:
         ws = get_worksheet("trade_plan_snapshot", TRADE_PLAN_SNAPSHOT_HEADERS)
-        ws.append_row([
-            str(code), plan.get("taiwan_data_date", ""), plan.get("state", ""), plan.get("signal_reason", ""),
-            plan.get("entry_price", 0), plan.get("breakout_price", 0), plan.get("chase_limit", 0),
-            plan.get("invalid_price", 0), plan.get("t1_price", 0), plan.get("t2_price", 0),
-            plan.get("current_trailing_stop", 0), plan.get("current_trailing_stop_source", ""),
-            plan.get("suggested_shares", 0), plan.get("addon_shares_approved", 0),
-            plan.get("partial_exit_shares", 0), plan.get("full_exit_shares", 0),
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        ])
-        return True
+        records = ws.get_all_records()
     except Exception as e:
-        st.error(f"⚠️ 寫入交易計畫快照失敗：{e}")
-        return False
+        st.error(f"⚠️ 讀取交易計畫快照失敗，本次清理中止，沒有任何資料被異動：{e}")
+        return False, 0, 0
+
+    if not records:
+        return True, 0, 0
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days_to_keep)
+    kept_rows = []
+    removed_count = 0
+    for row in records:
+        _snap_date_str = str(row.get("snapshot_date", "")).strip()
+        _keep = True
+        if _snap_date_str:
+            try:
+                _keep = datetime.datetime.strptime(_snap_date_str, "%Y-%m-%d") >= cutoff
+            except Exception:
+                _keep = True  # 日期格式異常時保守保留，不因為格式問題誤刪資料
+        if _keep:
+            kept_rows.append([row.get(h, "") for h in TRADE_PLAN_SNAPSHOT_HEADERS])
+        else:
+            removed_count += 1
+
+    if removed_count == 0:
+        return True, 0, len(kept_rows)  # 沒有東西要清，不需要真的動到試算表
+
+    try:
+        ws.clear()
+        ws.update([TRADE_PLAN_SNAPSHOT_HEADERS] + kept_rows)
+        return True, removed_count, len(kept_rows)
+    except Exception as e:
+        st.error(f"⚠️ 清理交易計畫快照時寫入失敗：{e}\n\n⚠️ 這個分頁目前可能已經是空的或不完整狀態，請立即檢查Google Sheet內容，必要時手動復原。")
+        return False, removed_count, len(kept_rows)
 
 # --- 4-1. trade_plan 分頁讀寫（V2.11.x 新增）---
 def _normalize_trade_plan_row(row):
@@ -2554,6 +2658,10 @@ def _fetch_backtest_indicator_frame(code, years=2):
     除息事件，如果沒有正確還原股利，回測算出來的MA/ATR/前高/波段低點在除息日附近會被扭曲，
     可能產生不該出現的假訊號，直接影響回測結果的可信度——這是我們一路驗證回測系統時，
     之前沒有檢查過的一個資料正確性缺口。
+
+    【V2.11.59新增】同 fetch_stock_data()，台股在yfinance完全抓不到資料（或資料量不足90筆）
+    時，改用FinMind救急備援，理由跟設計考量見 _fetch_tw_stock_finmind() 的說明——刻意只在
+    yfinance失敗時才用，正常情況下不影響既有的yfinance資料來源與股利還原品質。
     """
     try:
         is_us = code.isalpha() or code.endswith('.US')
@@ -2567,6 +2675,11 @@ def _fetch_backtest_indicator_frame(code, years=2):
             if raw is None or raw.empty:
                 raw = yf.download(f"{code}.TWO", period=period, progress=False, auto_adjust=True)
         raw = _trim_trailing_nan_rows(raw)
+        if (raw is None or raw.empty or len(raw) < 90) and not is_us:
+            _bare_code = code.replace('.TW', '').replace('.TWO', '')
+            _fm_raw = _fetch_tw_stock_finmind(_bare_code, days=int(years * 365) + 30)
+            if _fm_raw is not None and len(_fm_raw) >= 90:
+                raw = _fm_raw
         if raw is None or raw.empty or len(raw) < 90:
             return None, None, f"歷史資料不足（僅{0 if raw is None else len(raw)}筆，至少需要90筆才能起算）"
 
@@ -3926,6 +4039,26 @@ with st.expander("📝 決策日誌 — 系統建議 vs 你實際執行了什麼
             file_name=f"decision_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
+
+# --- 5-3. 交易計畫快照清理（V2.11.58新增）---
+# trade_plan_snapshot 分頁從V2.11.41起純append-only、會無限累積，這裡提供手動觸發的清理工具，
+# 刻意不做成自動背景執行（見 cleanup_old_trade_plan_snapshots() 的說明，這個操作本身需要
+# 讀取全部→篩選→整批覆寫，風險比純append-only高，交由使用者自己決定什麼時候要做）。
+with st.expander("🧹 清理交易計畫快照（選用，不影響任何交易判斷）", expanded=False):
+    st.caption(
+        "「上一個確定版」快照（見各股票交易計畫分頁的🔒區塊）會持續累積，不會自動清除。"
+        "這裡可以手動清掉太舊、已經用不到的舊快照，只保留最近一段時間的資料——App平常運作"
+        "只會用到每檔股票最新的一筆，清掉更早的不會影響任何顯示或判斷，純粹是控制Google Sheet"
+        "的資料量。"
+    )
+    _cleanup_days = st.number_input("保留最近幾天的快照", min_value=7, max_value=365, value=30, step=1, key="cleanup_days_input")
+    if st.button(f"🧹 清理超過{_cleanup_days}天的舊快照"):
+        _clean_ok, _clean_removed, _clean_kept = cleanup_old_trade_plan_snapshots(days_to_keep=_cleanup_days)
+        if _clean_ok:
+            if _clean_removed == 0:
+                st.info(f"沒有超過{_cleanup_days}天的舊快照，目前共{_clean_kept}筆，不需要清理。")
+            else:
+                st.success(f"已清除 {_clean_removed} 筆舊快照，保留 {_clean_kept} 筆。")
 
 if not portfolio:
     if not PORTFOLIO_LOAD_OK:
