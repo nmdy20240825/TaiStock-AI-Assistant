@@ -6,7 +6,7 @@ import requests
 import datetime
 from zoneinfo import ZoneInfo
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import Optional, Literal, Dict, Any, List, Tuple
 import plotly.graph_objects as go
 
@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.59"
+APP_VERSION = "V2.11.63"
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -124,6 +124,30 @@ def compute_signal_backtest(history):
             stats.setdefault(status, []).append(ret_pct)
     return stats
 
+def _wilder_rma(x, period):
+    """
+    【V2.11.63新增】標準 Wilder RMA：以前 period 筆有效值的簡單平均為種子，之後
+    y_t = (y_{t-1}×(period−1) + x_t) ÷ period。與教科書定義一致（不再用 ewm 以第一筆為種子）。
+    """
+    s = pd.Series(x).astype(float)
+    vals = s.to_numpy(dtype=float)
+    out = np.full(len(vals), np.nan)
+    run = 0
+    for i in range(len(vals)):
+        if np.isnan(vals[i]):
+            run = 0
+            continue
+        run += 1
+        if run == period:
+            prev = float(np.mean(vals[i - period + 1:i + 1]))
+            out[i] = prev
+            for j in range(i + 1, len(vals)):
+                if not np.isnan(vals[j]):
+                    prev = (prev * (period - 1) + vals[j]) / period
+                out[j] = prev
+            break
+    return pd.Series(out, index=s.index)
+
 def calc_atr_series(h, l, c, period=14):
     """
     【V2.11.2 新增，V2.11.57修正平滑方式】完整 ATR 序列（不只是最後一個數值），供移動停利棘輪
@@ -134,9 +158,7 @@ def calc_atr_series(h, l, c, period=14):
     每一天權重完全相等，滿14天的舊資料一滾出視窗就整個消失，數值容易在極端波動日出現／消失的
     那一刻跳動）。業界慣用的標準ATR，是Welles Wilder提出的平滑法（RMA，一種特殊的指數平滑），
     給越近期的資料越高權重、越久遠的資料權重平滑遞減，不會有「滿14天後突然消失」這種斷崖式的
-    跳動。這裡改用 ewm(alpha=1/period, adjust=False).mean()，是pandas裡最通用、也是大多數
-    交易平台/程式庫實際採用的Wilder RMA近似寫法（只有暖身期最初幾筆的起始權重跟教科書上
-    Wilder的原始遞迴公式有極小差異，穩定後的數值等價）。
+    跳動。【V2.11.63修正】這裡改用 _wilder_rma()：以前 period 筆 SMA 為種子、之後依 Wilder 遞迴公式平滑，與教科書定義一致。
 
     【重要，需要人工確認的影響範圍】這個函式算出來的ATR，是系統裡幾乎所有風險計算的基礎：
     三層移動防守線、T1/T2目標價的R倍數換算、突破品質分數裡的突破強度與MACD動能強度子項（都靠
@@ -150,7 +172,53 @@ def calc_atr_series(h, l, c, period=14):
     tr2 = (h - prev_close).abs()
     tr3 = (l - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    return _wilder_rma(tr, period)
+
+def calc_rsi_series(c, period=14):
+    """
+    【V2.11.62新增，V2.11.63修正】Wilder RMA 版標準 RSI 序列，取代原本的簡單移動平均（SMA）版 RSI，
+    消除14天前極端漲跌滾出視窗造成的斷崖式跳動。平滑採用 _wilder_rma（標準種子），
+    與 Wilder 原始定義一致；但與看盤軟體的數值仍可能有小幅差異（各家的暖身資料長度與取值不同），
+    不保證完全一致。
+    無下跌（down=0）時 RSI=100（有上漲）或 50（完全持平）。
+    """
+    delta = c.diff()
+    up = _wilder_rma(delta.clip(lower=0), period)
+    down = _wilder_rma(-1 * delta.clip(upper=0), period)
+    rs = up / down.where(down > 0)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(~((down == 0) & (up > 0)), 100.0)
+    rsi = rsi.where(~((down == 0) & (up == 0)), 50.0)
+    return rsi
+
+TREND_CONFIRM_DAYS = 3  # 【V2.11.61新增，需要人工確認的參數】SOP三燈裡的「趨勢燈」（多頭排列：
+# price>MA20 且 MA10>MA20>MA60），原本是逐日重新判斷的即時快照，今天符合就算符合、沒有要求
+# 要連續維持幾天——震盪盤時，均線來回交叉容易讓這個燈號忽亮忽滅，變成雜訊。這個常數要求連續
+# 成立至少這麼多天，才算「確認」的多頭排列，用來過濾掉短暫、不穩定的假訊號。設1天等同完全
+#不改變行為（跟改版前一樣，今天符合就算符合），是初版經驗值，建議之後用回測比較改動前後的
+# 交易筆數/勝率/Expectancy，確認這個天數合不合理。
+
+def calc_trend_confirmed_series(close, ma10, ma20, ma60, confirm_days=TREND_CONFIRM_DAYS):
+    """
+    【V2.11.61新增】SOP三燈「趨勢燈」的N天連續確認版本。回傳布林序列：某一天算不算「確認」的
+    多頭排列，不是「當天符不符合」，是「當天以及回推confirm_days-1天，是不是每一天都符合」。
+
+    confirm_days<=1 時完全等同於原本逐日判斷的行為（不改變任何既有邏輯），這是刻意的向下相容
+    設計——只要呼叫端傳1或不傳這個參數，行為就跟改版前分毫不差。
+
+    這裡刻意做成獨立、共用的函式，不是直接改寫shared scoring function（calculate_daily_score）
+    裡面的step3_pass計算——因為那個函式是一次只處理「今天」單一天的純量輸入（stateless），
+    沒有過去幾天的歷史資料可以看，沒辦法自己判斷「連續」；而這個函式接收的是完整的價格/均線
+    序列（呼叫端在算scalar版本之前，本來就已經有這些完整序列），可以直接用rolling window判斷。
+    呼叫端算完這個序列後，拿最新一天（或當天）的值去覆蓋掉calculate_daily_score()算出來的
+    step3_pass，讓SOP三燈的顯示、trend_gate（進場判斷用）、calculate_stop_plan()的
+    trend_confirmed（防守線Level切換用）三處都能維持一致，不會有「畫面顯示綠燈、但背後其實
+    沒有真的核准進場」這種兩套系統對不上的情況。
+    """
+    raw = (close > ma20) & (ma10 > ma20) & (ma20 > ma60)
+    if confirm_days is None or confirm_days <= 1:
+        return raw.fillna(False)
+    return raw.rolling(confirm_days).apply(lambda x: bool(x.all()), raw=True).fillna(0).astype(bool)
 
 def calc_structural_target(high_series, current_price, atr, lookback=60, min_gap_atr_multiple=1.0):
     """
@@ -396,7 +464,6 @@ class MACDStrategyAnalyzer:
             return "無", "資料長度不足以偵測背離（lookback視窗過短）"
 
         window_close = close.iloc[-(n + 1):-1]
-        window_low = low.iloc[-(n + 1):-1]
         window_high = high.iloc[-(n + 1):-1]
         window_osc = osc.iloc[-(n + 1):-1]
 
@@ -1063,7 +1130,7 @@ TRADE_PLAN_HEADERS = [
 TRADE_STATES = {
     "PREPARE", "BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "HOLD",
     "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY",
-    "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "BREAKOUT_FAILED",
+    "SUSPENDED_BY_REGIME", "SUSPENDED_BY_PORTFOLIO_RISK", "INVALID", "EXPIRED", "BREAKOUT_FAILED",
 }
 
 # 規格書第六節「狀態轉移」表格的合法轉移清單。transition_state() 會用這張表擋掉不合法的跳轉。
@@ -1081,14 +1148,17 @@ ALLOWED_TRANSITIONS = {
     # 【V2.11.14修正，真實bug】同樣道理也漏了 PULLBACK_WAIT：已經確認「下一交易日可進場」後，
     # 如果隔日真的開太高、追價超過追價上限，理應改判「追價過高、改等回測」，但轉移表原本沒開放
     # 這條路，導致這個轉移一律被拒絕，狀態會卡在ENTER_NEXT_DAY不動，等於沒有真正擋下追高風險。
-    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "PULLBACK_WAIT", "ENTER_NEXT_DAY"},
+    "ENTER_NEXT_DAY": {"HOLD", "SUSPENDED_BY_REGIME", "SUSPENDED_BY_PORTFOLIO_RISK", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "PULLBACK_WAIT", "ENTER_NEXT_DAY"},
     # 【修正：股數變 0 的重置路徑】HOLD/ADD_NEXT_DAY/PARTIAL_EXIT_NEXT_DAY 都可能因為使用者在系統之外
     # 手動賣出全部持股，導致 held_qty 直接變 0，這種情況也要能重置回 PREPARE 重新追蹤訊號，
     # 否則狀態會卡死在「理論上已經沒有部位、卻永遠回不去空手訊號流程」的中間態。
     "HOLD": {"ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "PREPARE", "HOLD"},
-    "ADD_NEXT_DAY": {"SUSPENDED_BY_REGIME", "HOLD", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "PREPARE", "ADD_NEXT_DAY"},
+    "ADD_NEXT_DAY": {"SUSPENDED_BY_REGIME", "SUSPENDED_BY_PORTFOLIO_RISK", "HOLD", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "PREPARE", "ADD_NEXT_DAY"},
     # 逆風解除後恢復到暫停前的原狀態；出清判斷仍優先於恢復。
     "SUSPENDED_BY_REGIME": {"ENTER_NEXT_DAY", "ADD_NEXT_DAY", "HOLD", "FULL_EXIT_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "BREAKOUT_WAIT", "PULLBACK_WAIT", "PREPARE", "SUSPENDED_BY_REGIME"},
+    # 【V2.11.60新增】全帳戶總風險超標時的暫停狀態，轉移規則完全比照 SUSPENDED_BY_REGIME——
+    # 風險降回門檻以下後恢復到暫停前的原狀態；出清判斷仍優先於恢復。
+    "SUSPENDED_BY_PORTFOLIO_RISK": {"ENTER_NEXT_DAY", "ADD_NEXT_DAY", "HOLD", "FULL_EXIT_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "BREAKOUT_WAIT", "PULLBACK_WAIT", "PREPARE", "SUSPENDED_BY_PORTFOLIO_RISK"},
     "PARTIAL_EXIT_NEXT_DAY": {"HOLD", "FULL_EXIT_NEXT_DAY", "PREPARE", "PARTIAL_EXIT_NEXT_DAY"},
     # 【V2.11.32修正，真實P0 bug】原本只開放到PREPARE，假設「出清訊號一定會被執行」（執行後qty
     # 變0，才會走到下面的PREPARE歸零重置路徑）。但這個假設不成立：使用者可能沒有在建議當天執行
@@ -1344,6 +1414,29 @@ def load_trade_plan_snapshots():
         st.error(f"⚠️ 讀取交易計畫快照失敗：{e}")
         return {}
 
+def append_trade_plan_snapshot(code, old_plan):
+    """
+    【V2.11.62補齊定義】當資料日期推進到新的一天時，將前一日最終確定版的交易計畫寫入
+    trade_plan_snapshot 分頁（純append-only，避免覆寫舊紀錄）。
+    """
+    try:
+        ws = get_worksheet("trade_plan_snapshot", TRADE_PLAN_SNAPSHOT_HEADERS)
+        row = [
+            str(code), old_plan.get("taiwan_data_date", ""), old_plan.get("state", ""),
+            old_plan.get("signal_reason", ""), old_plan.get("entry_price", 0),
+            old_plan.get("breakout_price", 0), old_plan.get("chase_limit", 0),
+            old_plan.get("invalid_price", 0), old_plan.get("t1_price", 0),
+            old_plan.get("t2_price", 0), old_plan.get("current_trailing_stop", 0),
+            old_plan.get("current_trailing_stop_source", ""), old_plan.get("suggested_shares", 0),
+            old_plan.get("addon_shares_approved", 0), old_plan.get("partial_exit_shares", 0),
+            old_plan.get("full_exit_shares", 0), datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        ]
+        ws.append_row(row)
+        return True
+    except Exception as e:
+        st.error(f"⚠️ 寫入交易計畫快照失敗：{e}")
+        return False
+
 def cleanup_old_trade_plan_snapshots(days_to_keep=30):
     """
     【V2.11.58新增】清理交易計畫快照分頁裡過舊的資料列。這個分頁從V2.11.41上線以來刻意設計成
@@ -1557,6 +1650,42 @@ BREAKOUT_QUALITY_GATE_THRESHOLD_NEUTRAL = 65.0  # 【V2.11.38新增，需要人�
 # 較高的品質門檻（原本50分提高到65分，對應五級評等的B/C分界），只放行更扎實的訊號，不是完全
 # 不能進場——呼應V2.11.16設計Market Regime Score五級分類時「中性應該降低部位」的構想，但沒有
 # 直接動部位大小計算（風險較高），改用「拉高品質要求」這個更小範圍的方式間接做到類似效果。
+
+PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT = 20.0  # 【V2.11.60新增，需要人工確認的參數】全帳戶總風險
+# 曝露%（見 calculate_portfolio_risk_pct）達到或超過這個數字時，暫停所有新倉/加碼訊號，只有
+# 續抱/出清判斷完全不受影響。數值刻意沿用既有「🛡️新手風險檢查」資訊性顯示區塊裡「紅色警告」
+# 的門檻（這個資訊性顯示從更早的版本就存在，只是原本純顯示、不會真的攔截任何訊號）——沿用
+# 同一個數字，是為了讓「顯示的警告等級」跟「真的觸發攔截的等級」保持一致，不要讓使用者同時
+# 看到兩個代表同一件事、卻不一樣的百分比數字，造成混淆。是初版經驗值，建議依實際使用效果調整。
+
+def calculate_portfolio_risk_pct(portfolio):
+    """
+    【V2.11.60新增】純粹依portfolio設定（分配資金cap、單筆風險%risk）算出來的全帳戶整體風險
+    曝露百分比，公式跟既有「🛡️新手風險檢查」資訊性顯示完全一致：
+    Σ(cap × risk% / 100) ÷ Σ(cap) × 100。
+
+    刻意設計成「只依賴portfolio設定，不依賴任何即時股價/指標資料」——這樣可以在主迴圈開始
+    逐一評估每一檔股票之前，就先算好這個全帳戶層級的數字一次，不用等所有股票都跑完一輪
+    （card_data建立完成）才知道總風險，才能拿這個數字去影響「這一輪」的個股進場判斷，不是
+    只能拿「上一輪」算出來的舊數字。
+
+    已結清（status="Closed"）跟暫停分析（status="Paused"）的股票不計入，理由跟既有「🛡️新手
+    風險檢查」／「組合最大損失」一致：這兩種狀態的股票不會主動追蹤新訊號，不應該佔用風險預算。
+    """
+    total_cap = 0.0
+    total_risk = 0.0
+    for code, info in portfolio.items():
+        if not isinstance(info, dict):
+            continue
+        if info.get('status') in ('Closed', 'Paused'):
+            continue
+        _cap = _safe_float(info.get('cap', 0))
+        _risk_pct = _safe_float(info.get('risk', 0))
+        total_cap += _cap
+        total_risk += _cap * _risk_pct / 100.0
+    if total_cap <= 0:
+        return 0.0
+    return total_risk / total_cap * 100.0
 
 def _breakout_quality_gate_threshold_for_regime(regime_score):
     """
@@ -1814,7 +1943,23 @@ def calculate_daily_score(price, cost, ma10, ma20, ma60, macd, bias, k, d, rsi, 
     回傳 dict：ai_score, confidence, step1_pass, step2_pass, step3_pass, macro_warnings,
     is_bull_aligned, score_inst, score_tech, score_vol, score_risk。
     """
-    score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0) if is_us_stock else min(inst['days'] * 5, 20) + (20 if inst['accumulated_shares'] * price >= 3000000000 else (10 if inst['accumulated_shares'] * price >= 1000000000 else 0))
+    # 【V2.11.63修正】籌碼集中度比例（累積買超 ÷ 5日均量×連續天數）改為「補充條件」：
+    # 必須同時達到金額下限（籌碼燈≥1億、籌碼分滿分≥3億）才生效，避免小額買超僅靠比例就亮燈；
+    # 籌碼燈與籌碼分共用同一組判定（_inst_lamp_ok／_inst_full_ok），保證「燈亮」與「有加分」永遠一致。
+    _inst_days = inst.get('days', 0)
+    _inst_acc = inst.get('accumulated_shares', 0.0)
+    _inst_amt = _inst_acc * price
+    _inst_vol_denom = vol_ma5 * max(_inst_days, 1) if vol_ma5 > 0 else 0.0
+    _inst_vol_ratio = (_inst_acc / _inst_vol_denom) if (_inst_vol_denom > 0 and _inst_acc > 0) else 0.0
+    _inst_lamp_ok = _inst_vol_ratio >= 0.08 and _inst_amt >= 100000000
+    _inst_full_ok = _inst_vol_ratio >= 0.15 and _inst_amt >= 300000000
+    if is_us_stock:
+        score_inst = (20 if price > ma60 else 0) + (10 if macd > 0 else 0) + (10 if 0 < bias < 20 else 0)
+    else:
+        # 【V2.11.63修正】連續賣超恢復負向扣分（V2.11.62誤把負值截成0，導致賣超股 AI 分數偏高）
+        _inst_streak_pts = min(_inst_days * 5, 20)
+        _inst_size_pts = 20 if (_inst_amt >= 3000000000 or _inst_full_ok) else (10 if (_inst_amt >= 1000000000 or _inst_lamp_ok) else 0)
+        score_inst = _inst_streak_pts + _inst_size_pts
     _rsi_bull_point = 10 if (rsi > 50 and rsi <= 80) else 0
     score_tech = (10 if k > d else 0) + _rsi_bull_point + (10 if price > ma20 else 0)
     score_vol = min((volume / vol_ma5) * 10, 15) if vol_ma5 > 0 else 0
@@ -1839,7 +1984,7 @@ def calculate_daily_score(price, cost, ma10, ma20, ma60, macd, bias, k, d, rsi, 
             macro_warnings.append("⚠️ 台股大盤跌破月線，逆勢操作風險較高。")
 
     confidence = min(99, max(10, int(confidence_base)))
-    step1_pass = (price > ma60 and macd > 0) if is_us_stock else (inst['days'] >= 3 or inst['accumulated_shares'] * price >= 1000000000)
+    step1_pass = (price > ma60 and macd > 0) if is_us_stock else (_inst_days >= 3 or _inst_amt >= 1000000000 or _inst_lamp_ok)
     step2_pass, step3_pass = (k > d and rsi > 50 and volume > vol_ma5), (price > ma20 and is_bull_aligned)
 
     return {
@@ -2259,6 +2404,9 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     if not entry_gate_pass or decision_score < 70 or atr <= 0:
         return None
 
+    # 【V2.11.63修正】突破價撤回為固定「前高×1.005」（V2.11.61的原始設計）。
+    # V2.11.62的自適應緩衝（min(0.1×ATR, 0.5%)）與收盤過前高時緩衝歸零，未經回測驗證，
+    # 且會降低假突破的過濾力道，先撤回；若要改，應先用回測比較交易筆數與勝率。
     breakout_price = round_to_tick(previous_high * 1.005, is_us_stock) if previous_high > 0 else round_to_tick(price, is_us_stock)
     chase_limit = round_to_tick(min(breakout_price + atr, breakout_price * 1.03), is_us_stock)
     pullback_low = round_to_tick(previous_high - 0.5 * atr, is_us_stock)
@@ -2359,10 +2507,17 @@ def calculate_addon_shares(current_shares, current_price, current_stop, add_pric
     return int(np.floor(raw_shares * _safe_float(confidence_multiplier, 1.0)))
 
 # --- 4-6. 狀態機主體（規格書十四節主程式正確執行順序：持倉優先於新倉、出清優先於停利/加碼/續抱）---
-def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info):
+def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info, portfolio_risk_suspended=False):
     """
     唯一會呼叫 transition_state() 推進正式狀態的地方。只在 TAIWAN_CLOSE_UPDATE（或首次建立計畫）
     時被呼叫；US_CLOSE_UPDATE/VIEW_ONLY 一律不呼叫這個函式（見 process_us_close_update / process_view_only）。
+
+    【V2.11.60新增】portfolio_risk_suspended：全帳戶總風險曝露是否已經達到或超過
+    PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT（見 calculate_portfolio_risk_pct）。這個布林值是
+    呼叫端在主迴圈開始前，用整個portfolio設定一次算好、對所有股票共用的同一個值，不是這個函式
+    自己算的——理由是這個函式一次只處理一檔股票，沒有其他股票的cap/risk%資訊，沒辦法自己算出
+    全帳戶總風險。預設False（向下相容：沒有傳這個參數的既有呼叫端，行為跟改版前完全一樣，
+    不會意外觸發任何暫停）。
     """
     plan = _normalize_trade_plan_row(trade_plan)
     code = plan.get("code", indicators.get("code", ""))
@@ -2442,7 +2597,20 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
             plan = transition_state(plan, "HOLD", {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"]},
                                      data_date, "市場逆風解除，重新評估加碼條件")
 
-        if not regime_bearish and portfolio_info.get("addon_quality_gate", True):
+        # 【V2.11.60新增】全帳戶總風險超標時：同樣只暫停「即將要執行的加碼」，邏輯完全比照
+        # 上面的逆風暫停，只是觸發條件換成portfolio_risk_suspended、暫停狀態換成
+        # SUSPENDED_BY_PORTFOLIO_RISK，理由文字清楚標明是風險超標、不是市場逆風，避免使用者
+        # 誤判成同一種原因。
+        if portfolio_risk_suspended and plan.get("state") == "ADD_NEXT_DAY":
+            return transition_state(plan, "SUSPENDED_BY_PORTFOLIO_RISK",
+                                     {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"]},
+                                     data_date, f"全帳戶總風險曝露已達{PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:.0f}%門檻，暫停加碼但保留交易計畫")
+
+        if not portfolio_risk_suspended and plan.get("state") == "SUSPENDED_BY_PORTFOLIO_RISK" and plan.get("origin_state") == "ADD_NEXT_DAY":
+            plan = transition_state(plan, "HOLD", {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"]},
+                                     data_date, "全帳戶總風險已降回門檻以下，重新評估加碼條件")
+
+        if not regime_bearish and not portfolio_risk_suspended and portfolio_info.get("addon_quality_gate", True):
             addon_shares = calculate_addon_shares(
                 held_qty, price, exit_plan["current_trailing_stop"], price, exit_plan["current_trailing_stop"],
                 portfolio_info.get("cap", 20000.0), portfolio_info.get("risk", 5.0),
@@ -2476,7 +2644,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
 
     # ===== 空手分支：先處理既有計畫（過期/失效/推進），逆風時不建立新計畫，但不刪除既有計畫 =====
     plan["last_known_qty"] = 0
-    active_wait_states = {"PREPARE", "BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "SUSPENDED_BY_REGIME"}
+    active_wait_states = {"PREPARE", "BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "SUSPENDED_BY_REGIME", "SUSPENDED_BY_PORTFOLIO_RISK"}
 
     # 【重置防卡死機制】任何「非等待中」的舊狀態（HOLD/ADD_NEXT_DAY/PARTIAL_EXIT_NEXT_DAY/
     # FULL_EXIT_NEXT_DAY/INVALID/EXPIRED）在偵測到目前是空手時，代表這筆交易已經結束
@@ -2525,6 +2693,17 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
         if plan.get("state") == "SUSPENDED_BY_REGIME":
             origin = plan.get("origin_state") or "BREAKOUT_WAIT"
             return transition_state(plan, origin if origin in active_wait_states else "BREAKOUT_WAIT", {}, data_date, "市場逆風解除，恢復原交易計畫")
+
+        # 【V2.11.60新增】全帳戶總風險超標時，同樣的處理方式：ENTER_NEXT_DAY會被暫停，
+        # BREAKOUT_WAIT/PULLBACK_WAIT本來就還沒到下單階段，單純不推進、不強制暫停。
+        if portfolio_risk_suspended:
+            if plan.get("state") in {"ENTER_NEXT_DAY"}:
+                return transition_state(plan, "SUSPENDED_BY_PORTFOLIO_RISK", {}, data_date, f"全帳戶總風險曝露已達{PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:.0f}%門檻，暫停新倉但保留原交易計畫")
+            return plan
+
+        if plan.get("state") == "SUSPENDED_BY_PORTFOLIO_RISK":
+            origin = plan.get("origin_state") or "BREAKOUT_WAIT"
+            return transition_state(plan, origin if origin in active_wait_states else "BREAKOUT_WAIT", {}, data_date, "全帳戶總風險已降回門檻以下，恢復原交易計畫")
 
         chase_limit = _safe_float(plan.get("chase_limit"))
         entry_price = _safe_float(plan.get("entry_price"))
@@ -2585,6 +2764,12 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
     # ===== 沒有既有計畫（PREPARE 且尚未有 entry_price）：檢查是否符合建立新計畫的條件 =====
     if regime_bearish:
         return plan  # 逆風時不建立新倉訊號，但完全不動既有（空的）計畫
+    # 【V2.11.60新增】全帳戶總風險超標時，同樣不建立新倉訊號——跟逆風攔截用同一種處理方式
+    # （直接維持原本的PREPARE不變），理由是這裡本來就還沒有任何計畫存在（entry_price是空的），
+    # 沒有「既有訊號被中途暫停」這回事，不需要另外轉去SUSPENDED_BY_PORTFOLIO_RISK這個狀態，
+    # PREPARE本身已經足以表達「目前沒有任何待處理的訊號」。
+    if portfolio_risk_suspended:
+        return plan
 
     entry_result = calculate_entry_plan(code, indicators, portfolio_info, market_context)
     if entry_result:
@@ -2598,9 +2783,9 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info)
     return plan
 
 # --- 4-7. 三種執行模式的入口函式（規格書五節；主迴圈只呼叫這三個函式，不再內嵌分流判斷）---
-def process_taiwan_close_update(old_plan, indicators, market_context, portfolio_info):
+def process_taiwan_close_update(old_plan, indicators, market_context, portfolio_info, portfolio_risk_suspended=False):
     """台股收盤更新：完整跑一次狀態機，個股訊號正式推進。"""
-    return evaluate_trade_state(old_plan, indicators, market_context, portfolio_info)
+    return evaluate_trade_state(old_plan, indicators, market_context, portfolio_info, portfolio_risk_suspended)
 
 def process_us_close_update(old_plan, market_context, us_data_date, is_us_stock):
     """
@@ -2692,14 +2877,15 @@ def _fetch_backtest_indicator_frame(code, years=2):
         df['ma10'] = c.rolling(10).mean()
         df['ma20'] = c.rolling(20).mean()
         df['ma60'] = c.rolling(60).mean()
+        # 【V2.11.61新增】SOP三燈「趨勢燈」的N天連續確認版本，在這裡（迴圈開始前）用完整的
+        # close/ma10/ma20/ma60序列一次算好整個欄位，迴圈裡逐日讀取即可，不需要重算。
+        df['trend_confirmed'] = calc_trend_confirmed_series(c, df['ma10'], df['ma20'], df['ma60'])
         df['atr'] = calc_atr_series(h, l, c, period=14)
         df['vol_ma5'] = v.rolling(5).mean()
         k_series, d_series = calc_kd(h, l, c)
         df['k'], df['d'] = k_series, d_series
-        delta = c.diff()
-        up = delta.clip(lower=0).rolling(14).mean()
-        down = -1 * delta.clip(upper=0).rolling(14).mean()
-        df['rsi'] = 100 - (100 / (1 + (up / (down + 0.001))))
+        # 【V2.11.62修正】改用 Wilder's RMA 版標準 RSI，與即時系統完全一致
+        df['rsi'] = calc_rsi_series(c, period=14)
         dif, _dea, _osc = calc_macd_full_series(c)
         df['macd'] = dif
         df['bias'] = (c - df['ma60']) / df['ma60'] * 100
@@ -2863,7 +3049,10 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
 
             t1, t2, _branch = calculate_target_plan(price, cost, atr, previous_high, is_us_stock,
                                                       entry_price=plan.get('entry_price'), initial_stop=plan.get('initial_stop'))
-            trend_confirmed = price > ma20 and (ma10 > ma20 > ma60)
+            # 【V2.11.61修正】原本這裡是「今天符不符合」的即時快照，改成讀取迴圈開始前已經用完整
+            # 序列算好的N天連續確認版本（見 calc_trend_confirmed_series()），跟即時系統維持
+            # 同一套定義，不是另外發明一套回測專用的判斷方式。
+            trend_confirmed = bool(row['trend_confirmed'])
             prev_stop_for_calc = plan.get('current_trailing_stop') or plan.get('initial_stop')
             atr_stop_price, _stop_source = calculate_stop_plan(price, cost, atr, ma20, prev_stop_for_calc, swing_low=swing_low, trend_confirmed=trend_confirmed)
 
@@ -2876,23 +3065,65 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                 vix_high=bool(market_context.get('VIX', {}).get('price', 0) >= 25),
             )
             decision_score = _score['ai_score']
+            # 【V2.11.61新增】calculate_daily_score()一次只處理「今天」單一天的純量輸入，沒有
+            # 歷史資料可以自己判斷「連續」，這裡直接覆蓋掉它算出來的step3_pass（今天的即時快照），
+            # 改用上面已經考慮過N天連續確認的trend_confirmed——確保SOP三燈的「趨勢燈」顯示、
+            # trend_gate（進場判斷用）、calculate_stop_plan()的Level切換，三處背後是同一個值，
+            # 不會有「畫面顯示綠燈、但背後其實沒有真的核准進場」這種兩套系統對不上的情況。
+            _score['step3_pass'] = trend_confirmed
 
             # 【V2.11.22移除】原本這裡算的「進場用R1」在數學上永遠精確等於1.0（見
             # calculate_entry_plan docstring 的完整推導），已跟即時系統同步拿掉這道預檢，
             # 這裡也同步不再計算，直接傳 None，跟即時系統維持同一套邏輯。
             _entry_r1 = None
 
+            # 【V2.11.62修正】回測同步對齊即時系統的 final_status、信心分級縮減與加碼品質關卡（addon_quality_gate），
+            # 並補齊 indicators["market_regime"]，消除回測與即時系統的邏輯落差。
+            _bt_confidence = _score['confidence']
+            if _bt_confidence >= 80: _bt_pos_pct = 1.0
+            elif _bt_confidence >= 60: _bt_pos_pct = 0.6
+            elif _bt_confidence >= 40: _bt_pos_pct = 0.2
+            else: _bt_pos_pct = 0.0
+
+            if cost > 0 and price <= atr_stop_price:
+                _bt_final_status = "🔵 停利退場" if price > cost else "🔴 破損"
+            elif cost > 0 and price < cost:
+                _bt_final_status = "⚠️ 帳面虧損"
+            elif cost > 0 and price >= cost * 1.30:
+                _bt_final_status = "🔥 利潤奔跑"
+            elif cost > 0 and price >= cost * 1.05:
+                _bt_final_status = "🟡 接近停利"
+            elif price < ma20 * 0.95:
+                _bt_final_status = "🔴 破線"
+            elif decision_score >= 70:
+                _bt_final_status = "🟢 進場"
+            else:
+                _bt_final_status = "🟡 觀望"
+
+            _bt_macd_blocks_addon = bool(_macd_result and _macd_result.error is None and (macd_divergence_type == "頂背離" or macd_osc_status == "翻黑"))
+            _bt_addon_gate_pass = bool(
+                qty > 0
+                and _bt_final_status in ("🟢 進場", "🔥 利潤奔跑")
+                and (_score['step1_pass'] and _score['step2_pass'] and _score['step3_pass'])
+                and _bt_confidence >= 80
+                and (atr <= 0 or price >= cost + 0.5 * atr)
+                and not _bt_macd_blocks_addon
+            )
+
             indicators = {
                 "code": code, "price": price, "atr": atr, "ma20": ma20, "previous_high": previous_high,
                 "decision_score": decision_score, "trend_gate": _score['step3_pass'], "chip_gate": _score['step1_pass'],
-                "volume_gate": _score['step2_pass'], "r1": _entry_r1, "is_us_stock": is_us_stock, "data_date": today_str,
+                "volume_gate": _score['step2_pass'], "r1": _entry_r1,
+                "market_regime": "BEARISH" if _regime_is_bearish(market_context, is_us_stock) else "NORMAL",
+                "is_us_stock": is_us_stock, "data_date": today_str,
                 "macd_osc_status": macd_osc_status, "macd_divergence_type": macd_divergence_type,
                 "macd_osc_value": macd_osc_value,
                 "swing_low": swing_low, "volume": float(row['volume']), "vol_ma5": float(row['vol_ma5']),
                 "prev_close": float(ind_df.iloc[i - 1]['close']) if i > 0 else price,
             }
             portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": qty,
-                               "available_cash": max(0.0, cap - qty * price), "addon_quality_gate": True, "confidence_multiplier": 1.0}
+                               "available_cash": max(0.0, cap - qty * price),
+                               "addon_quality_gate": _bt_addon_gate_pass, "confidence_multiplier": _bt_pos_pct}
 
             new_plan = evaluate_trade_state(plan, indicators, market_context, portfolio_info)
             state = new_plan.get('state')
@@ -2906,6 +3137,9 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                     # 隔天實際成交那天，因為決策本身是「今天收盤」做的，這才是當時系統看到的市場環境。
                     _entry_regime = calculate_regime_score(market_context)
                     open_trade = {'code': code, 'entry_date': dates[i + 1], 'entry_price': next_open,
+                                   'initial_qty': fill_qty,
+                                   'total_invested': float(fill_qty * next_open),
+                                   'total_proceeds': 0.0,
                                    'breakout_quality_score': new_plan.get('breakout_quality_score', 0),
                                    # 【V2.11.28新增，V2.11.30改名】子項分數，供事後分析哪個子項在拖累整體判別力
                                    'bq_volume': new_plan.get('bq_volume', 0), 'bq_macd': new_plan.get('bq_macd', 0),
@@ -2926,6 +3160,7 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                     qty, cost = qty + add_qty, new_cost
                     if open_trade:
                         open_trade['adds'] += 1
+                        open_trade['total_invested'] = open_trade.get('total_invested', 0.0) + float(add_qty * next_open)
                         # 【V2.11.27新增】記錄每一次加碼當下的市場燈號分數，跟進場時同一個算法
                         # （用決策當天i的market_context），供分析「加碼是不是發生在市場正在轉弱
                         # 的時段」——這是比「進場當下分數」更精確的問題：V2.11.26驗證過進場分數
@@ -2938,13 +3173,16 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
             elif state == 'PARTIAL_EXIT_NEXT_DAY':
                 exit_qty = min(int(new_plan.get('partial_exit_shares', 0)), qty)
                 if exit_qty > 0:
-                    if open_trade: open_trade['partial_exits'].append({'date': dates[i + 1], 'price': next_open, 'qty': exit_qty})
+                    if open_trade:
+                        open_trade['partial_exits'].append({'date': dates[i + 1], 'price': next_open, 'qty': exit_qty})
+                        open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(exit_qty * next_open)
                     qty -= exit_qty
                 new_plan = dict(new_plan)
                 new_plan['state'] = 'HOLD' if qty > 0 else 'PREPARE'
             elif state == 'FULL_EXIT_NEXT_DAY':
                 if open_trade and qty > 0:
                     open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[i + 1], next_open, qty
+                    open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(qty * next_open)
                     open_trade['exit_reason'] = new_plan.get('signal_reason', '')
                     trades.append(open_trade)
                 open_trade = None
@@ -2955,7 +3193,9 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
 
         # 回測結束時仍持有部位：以最後一天收盤價強制平倉結算，不然這筆交易無法統計進報表
         if open_trade and qty > 0:
-            open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[-1], float(ind_df.iloc[-1]['close']), qty
+            _last_close = float(ind_df.iloc[-1]['close'])
+            open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[-1], _last_close, qty
+            open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(qty * _last_close)
             open_trade['exit_reason'] = '回測結束強制平倉（尚未實際出場）'
             trades.append(open_trade)
 
@@ -2968,7 +3208,13 @@ def _aggregate_backtest_trades(trade):
     entry_price = trade['entry_price']
     exit_price = trade['exit_price']
     holding_days = (pd.Timestamp(trade['exit_date']) - pd.Timestamp(trade['entry_date'])).days
-    pnl_pct = (exit_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+    # 【V2.11.62精進】改用含分批停利與歷次加碼的總投入/總回收金額計算真實加權報酬率
+    total_invested = _safe_float(trade.get('total_invested'), 0.0)
+    total_proceeds = _safe_float(trade.get('total_proceeds'), 0.0)
+    if total_invested > 0 and total_proceeds > 0:
+        pnl_pct = (total_proceeds - total_invested) / total_invested * 100.0
+    else:
+        pnl_pct = (exit_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
     t1_hit = len(trade.get('partial_exits', [])) >= 1
     t2_hit = len(trade.get('partial_exits', [])) >= 2
     _add_scores = trade.get('add_regime_scores', [])
@@ -3378,7 +3624,8 @@ def render_stock_card(data, system_history, portfolio_data):
         tab_c5, tab_c1, tab_c2, tab_c3, tab_c6, tab_c4 = st.tabs(["🗓️ 交易計畫", "⚙️ AI決策與SOP", "📉 技術數據", "🛡️ 風控點位", "📐 MACD動能背離", "📈 決策時間軸"])
 
         with tab_c1:
-            st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{''.join([f'<div style=\"margin-bottom: 4px;\">{item}</div>' for item in data['ai_advice']])}</div>", unsafe_allow_html=True)
+            _advice_items_html = "".join([f'<div style="margin-bottom: 4px;">{item}</div>' for item in data['ai_advice']])
+            st.markdown(f"<div class='ai-advice-box'><div style='font-size: 1.1em; font-weight: bold; margin-bottom: 8px;'>🤖 AI 執行建議：</div>{_advice_items_html}</div>", unsafe_allow_html=True)
             st.markdown(f"**🧠 AI 戰力拆解 (總分 {data['ai_score']})**")
             # 【V2.11.9修正，P1-1】美股的 score_inst 實際上是用「price>MA60 且 MACD>0」算的
             # 動能/趨勢分數，跟台股用真正的法人籌碼資料算出來的 score_inst 不是同一件事，
@@ -3515,7 +3762,7 @@ def render_stock_card(data, system_history, portfolio_data):
                 "PULLBACK_WAIT": "🟡 等待回測", "ENTER_NEXT_DAY": "🟢 下一交易日可進場",
                 "HOLD": "🔵 持有續抱", "ADD_NEXT_DAY": "🟢 下一交易日可加碼",
                 "PARTIAL_EXIT_NEXT_DAY": "🟠 下一交易日分批出場", "FULL_EXIT_NEXT_DAY": "🔴 下一交易日全部出清",
-                "SUSPENDED_BY_REGIME": "⏸️ 市場逆風，暫停新倉/加碼", "INVALID": "🔴 訊號失效", "EXPIRED": "⚪ 訊號已過期",
+                "SUSPENDED_BY_REGIME": "⏸️ 市場逆風，暫停新倉/加碼", "SUSPENDED_BY_PORTFOLIO_RISK": "⏸️ 總風險超標，暫停新倉/加碼", "INVALID": "🔴 訊號失效", "EXPIRED": "⚪ 訊號已過期",
                 "BREAKOUT_FAILED": "🟠 突破失敗",
             }
             st.markdown(f"**交易計畫狀態**：{_state_label_map.get(_plan_state, _plan_state)}")
@@ -3623,6 +3870,8 @@ def render_stock_card(data, system_history, portfolio_data):
                 st.write(f"失效價：{data.get('plan_invalid_price', 0):.2f}　｜　建議進場股數：{data.get('plan_suggested_shares', 0)} 股")
                 if _plan_state == "SUSPENDED_BY_REGIME":
                     st.warning("⏸️ 市場目前處於逆風狀態，新倉暫停，但交易計畫本身未被刪除，逆風解除後會自動恢復。")
+                elif _plan_state == "SUSPENDED_BY_PORTFOLIO_RISK":
+                    st.warning(f"⏸️ 全帳戶總風險曝露已達{PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:.0f}%門檻，新倉暫停，但交易計畫本身未被刪除，風險降回門檻以下後會自動恢復。詳見「🛡️新手風險檢查」。")
             else:
                 st.markdown("**持倉計畫資訊**")
                 _pnl_cost = _safe_float(data.get('cost', 0))
@@ -4071,6 +4320,13 @@ else:
     _any_intraday_reevaluation = False  # 【新增】只要有任何一檔因「今天K棒尚未收斂」被強制重新評估過，
                                          # 就算全域執行模式是VIEW_ONLY，最後也要把這次的結果存回trade_plan。
 
+    # 【V2.11.60新增】全帳戶總風險是否已經超標，只依portfolio設定算一次，所有股票共用同一個值，
+    # 不需要等主迴圈跑完（card_data建立完成）才知道——理由跟 calculate_portfolio_risk_pct() 的
+    # 說明一致：這個數字完全不依賴任何即時股價/指標資料，可以在迴圈開始評估任何一檔股票之前，
+    # 就先用完整的portfolio設定算好。
+    _portfolio_risk_pct_now = calculate_portfolio_risk_pct(portfolio)
+    _portfolio_risk_suspended_now = _portfolio_risk_pct_now >= PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT
+
     for code, info in list(portfolio.items()):
         if isinstance(info, dict):
             _status = info.get('status', 'Active')
@@ -4127,6 +4383,11 @@ else:
             pivot_status = "🟢 站上" if price > pivot_point else "🔴 未站上"
 
             ma10, ma20, ma60 = float(c.rolling(10).mean().iloc[-1]), float(c.rolling(20).mean().iloc[-1]), float(c.rolling(60).mean().iloc[-1])
+            # 【V2.11.61新增】SOP三燈「趨勢燈」的N天連續確認版本，用完整的close/MA序列算好，
+            # 取最新一天（今天）的值——跟回測引擎用的是同一個共用函式 calc_trend_confirmed_series()，
+            # 定義完全一致。
+            _trend_confirmed_series = calc_trend_confirmed_series(c, c.rolling(10).mean(), c.rolling(20).mean(), c.rolling(60).mean())
+            _trend_confirmed_today = bool(_trend_confirmed_series.iloc[-1]) if len(_trend_confirmed_series) > 0 else False
 
             # 【V2.9 修正】MACD 改用真正的 EMA 計算（原版用 SMA 相減會失真）
             macd = calc_macd(c)
@@ -4135,17 +4396,12 @@ else:
             k_series, d_series = calc_kd(h, l, c)
             k, d = float(k_series.iloc[-1]), float(d_series.iloc[-1])
 
-            delta = c.diff()
-            up, down = delta.clip(lower=0).rolling(14).mean().iloc[-1], -1 * delta.clip(upper=0).rolling(14).mean().iloc[-1]
-            rsi = float(100 - (100 / (1 + (np.nan_to_num(up) / (np.nan_to_num(down) + 0.001)))))
-            # 【V2.11.10新增】RSI完整序列（不只是最後一個數值），供動能加速度子分數算斜率用，
-            # 跟上面的純量rsi分開算，不影響既有計算，只是多留一份序列版本。
-            _up_series = delta.clip(lower=0).rolling(14).mean()
-            _down_series = -1 * delta.clip(upper=0).rolling(14).mean()
-            _rsi_series = 100 - (100 / (1 + (_up_series / (_down_series + 0.001))))
-            # 【V2.11.2 修正】原本 range(-13,0) 只加總13天卻除以14，跟新增的 calc_atr_series()（14期）
-            # 對不齊，微幅低估ATR。改成 range(-14,0) 真正取14天，兩處ATR計算基準一致。
-            atr = float(sum([max(h.iloc[i]-l.iloc[i], abs(h.iloc[i]-c.iloc[i-1]), abs(l.iloc[i]-c.iloc[i-1])) for i in range(-14, 0)]) / 14)
+            # 【V2.11.62修正】統一呼叫 Wilder's RMA 版 calc_rsi_series 與 calc_atr_series，
+            # 確保即時系統與回測引擎的 RSI／ATR 數值 100% 同步一致。
+            _rsi_series = calc_rsi_series(c, period=14)
+            rsi = float(_rsi_series.iloc[-1])
+            _atr_series = calc_atr_series(h, l, c, period=14)
+            atr = float(_atr_series.iloc[-1])
             bias = float(((price - ma60) / ma60) * 100)
             # 【V2.11 修正②】布林上軌：用於跟 RSI 超買訊號交叉確認，不進計分公式，純粹是文字警示用。
             boll_upper = float((c.rolling(20).mean() + 2 * c.rolling(20).std()).iloc[-1])
@@ -4226,7 +4482,9 @@ else:
             # 是因為 step3_pass 定義在後面（第2773行附近）——V2.11.11 曾因為把計算搬到迴圈更前面、
             # 卻忘記把某個變數的定義一起搬過去，導致 NameError 整批分析失敗，這裡刻意不重蹈覆轍，
             # 用「原地重算同一條件」取代「往前搬變數定義」，公式必須跟下面 step3_pass 保持一致。
-            _ui_trend_confirmed = price > ma20 and (ma10 > ma20 > ma60)
+            # 【V2.11.61修正】原本是「今天符不符合」的即時快照，改用上面已經用完整序列算好的
+            # N天連續確認版本（_trend_confirmed_today），跟回測引擎維持同一套定義。
+            _ui_trend_confirmed = _trend_confirmed_today
             atr_stop_price, _atr_stop_source = calculate_stop_plan(price, cost, atr, ma20, _prev_stop_for_calc, swing_low=_swing_low, trend_confirmed=_ui_trend_confirmed)
 
             take_profit_price = t1
@@ -4253,6 +4511,12 @@ else:
             )
             ai_score, confidence = _score_result["ai_score"], _score_result["confidence"]
             step1_pass, step2_pass, step3_pass = _score_result["step1_pass"], _score_result["step2_pass"], _score_result["step3_pass"]
+            # 【V2.11.61新增】calculate_daily_score()一次只處理「今天」單一天的純量輸入，沒有
+            # 歷史資料可以自己判斷「連續」，這裡直接覆蓋掉它算出來的step3_pass（今天的即時快照），
+            # 改用上面已經考慮過N天連續確認的_trend_confirmed_today——確保SOP三燈的「趨勢燈」
+            # 顯示、trend_gate（進場判斷用）、calculate_stop_plan()的Level切換，三處背後是同一個
+            # 值，不會有「畫面顯示綠燈、但背後其實沒有真的核准進場」這種兩套系統對不上的情況。
+            step3_pass = _trend_confirmed_today
             macro_warnings, is_bull_aligned = _score_result["macro_warnings"], _score_result["is_bull_aligned"]
             score_inst, score_tech = _score_result["score_inst"], _score_result["score_tech"]
             score_vol, score_risk = _score_result["score_vol"], _score_result["score_risk"]
@@ -4266,7 +4530,7 @@ else:
                 ai_advice = [f"✓ 建議：{'立即執行紀律停利' if price > cost else '執行基準停損，絕不凹單'}", f"✓ 依據：股價跌破防守線 ({atr_stop_price:.1f})", "✓ 狀態：收回資金保護本金", f"🎯 決策信心：{confidence}%"]
             elif cost > 0 and price < cost:
                 final_status = "⚠️ 帳面虧損"
-                ai_advice = ["✓ 建議：注意資金控管，跌破防守線前最後警戒", f"✓ 依據：現價跌破設定成本 ({cost:.2f})", "✓ 狀態：已產生實質帳面虧損，紀律優先", f"🎯 決策信心：0% (防禦狀態)"]
+                ai_advice = ["✓ 建議：注意資金控管，跌破防守線前最後警戒", f"✓ 依據：現價跌破設定成本 ({cost:.2f})", "✓ 狀態：已產生實質帳面虧損，紀律優先", "🎯 決策信心：0% (防禦狀態)"]
             elif cost > 0 and price >= cost * 1.30:
                 # 【V2.11.53修正】原本這裡寫死是 cost*1.10（獲利超過10%），跟「交易計畫」分頁的
                 # calculate_stop_plan() 早在V2.11.19就已經把同類型的獲利保護門檻從10%調高到30%，
@@ -4469,7 +4733,7 @@ else:
             _force_intraday_recheck = bool(is_today_bar) and not is_us_stock
             if execution_mode == TAIWAN_CLOSE_UPDATE or _force_intraday_recheck or (not _old_plan.get("taiwan_data_date") and _plan_data_date):
                 # 台股有新日K、今天K棒尚未收斂需要持續追蹤、或這檔股票從未被 evaluate 過（首次遷移/新增持股的一次性 bootstrap）
-                _new_plan = process_taiwan_close_update(_old_plan, _plan_indicators, macro_data, _plan_portfolio_info)
+                _new_plan = process_taiwan_close_update(_old_plan, _plan_indicators, macro_data, _plan_portfolio_info, _portfolio_risk_suspended_now)
                 # 【V2.11.41新增，Trade Plan Snapshot】在覆寫日期之前，先檢查這是不是「真的推進到
                 # 新的一天」（不是同一天內的盤中重複評估）——如果是，把_old_plan（前一天最終確定的
                 # 內容）凍結存一份快照，這樣不管接下來當天盤中重新評估幾次、覆寫幾次，使用者都還能
@@ -4653,17 +4917,19 @@ else:
     # 分母是「所有 Active 持股規劃的分配資金加總」，不是你真正的總資產，算是概估值。
     if card_data:
         st.markdown("### 🛡️ 新手風險檢查")
+        # 【V2.11.60修正】改用主迴圈開始前就算好的 _portfolio_risk_pct_now，跟真正觸發攔截判斷
+        # 用的是同一個數字，不會因為算法/時間點的細微差異，讓這裡顯示的百分比跟實際有沒有觸發
+        # 攔截兜不起來。
         _total_cap_plan = sum(d['cap'] for d in card_data)
-        _total_risk_plan = sum(d['risk_amount'] for d in card_data)
         if _total_cap_plan > 0:
-            _risk_exposure_pct = _total_risk_plan / _total_cap_plan * 100
-            if _risk_exposure_pct >= 20:
-                st.error(f"🚨 整體風險曝露：{_risk_exposure_pct:.1f}%（把你所有持股設定的「分配資金 × 單筆風險%」加總，除以總分配資金）。這個比例偏高，代表如果所有持股同時觸發停損，虧損金額會佔你規劃資金相當大的比例，建議重新檢視各檔的單筆風險%設定。")
+            _risk_exposure_pct = _portfolio_risk_pct_now
+            if _risk_exposure_pct >= PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:
+                st.error(f"🚨 整體風險曝露：{_risk_exposure_pct:.1f}%（把你所有持股設定的「分配資金 × 單筆風險%」加總，除以總分配資金），已達到{PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:.0f}%門檻——**現在起，所有股票的新倉/加碼訊號會自動暫停**（已保留原有的交易計畫，不會刪除，風險降回門檻以下會自動恢復），續抱與出清判斷完全不受影響。建議重新檢視各檔的單筆風險%設定，或考慮先出清部分部位降低整體曝露。")
             elif _risk_exposure_pct >= 10:
-                st.warning(f"⚠️ 整體風險曝露：{_risk_exposure_pct:.1f}%，中等偏高，建議留意不要再繼續加碼提高單筆風險%。")
+                st.warning(f"⚠️ 整體風險曝露：{_risk_exposure_pct:.1f}%，中等偏高，建議留意不要再繼續加碼提高單筆風險%（達到{PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:.0f}%會自動暫停新倉/加碼）。")
             else:
                 st.success(f"✅ 整體風險曝露：{_risk_exposure_pct:.1f}%，屬於相對保守的範圍。")
-            st.caption("這個數字是用你側邊欄設定的「分配資金」與「單筆風險%」概算出來的整體風險預算比例，不是你真實總資產的風險占比，僅供參考。")
+            st.caption(f"這個數字是用你側邊欄設定的「分配資金」與「單筆風險%」概算出來的整體風險預算比例，不是你真實總資產的風險占比。【V2.11.60起】這個數字達到{PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT:.0f}%時會真的暫停新倉/加碼訊號，不只是顯示提醒，門檻可在程式碼常數 PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT 調整。")
 
         # 【V2.11.2 新增】組合最大損失：用實際持有股數 × (現價−防守線) 加總，換算成具體金額，
         # 補充上面「整體風險曝露%」的百分比視角，直接回答「如果現在全部觸及防守線，最多會賠多少錢」。
@@ -4765,7 +5031,7 @@ else:
                     except Exception: pass
 
         if overtime_broken:
-            st.error(f"🚨 **【最高紀律警報】** 以下持股已破線或虧損超過 3 天未處理，請立即執行手動歸檔或停損退場：\n\n" + "、".join(overtime_broken), icon="🚨")
+            st.error("🚨 **【最高紀律警報】** 以下持股已破線或虧損超過 3 天未處理，請立即執行手動歸檔或停損退場：\n\n" + "、".join(overtime_broken), icon="🚨")
 
         with st.expander("展開今日操作任務", expanded=True):
             action_sell, action_buy, action_watch = [], [], []
@@ -4799,6 +5065,8 @@ else:
                     action_buy.append(f"🎯{_ack_badge} **【交易計畫】下一交易日可進場**：{data['name']} 突破價 {data.get('plan_breakout_price',0):.2f}，建議股數 {data.get('plan_suggested_shares',0)} 股。")
                 elif _ps == "SUSPENDED_BY_REGIME":
                     action_watch.append(f"⏸️{_ack_badge} **【交易計畫】市場逆風暫停**：{data['name']} 原訂計畫已保留，等待逆風解除後自動恢復。")
+                elif _ps == "SUSPENDED_BY_PORTFOLIO_RISK":
+                    action_watch.append(f"⏸️{_ack_badge} **【交易計畫】總風險超標暫停**：{data['name']} 原訂計畫已保留，等待全帳戶風險降回門檻以下後自動恢復。")
 
             st.markdown("#### 🟥 優先執行 (風控與停利)")
             if not action_sell: st.write("✅ 今日無急迫停損/停利需求")
