@@ -3,9 +3,12 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import requests
+import re
 import datetime
 from zoneinfo import ZoneInfo
 import json
+import math
+import contextvars
 from dataclasses import dataclass, asdict
 from typing import Optional, Literal, Dict, Any, List, Tuple
 import plotly.graph_objects as go
@@ -14,7 +17,10 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.11.63"
+APP_VERSION = "V2.12.0"
+# 【V2.12.0】本版重點：回測改為「扣除台股交易成本＋套用隔日開盤執行閘門（追價上限／失效價／漲跌停）」，
+# 與實盤可執行的條件對齊；新增 ETF 跳動單位、處置/注意股警示、K線/收斂/量能觀察因子（只記錄不影響決策）。
+# 回測報酬改為「淨報酬」（扣成本），V2.11.63（含）以前的回測數字與本版不可直接比較。
 APP_TITLE = f"TaiStock {APP_VERSION} 波段紀律決策系統"
 
 st.set_page_config(layout="wide", page_title=APP_TITLE)
@@ -278,6 +284,76 @@ def calc_trailing_stop(close_series, ma20_series, atr_series, cost, lookback=60,
     if not candidates:
         return None, "fallback"
     return max(candidates), "ratchet"
+
+def calc_price_action_features(o, h, l, c, v):
+    """
+    【V2.12.0新增，觀察用】把圖卡教學裡「可以用日K計算」的概念量化成欄位，**只記錄、不影響任何進場／
+    加碼／出場判斷**。用途是讓回測先驗證這些因子有沒有判別力，再決定要不要升級成正式關卡（沿用
+    動能加速度、突破品質分數的一貫做法：先觀察、後生效）。
+
+    回傳 DataFrame（與輸入同索引），欄位：
+      clv              收盤位置（Close Location Value）＝((C−L)−(H−C))/(H−L)，−1~+1。
+                       接近+1＝收在最高附近（尾盤強）、接近−1＝收在最低附近（尾盤弱）。
+                       這是「尾盤看盤技巧」在日K上唯一能做的近似：日K看不到最後15分鐘的量，
+                       但看得到「收在當天區間的哪裡」。
+      vol_ratio_prev5  當日量 ÷ 「前5日」均量（不含當天）。這才是看盤軟體常見的量比定義；
+                       系統既有的 vol_ma5 含當天，兩者意義不同（見說明書第14節）。
+      range_contraction 近10日平均振幅 ÷ 近60日平均振幅（都不含當天）。<0.7 代表突破前波動明顯收斂
+                       （三角收斂、旗形、楔形「收斂期」的量化近似），不做型態辨識。
+      volume_dryup     近10日均量 ÷ 近60日均量（都不含當天）。<0.8 代表突破前量縮整理
+                       （「量縮後放量」「陰陽堆疊」的量化近似）。
+      candle_pattern   當日K線型態標籤（多頭吞噬／空頭吞噬／長下影錘子／長上影流星／十字星／長紅實體／
+                       長黑實體／一般），規則固定、可回測；是否出現在關鍵價位由呼叫端另外判斷。
+    """
+    o = pd.Series(o).astype(float); h = pd.Series(h).astype(float)
+    l = pd.Series(l).astype(float); c = pd.Series(c).astype(float); v = pd.Series(v).astype(float)
+    rng = (h - l)
+    out = pd.DataFrame(index=c.index)
+    out["clv"] = (((c - l) - (h - c)) / rng.where(rng > 0)).clip(-1, 1)
+    _prev5 = v.shift(1).rolling(5).mean()
+    out["vol_ratio_prev5"] = v / _prev5.where(_prev5 > 0)
+    _r10 = rng.shift(1).rolling(10).mean(); _r60 = rng.shift(1).rolling(60).mean()
+    out["range_contraction"] = _r10 / _r60.where(_r60 > 0)
+    _v10 = v.shift(1).rolling(10).mean(); _v60 = v.shift(1).rolling(60).mean()
+    out["volume_dryup"] = _v10 / _v60.where(_v60 > 0)
+
+    body = (c - o).abs()
+    upper = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower = pd.concat([o, c], axis=1).min(axis=1) - l
+    po, pc = o.shift(1), c.shift(1)
+    patterns = []
+    for i in range(len(c)):
+        r = rng.iloc[i]
+        if pd.isna(r) or r <= 0 or pd.isna(o.iloc[i]):
+            patterns.append("一般"); continue
+        b, up, lo = body.iloc[i], upper.iloc[i], lower.iloc[i]
+        oi, ci = o.iloc[i], c.iloc[i]
+        poi, pci = po.iloc[i], pc.iloc[i]
+        if not pd.isna(poi) and pci < poi and ci > oi and ci >= poi and oi <= pci:
+            patterns.append("多頭吞噬")
+        elif not pd.isna(poi) and pci > poi and ci < oi and ci <= poi and oi >= pci:
+            patterns.append("空頭吞噬")
+        elif lo >= 2 * b and up <= max(b, 0.1 * r) and lo >= 0.4 * r:
+            patterns.append("長下影錘子")
+        elif up >= 2 * b and lo <= max(b, 0.1 * r) and up >= 0.4 * r:
+            patterns.append("長上影流星")
+        elif b <= 0.1 * r:
+            patterns.append("十字星")
+        elif b >= 0.7 * r:
+            patterns.append("長紅實體" if ci > oi else "長黑實體")
+        else:
+            patterns.append("一般")
+    out["candle_pattern"] = patterns
+    return out
+
+def describe_price_action_features(row):
+    """【V2.12.0新增】把觀察因子轉成一行中文說明（卡片顯示用）。"""
+    def _f(x, fmt):
+        return "—" if x is None or pd.isna(x) else format(x, fmt)
+    clv = row.get("clv"); vr = row.get("vol_ratio_prev5"); rc = row.get("range_contraction"); vd = row.get("volume_dryup")
+    clv_txt = "收在高檔" if (clv is not None and not pd.isna(clv) and clv >= 0.6) else ("收在低檔" if (clv is not None and not pd.isna(clv) and clv <= -0.6) else "收在中段")
+    return (f"K線：{row.get('candle_pattern', '一般')}｜收盤位置CLV {_f(clv, '+.2f')}（{clv_txt}）｜"
+            f"量比(對前5日) {_f(vr, '.2f')}倍｜波動收斂 {_f(rc, '.2f')}｜量縮程度 {_f(vd, '.2f')}")
 
 # --- 0-0-1. MACD 動能變化與背離分析模組（新增）---
 # 依據「柱狀體主導、背離為轉折預警、快慢線交叉僅作次要確認」的架構，
@@ -748,31 +824,117 @@ def _add_business_days(date_str, days, is_us_stock=False):
     except Exception:
         return ""
 
-def round_to_tick(price, is_us_stock=False):
+# 【V2.12.0新增】目前正在處理的這一檔是不是台股 ETF。round_to_tick() 的呼叫端多半只知道 is_us_stock，
+# 不知道代號，所以由主迴圈／回測在「開始處理某一檔」時設定這個 ContextVar，round_to_tick() 沒有明確
+# 傳入 is_etf 時就讀取它。ContextVar 每個執行緒各自獨立（Streamlit 每個 session 的腳本在自己的執行緒
+# 執行），不會互相干擾。
+_TICK_IS_ETF = contextvars.ContextVar("_TICK_IS_ETF", default=False)
+
+def is_tw_etf(code):
     """
-    【V2.11.x 新增】依台股實際最小跳動單位（tick size）取整，避免系統建議的突破價/追價上限
+    【V2.12.0新增】台股 ETF 判斷：證交所／櫃買中心的 ETF（含槓桿/反向、債券ETF）代號都以「00」開頭
+    （例如 0050、0056、00878、00631L、00679B）。美股代號一律回傳 False。
+    這是代號慣例判斷，不是查詢官方清單；極少數例外（例如未來規則改變）需要人工確認。
+    """
+    c = str(code or "").upper().replace(".TWO", "").replace(".TW", "").strip()
+    if not c or c.isalpha() or c.endswith(".US"):
+        return False
+    return c.startswith("00")
+
+def _tw_tick_size(p, is_etf=False):
+    """台股最小跳動單位（臺灣證交所現行制度）。股票：<10:0.01／10~50:0.05／50~100:0.1／100~500:0.5／
+    500~1000:1／>=1000:5。ETF（含受益憑證）：<50:0.01／>=50:0.05。"""
+    if is_etf:
+        return 0.01 if p < 50 else 0.05
+    if p < 10:
+        return 0.01
+    if p < 50:
+        return 0.05
+    if p < 100:
+        return 0.1
+    if p < 500:
+        return 0.5
+    if p < 1000:
+        return 1.0
+    return 5.0
+
+def round_to_tick(price, is_us_stock=False, is_etf=None, mode="nearest"):
+    """
+    【V2.11.x 新增，V2.12.0擴充】依台股實際最小跳動單位（tick size）取整，避免系統建議的突破價/追價上限
     是一個實務上不可能成交的價格（例如 87.503 元）。美股不受台股tick制度限制，只取到分。
-    台股現行制度（依價格級距）：
-      <10元：0.01　10~50元：0.05　50~100元：0.1　100~500元：0.5　500~1000元：1　>=1000元：5
+
+    【V2.12.0】
+      - 新增 ETF 跳動單位（<50元 0.01、>=50元 0.05）。is_etf 沒有明確傳入時，讀取主迴圈／回測設定的
+        _TICK_IS_ETF（見 is_tw_etf()）。舊版一律套用股票級距，ETF 的建議價位可能是不合法價位。
+      - 新增 mode："nearest"（四捨五入到最近的合法價位，預設，與舊版行為相同）／"up"（無條件進位）／
+        "down"（無條件捨去）。突破價改用 "up"，確保「至少高於前高 0.5%」不會因為四捨五入被打折。
     """
     p = _safe_float(price, 0.0)
     if p <= 0:
         return 0.0
     if is_us_stock:
         return round(p, 2)
-    if p < 10:
-        tick = 0.01
-    elif p < 50:
-        tick = 0.05
-    elif p < 100:
-        tick = 0.1
-    elif p < 500:
-        tick = 0.5
-    elif p < 1000:
-        tick = 1.0
+    if is_etf is None:
+        is_etf = _TICK_IS_ETF.get()
+    tick = _tw_tick_size(p, is_etf)
+    units = p / tick
+    if mode == "up":
+        units = math.ceil(units - 1e-9)
+    elif mode == "down":
+        units = math.floor(units + 1e-9)
     else:
-        tick = 5.0
-    return round(round(p / tick) * tick, 2)
+        units = round(units)
+    return round(units * tick, 2)
+
+# ===== 【V2.12.0新增】台股交易成本與漲跌停 =====
+# 【需要人工確認的參數】以下為法定費率；券商手續費折扣（TW_FEE_DISCOUNT，例如2.8折填0.28）與最低手續費
+# （TW_MIN_FEE，整股多數券商20元、零股各券商不同，常見1元）請依你實際開戶的券商條件修改。
+# 預設採「不打折＋最低20元」的保守設定，讓回測寧可低估績效、不要高估。
+TW_FEE_RATE = 0.001425        # 手續費率（買賣各收一次）
+TW_FEE_DISCOUNT = 1.0         # 券商折扣，1.0＝不打折
+TW_MIN_FEE = 20.0             # 每筆最低手續費（元）
+TW_STOCK_TAX_RATE = 0.003     # 股票證交稅（僅賣出）
+TW_ETF_TAX_RATE = 0.001       # ETF 證交稅（僅賣出）
+US_FEE_RATE = 0.0             # 美股：多數複委託/美國券商費率差異大，預設0，請依實際條件修改
+US_MIN_FEE = 0.0
+TW_PRICE_LIMIT_PCT = 0.10     # 台股一般股票漲跌幅限制±10%（部分境外指數ETF無漲跌幅限制，此處不區分）
+
+def calc_trade_cost(side, price, qty, is_us_stock=False, is_etf=False):
+    """
+    【V2.12.0新增】單筆交易成本（元）。side="buy"/"sell"。
+    台股：手續費＝max(無條件捨去(成交金額×費率×折扣), 最低手續費)；賣出另加證交稅＝無條件捨去(成交金額×稅率)。
+    美股：成交金額×US_FEE_RATE，最低 US_MIN_FEE。
+    qty<=0 或價格無效時回傳 0。
+    """
+    q = _safe_float(qty, 0.0)
+    px = _safe_float(price, 0.0)
+    if q <= 0 or px <= 0:
+        return 0.0
+    notional = q * px
+    if is_us_stock:
+        return max(notional * US_FEE_RATE, US_MIN_FEE)
+    fee = max(math.floor(notional * TW_FEE_RATE * TW_FEE_DISCOUNT), TW_MIN_FEE)
+    tax = 0.0
+    if side == "sell":
+        tax = math.floor(notional * (TW_ETF_TAX_RATE if is_etf else TW_STOCK_TAX_RATE))
+    return float(fee + tax)
+
+def tw_limit_hit(prev_close, open_price, direction="up", is_etf=False):
+    """
+    【V2.12.0新增】判斷開盤價是否「開在漲停／跌停」。台股漲跌停價＝前一日收盤（參考價）×(1±10%)，
+    漲停價向下取到合法跳動單位、跌停價向上取。開盤價距離漲停（跌停）價不到半個 tick 即視為開在漲停（跌停）。
+    回測使用還原股價（auto_adjust）時，除息日的「還原前收盤」剛好等於除息參考價的比例關係，
+    所以這個比例判斷在除權息日附近仍然成立；但還原後的價位本身可能不是合法 tick，屬於近似判斷。
+    """
+    pc = _safe_float(prev_close, 0.0)
+    op = _safe_float(open_price, 0.0)
+    if pc <= 0 or op <= 0:
+        return False
+    if direction == "up":
+        lim = round_to_tick(pc * (1 + TW_PRICE_LIMIT_PCT), False, is_etf, mode="down")
+        return op >= lim - 0.5 * _tw_tick_size(lim, is_etf)
+    lim = round_to_tick(pc * (1 - TW_PRICE_LIMIT_PCT), False, is_etf, mode="up")
+    return op <= lim + 0.5 * _tw_tick_size(lim, is_etf)
 
 # --- 1. 大盤宏觀環境抓取 ---
 def _fetch_tw_index_finmind():
@@ -972,6 +1134,61 @@ def fetch_stock_data_extended(code):
         return df if df is not None else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
+
+# --- 2-1. 【V2.12.0新增】處置股／注意股警示 ---
+# 【需要人工確認】以下端點依證交所／櫃買中心 OpenAPI 公開資料整理，證交所處置股端點
+# （/announcement/punish）已有第三方專案實際使用；其餘端點名稱未在部署環境實測，任何一個抓取失敗
+# 都只會讓該來源被略過（畫面會顯示哪些來源失敗），不影響其他功能。
+# MANUAL_DISPOSITION_CODES：API 抓不到時，可以手動把處置中的代號填進來（例如 {"3324"}），效果相同。
+TW_ALERT_SOURCES = [
+    ("disposition", "證交所處置", "https://openapi.twse.com.tw/v1/announcement/punish"),
+    ("notice", "證交所注意", "https://openapi.twse.com.tw/v1/announcement/notice"),
+    ("disposition", "櫃買處置", "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"),
+    ("notice", "櫃買注意", "https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_information"),
+]
+MANUAL_DISPOSITION_CODES = set()
+_ALERT_CODE_KEYS = ("Code", "SecuritiesCompanyCode", "SecuritiesCode", "StockCode", "證券代號", "股票代號", "有價證券代號")
+
+def _extract_alert_codes(records):
+    codes = set()
+    if not isinstance(records, list):
+        return codes
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        val = None
+        for k in _ALERT_CODE_KEYS:
+            if k in rec and rec[k]:
+                val = str(rec[k]).strip(); break
+        if val is None:
+            for vv in rec.values():
+                vs = str(vv).strip()
+                if re.fullmatch(r"\d{4}[0-9A-Z]{0,2}", vs):
+                    val = vs; break
+        if val and re.fullmatch(r"\d{4}[0-9A-Z]{0,2}", val):
+            codes.add(val)
+    return codes
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_tw_alert_codes():
+    """回傳 {"disposition": set, "notice": set, "ok": [來源], "failed": [來源]}。失敗一律不拋錯。"""
+    result = {"disposition": set(MANUAL_DISPOSITION_CODES), "notice": set(), "ok": [], "failed": []}
+    for kind, label, url in TW_ALERT_SOURCES:
+        try:
+            resp = requests.get(url, timeout=5, headers={"Accept": "application/json"})
+            data = resp.json()
+            result[kind] |= _extract_alert_codes(data)
+            result["ok"].append(label)
+        except Exception:
+            result["failed"].append(label)
+    return result
+
+def tw_alert_status(code, alerts):
+    """回傳 (is_disposition, is_notice)。美股一律 (False, False)。"""
+    c = str(code or "").upper().replace(".TWO", "").replace(".TW", "").strip()
+    if not c or c.isalpha() or not alerts:
+        return False, False
+    return c in alerts.get("disposition", set()), c in alerts.get("notice", set())
 
 # --- 3. 籌碼資料抓取 ---
 @st.cache_data(ttl=3600)
@@ -1842,6 +2059,35 @@ def classify_next_day_execution(plan, price):
         return "CANCEL", "🔴 已判定突破失敗，不執行"
     return "NO_TRADE", "⚪ 目前沒有待執行的進場計畫"
 
+# 【V2.12.0新增，需要人工確認的參數】回測時「隔日開盤價低於突破價、但高於失效價」要不要照常成交。
+# 實盤卡片的建議是「先觀察是否站穩再執行，或酌量減碼執行」，回測無法模擬盤中觀察，只能二選一；
+# 預設 True（照常執行並在交易明細標記 entry_gate=EXECUTE_WITH_LIMIT），可改 False 比較兩種做法的差異。
+BACKTEST_EXECUTE_BELOW_BREAKOUT = True
+
+def classify_open_execution(plan, open_price, limit_up_open=False):
+    """
+    【V2.12.0新增】用「隔日開盤價」套用跟 classify_next_day_execution() 完全相同的閘門順序，
+    外加台股開盤漲停買不到的判斷。供回測使用，也是說明書教你隔天早上對照開盤價的同一套規則：
+      CANCEL：開盤跌破失效價 → 取消
+      SKIP_LIMIT_UP：開盤即漲停 → 實務上買不到
+      WAIT_RETEST：開盤超過追價上限 → 不追，改等回測
+      EXECUTE_WITH_LIMIT：開盤低於突破價（但高於失效價）→ 觀察/減量
+      EXECUTE：其餘 → 依計畫執行
+    """
+    breakout_price = _safe_float(plan.get("breakout_price"))
+    chase_limit = _safe_float(plan.get("chase_limit"))
+    invalid_price = _safe_float(plan.get("invalid_price"))
+    op = _safe_float(open_price)
+    if invalid_price > 0 and op < invalid_price:
+        return "CANCEL", "開盤跌破失效價，取消"
+    if limit_up_open:
+        return "SKIP_LIMIT_UP", "開盤即漲停，買不到"
+    if chase_limit > 0 and op > chase_limit:
+        return "WAIT_RETEST", "開盤超過追價上限，不追價，改等回測"
+    if breakout_price > 0 and op < breakout_price:
+        return "EXECUTE_WITH_LIMIT", "開盤低於突破價，觀察或減量"
+    return "EXECUTE", "依計畫執行"
+
 def is_breakout_failed(plan, price, volume, vol_ma5, atr, prev_close):
     """
     【V2.11.10新增，Breakout Engine「T+1 Execution Gate」】比 is_signal_invalid 抓得更早、更貼近
@@ -2400,6 +2646,9 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
         and not macd_blocks_entry
         and volume_confirms
         and macd_confirms
+        # 【V2.12.0新增】處置股（分盤集合競價、大額需預收款券）不建立新的進場計畫：隔日開盤執行的假設
+        # 在處置期間不成立。注意股只提示、不擋。回測沒有歷史處置資料，這道關卡只作用在即時系統。
+        and not indicators.get("disposition_block", False)
     )
     if not entry_gate_pass or decision_score < 70 or atr <= 0:
         return None
@@ -2407,7 +2656,8 @@ def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     # 【V2.11.63修正】突破價撤回為固定「前高×1.005」（V2.11.61的原始設計）。
     # V2.11.62的自適應緩衝（min(0.1×ATR, 0.5%)）與收盤過前高時緩衝歸零，未經回測驗證，
     # 且會降低假突破的過濾力道，先撤回；若要改，應先用回測比較交易筆數與勝率。
-    breakout_price = round_to_tick(previous_high * 1.005, is_us_stock) if previous_high > 0 else round_to_tick(price, is_us_stock)
+    # 【V2.12.0】突破價改為無條件進位到合法跳動單位（mode="up"），確保真的高於前高×1.005，不會被四捨五入打折。
+    breakout_price = round_to_tick(previous_high * 1.005, is_us_stock, mode="up") if previous_high > 0 else round_to_tick(price, is_us_stock)
     chase_limit = round_to_tick(min(breakout_price + atr, breakout_price * 1.03), is_us_stock)
     pullback_low = round_to_tick(previous_high - 0.5 * atr, is_us_stock)
     pullback_high = round_to_tick(previous_high + 0.2 * atr, is_us_stock)
@@ -2717,6 +2967,12 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info,
             _prev_min = _safe_float(plan.get("retest_min_price"))
             plan["retest_min_price"] = price if _prev_min <= 0 else min(_prev_min, price)
 
+        # 【V2.12.0新增】處置期間不把等待中的計畫推進到「隔日進場」，計畫本身保留（不刪除、不重置），
+        # 處置解除後依當天資料繼續評估。
+        if indicators.get("disposition_block") and plan.get("state") in {"BREAKOUT_WAIT", "PULLBACK_WAIT"}:
+            plan["signal_reason"] = "⛔ 目前為處置股（分盤集合競價），暫不推進到隔日進場，計畫保留待處置解除"
+            return plan
+
         if plan.get("state") in {"BREAKOUT_WAIT", "PULLBACK_WAIT"} and entry_price > 0 and price >= entry_price:
             # 【V2.11.34新增，Breakout Quality Gate】用「今天」的最新資料重新算一次品質分數，不是
             # 沿用建立BREAKOUT_WAIT/PULLBACK_WAIT當時凍結的舊分數——那是計畫剛建立那天的快照，
@@ -2894,6 +3150,10 @@ def _fetch_backtest_indicator_frame(code, years=2):
         df['previous_high'] = h.rolling(60).max().shift(1)
         df['swing_low'] = l.rolling(20).min().shift(1)
         df['pivot_point'] = (h.shift(1) + l.shift(1) + c.shift(1)) / 3
+        # 【V2.12.0新增，觀察用】價格行為觀察因子（只記錄在交易明細，不影響任何決策）
+        _paf = calc_price_action_features(o, h, l, c, v)
+        for _col in _paf.columns:
+            df[_col] = _paf[_col]
         df['is_us_stock'] = is_us
         return df, raw, None
     except Exception as e:
@@ -2977,7 +3237,7 @@ def _fetch_regime_history(years=2):
     except Exception as e:
         return None, str(e)
 
-def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000.0, risk_pct=5.0):
+def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000.0, risk_pct=5.0, exec_stats=None):
     """
     對單一股票逐日重演狀態機。核心原則：
       - 每一天只看得到「當天以前」的資料（ind_df每一列本身就是因果的，rolling/ewm天生只看過去）
@@ -2987,12 +3247,31 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
         的定位
       - qty／cost 是這個函式自己管理的模擬帳本，不會動到真實的 Google Sheet
 
+    【V2.12.0新增，回測與實盤對齊】
+      - 隔日開盤執行閘門：ENTER_NEXT_DAY 不再「隔日開盤無條件成交」，改用隔日「開盤價」套用跟
+        classify_next_day_execution() 同一套規則——開盤跌破失效價→取消（回到PREPARE）；開盤超過追價上限→
+        不追、改等回測（PULLBACK_WAIT）；台股開盤即漲停→買不到（維持ENTER_NEXT_DAY，交給隔天狀態機重新
+        判斷）；開盤低於突破價但高於失效價→依 BACKTEST_EXECUTE_BELOW_BREAKOUT 決定（預設照常執行並標記）。
+      - 加碼遇開盤漲停買不到、出場（分批或全部）遇開盤跌停賣不掉：當天不成交，部位維持，隔天由狀態機
+        依當天資料重新判斷（若仍在防守線之下會再次觸發出場）。
+      - 交易成本：買進扣手續費、賣出扣手續費＋證交稅（見 calc_trade_cost()），報酬率改為淨報酬；
+        另外保留未扣成本的毛報酬（gross）方便比較成本拖累。
+      - exec_stats（選填 dict）：累計各種「未成交／取消」次數，供UI顯示。
+
     回傳 (trades, error)：trades 是完整交易記錄的 list of dict；error 是中途失敗原因（若有）。
     """
+    _tick_token = None
     try:
         plan = _trade_plan_defaults(code)
         qty, cost = 0, 0.0
         is_us_stock = bool(ind_df['is_us_stock'].iloc[0]) if len(ind_df) else False
+        is_etf = (not is_us_stock) and is_tw_etf(code)
+        _tick_token = _TICK_IS_ETF.set(is_etf)
+        if exec_stats is None:
+            exec_stats = {}
+        for _k in ("entry_signals", "entry_filled", "skip_limit_up", "skip_chase", "cancel_invalid",
+                   "below_breakout_filled", "below_breakout_skipped", "add_skip_limit_up", "exit_blocked_limit_down"):
+            exec_stats.setdefault(_k, 0)
         trades = []
         open_trade = None
 
@@ -3128,80 +3407,125 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
             new_plan = evaluate_trade_state(plan, indicators, market_context, portfolio_info)
             state = new_plan.get('state')
 
+            _lim_up_open = (not is_us_stock) and tw_limit_hit(price, next_open, "up", is_etf)
+            _lim_dn_open = (not is_us_stock) and tw_limit_hit(price, next_open, "down", is_etf)
+
             if state == 'ENTER_NEXT_DAY':
+                exec_stats["entry_signals"] += 1
+                _gate, _gate_note = classify_open_execution(new_plan, next_open, _lim_up_open)
                 fill_qty = int(new_plan.get('suggested_shares', 0))
-                if fill_qty > 0:
+                if _gate == "CANCEL":
+                    exec_stats["cancel_invalid"] += 1
+                    new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
+                elif _gate == "WAIT_RETEST":
+                    exec_stats["skip_chase"] += 1
+                    new_plan = dict(new_plan); new_plan['state'] = 'PULLBACK_WAIT'
+                    new_plan['signal_reason'] = "（回測）隔日開盤超過追價上限，不追價，改等回測"
+                elif _gate == "SKIP_LIMIT_UP":
+                    exec_stats["skip_limit_up"] += 1
+                    # 維持 ENTER_NEXT_DAY：跟實盤一樣，沒買到就留給隔天狀態機依收盤資料重新判斷
+                elif _gate == "EXECUTE_WITH_LIMIT" and not BACKTEST_EXECUTE_BELOW_BREAKOUT:
+                    exec_stats["below_breakout_skipped"] += 1
+                elif fill_qty > 0:
+                    if _gate == "EXECUTE_WITH_LIMIT":
+                        exec_stats["below_breakout_filled"] += 1
+                    exec_stats["entry_filled"] += 1
+                    _buy_cost = calc_trade_cost("buy", next_open, fill_qty, is_us_stock, is_etf)
                     qty, cost = fill_qty, next_open
-                    # 【V2.11.26新增】記錄進場當下的市場燈號分數，供事後分析「虧損交易是不是集中在
-                    # 大盤本身就轉弱的時段」——用進場決策當天（i）的 market_context 算分數，不是
-                    # 隔天實際成交那天，因為決策本身是「今天收盤」做的，這才是當時系統看到的市場環境。
+                    # 【V2.11.26新增】記錄進場當下的市場燈號分數（用決策當天 i 的 market_context）。
                     _entry_regime = calculate_regime_score(market_context)
                     open_trade = {'code': code, 'entry_date': dates[i + 1], 'entry_price': next_open,
                                    'initial_qty': fill_qty,
-                                   'total_invested': float(fill_qty * next_open),
-                                   'total_proceeds': 0.0,
+                                   'total_invested': float(fill_qty * next_open) + _buy_cost,
+                                   'gross_invested': float(fill_qty * next_open),
+                                   'total_proceeds': 0.0, 'gross_proceeds': 0.0, 'total_costs': _buy_cost,
+                                   'entry_gate': _gate,
                                    'breakout_quality_score': new_plan.get('breakout_quality_score', 0),
-                                   # 【V2.11.28新增，V2.11.30改名】子項分數，供事後分析哪個子項在拖累整體判別力
                                    'bq_volume': new_plan.get('bq_volume', 0), 'bq_macd': new_plan.get('bq_macd', 0),
                                    'bq_breakout_margin': new_plan.get('bq_breakout_margin', 0), 'bq_decision_score': new_plan.get('bq_decision_score', 0),
                                    'retest_quality': new_plan.get('retest_quality', ''), 'adds': 0, 'partial_exits': [], 'is_us_stock': is_us_stock,
                                    'entry_regime_tw': _entry_regime['tw_regime'], 'entry_regime_us': _entry_regime['us_regime'],
                                    'entry_regime_overview': _entry_regime['overview'],
-                                   # 【V2.11.35新增，MFE/MAE】用進場成交價當起點，之後每天用當天的
-                                   # High/Low更新，追蹤持有期間「最高曾經浮盈到哪」跟「最深曾經浮虧到哪」。
-                                   'mfe_price': next_open, 'mae_price': next_open}
+                                   'mfe_price': next_open, 'mae_price': next_open,
+                                   # 【V2.12.0新增，觀察用】訊號當天（決策日 i）的價格行為因子
+                                   'obs_clv': _safe_float(row.get('clv'), float('nan')),
+                                   'obs_vol_ratio_prev5': _safe_float(row.get('vol_ratio_prev5'), float('nan')),
+                                   'obs_range_contraction': _safe_float(row.get('range_contraction'), float('nan')),
+                                   'obs_volume_dryup': _safe_float(row.get('volume_dryup'), float('nan')),
+                                   'obs_candle_pattern': row.get('candle_pattern', '一般')}
                     new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
                 else:
                     new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
             elif state == 'ADD_NEXT_DAY':
                 add_qty = int(new_plan.get('addon_shares_approved', 0))
-                if add_qty > 0 and qty > 0:
+                if _lim_up_open:
+                    exec_stats["add_skip_limit_up"] += 1
+                elif add_qty > 0 and qty > 0:
+                    _add_cost = calc_trade_cost("buy", next_open, add_qty, is_us_stock, is_etf)
                     new_cost = (cost * qty + next_open * add_qty) / (qty + add_qty)
                     qty, cost = qty + add_qty, new_cost
                     if open_trade:
                         open_trade['adds'] += 1
-                        open_trade['total_invested'] = open_trade.get('total_invested', 0.0) + float(add_qty * next_open)
-                        # 【V2.11.27新增】記錄每一次加碼當下的市場燈號分數，跟進場時同一個算法
-                        # （用決策當天i的market_context），供分析「加碼是不是發生在市場正在轉弱
-                        # 的時段」——這是比「進場當下分數」更精確的問題：V2.11.26驗證過進場分數
-                        # 跟輸贏基本無關，因為進場後市場才轉壞、進場分數量不到；加碼卻是「持有期間」
-                        # 才發生的決策，理論上應該要能反映當下市場環境轉差與否。
+                        open_trade['total_invested'] = open_trade.get('total_invested', 0.0) + float(add_qty * next_open) + _add_cost
+                        open_trade['gross_invested'] = open_trade.get('gross_invested', 0.0) + float(add_qty * next_open)
+                        open_trade['total_costs'] = open_trade.get('total_costs', 0.0) + _add_cost
+                        # 【V2.11.27新增】記錄每一次加碼當下的市場燈號分數（決策當天 i 的 market_context）。
                         _add_regime = calculate_regime_score(market_context)
                         _add_regime_score = _add_regime['us_regime'] if is_us_stock else _add_regime['tw_regime']
                         open_trade.setdefault('add_regime_scores', []).append(round(_add_regime_score, 1))
                 new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
             elif state == 'PARTIAL_EXIT_NEXT_DAY':
                 exit_qty = min(int(new_plan.get('partial_exit_shares', 0)), qty)
-                if exit_qty > 0:
-                    if open_trade:
-                        open_trade['partial_exits'].append({'date': dates[i + 1], 'price': next_open, 'qty': exit_qty})
-                        open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(exit_qty * next_open)
-                    qty -= exit_qty
-                new_plan = dict(new_plan)
-                new_plan['state'] = 'HOLD' if qty > 0 else 'PREPARE'
+                if _lim_dn_open and exit_qty > 0:
+                    exec_stats["exit_blocked_limit_down"] += 1
+                    new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
+                else:
+                    if exit_qty > 0:
+                        _sell_cost = calc_trade_cost("sell", next_open, exit_qty, is_us_stock, is_etf)
+                        if open_trade:
+                            open_trade['partial_exits'].append({'date': dates[i + 1], 'price': next_open, 'qty': exit_qty})
+                            open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(exit_qty * next_open) - _sell_cost
+                            open_trade['gross_proceeds'] = open_trade.get('gross_proceeds', 0.0) + float(exit_qty * next_open)
+                            open_trade['total_costs'] = open_trade.get('total_costs', 0.0) + _sell_cost
+                        qty -= exit_qty
+                    new_plan = dict(new_plan)
+                    new_plan['state'] = 'HOLD' if qty > 0 else 'PREPARE'
             elif state == 'FULL_EXIT_NEXT_DAY':
-                if open_trade and qty > 0:
-                    open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[i + 1], next_open, qty
-                    open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(qty * next_open)
-                    open_trade['exit_reason'] = new_plan.get('signal_reason', '')
-                    trades.append(open_trade)
-                open_trade = None
-                qty, cost = 0, 0.0
-                new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
+                if _lim_dn_open and qty > 0:
+                    exec_stats["exit_blocked_limit_down"] += 1
+                    new_plan = dict(new_plan); new_plan['state'] = 'HOLD'
+                else:
+                    if open_trade and qty > 0:
+                        _sell_cost = calc_trade_cost("sell", next_open, qty, is_us_stock, is_etf)
+                        open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[i + 1], next_open, qty
+                        open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(qty * next_open) - _sell_cost
+                        open_trade['gross_proceeds'] = open_trade.get('gross_proceeds', 0.0) + float(qty * next_open)
+                        open_trade['total_costs'] = open_trade.get('total_costs', 0.0) + _sell_cost
+                        open_trade['exit_reason'] = new_plan.get('signal_reason', '')
+                        trades.append(open_trade)
+                    open_trade = None
+                    qty, cost = 0, 0.0
+                    new_plan = dict(new_plan); new_plan['state'] = 'PREPARE'
 
             plan = new_plan
 
         # 回測結束時仍持有部位：以最後一天收盤價強制平倉結算，不然這筆交易無法統計進報表
         if open_trade and qty > 0:
             _last_close = float(ind_df.iloc[-1]['close'])
+            _sell_cost = calc_trade_cost("sell", _last_close, qty, is_us_stock, is_etf)
             open_trade['exit_date'], open_trade['exit_price'], open_trade['exit_qty'] = dates[-1], _last_close, qty
-            open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(qty * _last_close)
+            open_trade['total_proceeds'] = open_trade.get('total_proceeds', 0.0) + float(qty * _last_close) - _sell_cost
+            open_trade['gross_proceeds'] = open_trade.get('gross_proceeds', 0.0) + float(qty * _last_close)
+            open_trade['total_costs'] = open_trade.get('total_costs', 0.0) + _sell_cost
             open_trade['exit_reason'] = '回測結束強制平倉（尚未實際出場）'
             trades.append(open_trade)
 
         return trades, None
     except Exception as e:
         return [], str(e)
+    finally:
+        if _tick_token is not None:
+            _TICK_IS_ETF.reset(_tick_token)
 
 def _aggregate_backtest_trades(trade):
     """把一筆 open_trade 記錄（含分批加碼/分批出場）換算成單筆交易的績效指標。"""
@@ -3209,12 +3533,17 @@ def _aggregate_backtest_trades(trade):
     exit_price = trade['exit_price']
     holding_days = (pd.Timestamp(trade['exit_date']) - pd.Timestamp(trade['entry_date'])).days
     # 【V2.11.62精進】改用含分批停利與歷次加碼的總投入/總回收金額計算真實加權報酬率
+    # 【V2.12.0】total_invested／total_proceeds 已含交易成本（買進加手續費、賣出扣手續費＋證交稅），
+    # 所以 pnl_pct 是「淨報酬」；gross_pnl_pct 是未扣成本的毛報酬，兩者差距＝成本拖累（cost_drag_pct）。
     total_invested = _safe_float(trade.get('total_invested'), 0.0)
     total_proceeds = _safe_float(trade.get('total_proceeds'), 0.0)
     if total_invested > 0 and total_proceeds > 0:
         pnl_pct = (total_proceeds - total_invested) / total_invested * 100.0
     else:
         pnl_pct = (exit_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
+    gross_invested = _safe_float(trade.get('gross_invested'), 0.0)
+    gross_proceeds = _safe_float(trade.get('gross_proceeds'), 0.0)
+    gross_pnl_pct = ((gross_proceeds - gross_invested) / gross_invested * 100.0) if (gross_invested > 0 and gross_proceeds > 0) else pnl_pct
     t1_hit = len(trade.get('partial_exits', [])) >= 1
     t2_hit = len(trade.get('partial_exits', [])) >= 2
     _add_scores = trade.get('add_regime_scores', [])
@@ -3253,6 +3582,13 @@ def _aggregate_backtest_trades(trade):
         'add_regime_score_min': round(min(_add_scores), 1) if _add_scores else None,
         'add_regime_score_avg': round(sum(_add_scores) / len(_add_scores), 1) if _add_scores else None,
         'exit_reason': trade.get('exit_reason', ''), 'win': pnl_pct > 0,
+        # 【V2.12.0新增】成本與執行閘門
+        'gross_pnl_pct': round(gross_pnl_pct, 3), 'cost_drag_pct': round(gross_pnl_pct - pnl_pct, 3),
+        'total_costs': round(_safe_float(trade.get('total_costs'), 0.0), 1), 'entry_gate': trade.get('entry_gate', ''),
+        # 【V2.12.0新增，觀察用】訊號當天的價格行為因子，供「觀察因子判別力」分析
+        'obs_clv': trade.get('obs_clv'), 'obs_vol_ratio_prev5': trade.get('obs_vol_ratio_prev5'),
+        'obs_range_contraction': trade.get('obs_range_contraction'), 'obs_volume_dryup': trade.get('obs_volume_dryup'),
+        'obs_candle_pattern': trade.get('obs_candle_pattern', ''),
     }
 
 def calculate_backtest_metrics(trades_df):
@@ -3307,7 +3643,55 @@ def calculate_backtest_metrics(trades_df):
         'avg_mfe_win': wins['mfe_pct'].mean() if len(wins) > 0 and _has_mfe_mae else None,
         'avg_mae_win': wins['mae_pct'].mean() if len(wins) > 0 and _has_mfe_mae else None,
         'avg_mae_loss': losses['mae_pct'].mean() if len(losses) > 0 and _has_mfe_mae else None,
+        # 【V2.12.0新增】成本拖累：平均每筆交易被交易成本吃掉幾個百分點；毛期望值＝未扣成本的期望值
+        'avg_cost_drag_pct': trades_df['cost_drag_pct'].mean() if 'cost_drag_pct' in trades_df.columns else None,
+        'gross_expectancy_pct': trades_df['gross_pnl_pct'].mean() if 'gross_pnl_pct' in trades_df.columns else None,
+        'net_expectancy_mean_pct': trades_df['pnl_pct'].mean(),
     }
+
+def calculate_observation_factor_report(trades_df, min_bucket=5):
+    """
+    【V2.12.0新增】觀察因子判別力：把交易依各觀察因子分組，比較各組的筆數／勝率／平均淨報酬。
+    目的不是找出「最好看」的組合（小樣本下很容易過度擬合），而是檢查方向是否符合直覺、
+    差距是否夠大且在跨時段一致性檢查中也成立，才考慮把該因子升級成正式關卡。
+    分組（固定門檻，避免依結果挑門檻）：
+      收盤位置CLV：≥0.6（收高）／−0.6~0.6／≤−0.6（收低）
+      量比(對前5日)：<1.5／1.5~3／≥3
+      波動收斂：<0.7（明顯收斂）／≥0.7
+      量縮程度：<0.8（突破前量縮）／≥0.8
+      K線型態：各標籤
+    樣本數低於 min_bucket 的組別仍列出，但標註「樣本不足」。
+    """
+    if trades_df is None or trades_df.empty:
+        return pd.DataFrame()
+    df = trades_df.copy()
+    rows = []
+    def _bucket(col, edges, labels):
+        if col not in df.columns:
+            return None
+        x = pd.to_numeric(df[col], errors='coerce')
+        return pd.cut(x, bins=edges, labels=labels, right=False)
+    specs = [
+        ("收盤位置CLV", _bucket('obs_clv', [-10, -0.6, 0.6, 10], ["收低(≤-0.6)", "中段", "收高(≥0.6)"])),
+        ("量比(對前5日)", _bucket('obs_vol_ratio_prev5', [0, 1.5, 3, 1e9], ["<1.5倍", "1.5~3倍", "≥3倍"])),
+        ("突破前波動收斂", _bucket('obs_range_contraction', [0, 0.7, 1e9], ["明顯收斂(<0.7)", "未收斂"])),
+        ("突破前量縮", _bucket('obs_volume_dryup', [0, 0.8, 1e9], ["量縮(<0.8)", "未量縮"])),
+        ("K線型態", df['obs_candle_pattern'] if 'obs_candle_pattern' in df.columns else None),
+    ]
+    for factor, groups in specs:
+        if groups is None:
+            continue
+        for g, sub in df.groupby(groups, observed=True):
+            n = len(sub)
+            if n == 0:
+                continue
+            rows.append({
+                "因子": factor, "分組": str(g), "筆數": n,
+                "勝率%": round(sub['win'].mean() * 100, 1),
+                "平均淨報酬%": round(sub['pnl_pct'].mean(), 2),
+                "備註": "樣本不足，僅供參考" if n < min_bucket else "",
+            })
+    return pd.DataFrame(rows)
 
 def calculate_walk_forward_split(trades_df, n_periods=2):
     """
@@ -3396,6 +3780,7 @@ def run_backtest(codes, years=2, progress_callback=None):
     regime_df, regime_err = _fetch_regime_history(years)
     all_trades = []
     errors = {}
+    exec_stats = {}  # 【V2.12.0新增】隔日開盤執行閘門的統計（跨所有股票累計）
     for idx, code in enumerate(codes):
         if progress_callback:
             progress_callback(idx, len(codes), code)
@@ -3405,7 +3790,7 @@ def run_backtest(codes, years=2, progress_callback=None):
         inst_df, inst_err = _fetch_institutional_history(code, years)
         if inst_err and not (code.isalpha() or code.endswith('.US')):
             errors[code] = f"籌碼資料：{inst_err}（仍會繼續回測，籌碼燈這段期間會偏保守判定不過關）"
-        trades, sim_err = _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df)
+        trades, sim_err = _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, exec_stats=exec_stats)
         if sim_err:
             errors.setdefault(code, ""); errors[code] += f" 模擬失敗：{sim_err}"
             continue
@@ -3413,6 +3798,8 @@ def run_backtest(codes, years=2, progress_callback=None):
             all_trades.append(_aggregate_backtest_trades(t))
     trades_df = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
     metrics = calculate_backtest_metrics(trades_df) if not trades_df.empty else None
+    if metrics is not None:
+        metrics['exec_stats'] = exec_stats
     if regime_err:
         errors['__regime__'] = f"市場燈號歷史資料：{regime_err}（仍會繼續回測，市場燈號這段期間會視為中性）"
     return trades_df, metrics, errors
@@ -3664,6 +4051,12 @@ def render_stock_card(data, system_history, portfolio_data):
             _accel = data.get('momentum_accel_score', 0.0)
             _accel_icon = "🔺" if _accel > 2 else ("🔻" if _accel < -2 else "▪️")
             st.caption(f"{_accel_icon} 動能加速度（觀察用，不影響任何進場/加碼門檻）：{_accel:+.1f} 分 — {data.get('momentum_accel_detail', '')}")
+            # 【V2.12.0新增，觀察用】
+            st.caption(f"🕯️ 價格行為（觀察用，不影響任何門檻）：{data.get('price_action_text', '—')}")
+            if data.get('is_disposition'):
+                st.error("⛔ 處置股：暫停新進場與加碼（見說明書第9.3.2節）")
+            elif data.get('is_notice'):
+                st.warning("⚠️ 注意股：進場請保守")
         with tab_c2:
             c_t1, c_t2 = st.columns(2)
             c_t1.write(f"**今日量**: {data['volume']:,.0f} | **5日均量**: {data['vol_ma5']:,.0f}\n**K**: {data['k']:.1f} | **D**: {data['d']:.1f} | **RSI**: {data['rsi']:.1f}")
@@ -3811,7 +4204,15 @@ def render_stock_card(data, system_history, portfolio_data):
             # 不用自己心算現價相對突破價/追價上限/失效價的位置。
             if data.get('held_qty', 0) <= 0 and _plan_state in ("ENTER_NEXT_DAY", "BREAKOUT_FAILED"):
                 _gate_code, _gate_note = data.get('plan_next_day_gate', ("NO_TRADE", ""))
-                st.info(f"**隔日執行判斷**：{_gate_note}")
+                st.info(f"**隔日執行判斷（依今日收盤價）**：{_gate_note}")
+                # 【V2.12.0新增】隔天早上真正要對照的是「開盤價」，跟回測用的是同一套規則（classify_open_execution）
+                if _plan_state == "ENTER_NEXT_DAY":
+                    _bp = _safe_float(data.get('plan_breakout_price')); _cl = _safe_float(data.get('plan_chase_limit')); _ip = _safe_float(data.get('plan_invalid_price'))
+                    st.caption(
+                        f"🌅 隔日開盤對照：開盤 < {_ip:.2f}（失效價）→ 取消｜開盤漲停 → 買不到，不追｜"
+                        f"開盤 > {_cl:.2f}（追價上限）→ 不追，等回測｜{_ip:.2f}~{_bp:.2f} → 觀察是否站穩或減量｜"
+                        f"{_bp:.2f}~{_cl:.2f} → 依計畫執行"
+                    )
 
             # 【修正】原本用 st.columns(2) 左右分欄，在手機/平板較窄的螢幕上兩欄文字容易被硬擠在一起、
             # 看起來混在一起分不清楚，改成單欄、由上到下依序顯示，寬螢幕/窄螢幕都不會有排版混淆的問題。
@@ -4203,10 +4604,29 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                         "（回吐缺口大代表停利可能太鬆；贏的交易MAE很深代表停損可能設太緊，容易把後來會成功的交易洗掉；"
                         "輸的交易MAE可以拿來對照理論停損距離，看停損有沒有確實執行）"
                     )
+                # 【V2.12.0新增】成本與隔日開盤執行閘門
+                _drag = _bt_metrics.get('avg_cost_drag_pct')
+                _gexp = _bt_metrics.get('gross_expectancy_pct')
+                if _drag is not None:
+                    st.caption(
+                        f"💸 以上勝率／平均獲利／虧損／Expectancy 都是**扣除交易成本後的淨報酬**（手續費{TW_FEE_RATE*100:.4f}%×折扣{TW_FEE_DISCOUNT:g}、"
+                        f"最低{TW_MIN_FEE:.0f}元、證交稅股票{TW_STOCK_TAX_RATE*100:.1f}%／ETF{TW_ETF_TAX_RATE*100:.1f}%）。"
+                        f"平均每筆被成本吃掉 {_drag:.2f} 個百分點；若不扣成本，平均每筆報酬為 {_gexp:.2f}%。"
+                    )
+                _es = _bt_metrics.get('exec_stats') or {}
+                if _es.get('entry_signals'):
+                    st.caption(
+                        f"🚪 隔日開盤執行閘門：進場訊號 {_es.get('entry_signals', 0)} 次，實際成交 {_es.get('entry_filled', 0)} 次"
+                        f"（其中開盤低於突破價仍成交 {_es.get('below_breakout_filled', 0)} 次）｜開盤漲停買不到 {_es.get('skip_limit_up', 0)} 次"
+                        f"｜開盤超過追價上限改等回測 {_es.get('skip_chase', 0)} 次｜開盤跌破失效價取消 {_es.get('cancel_invalid', 0)} 次"
+                        f"｜加碼遇漲停未成交 {_es.get('add_skip_limit_up', 0)} 次｜出場遇跌停延後 {_es.get('exit_blocked_limit_down', 0)} 次。"
+                        "（同一個訊號若連續幾天沒成交，會被重複計入訊號次數）"
+                    )
                 st.caption(
                     "⚠️ 最大回撤是用「逐筆交易累積報酬率」算出的簡化權益曲線，不是真實資金逐日回撤"
-                    "（沒有考慮同時持有多檔部位的資金排擠、也沒有考慮交易成本/滑價，屬於P2-2/P2-3尚未實作範圍，"
-                    "見說明書第14節）。"
+                    "（沒有考慮同時持有多檔部位的資金排擠；滑價只以「隔日開盤價成交」近似，見說明書第14節）。"
+                    "回測股票清單若是依「近期表現好」挑選，結果會有選擇偏差，建議同時放入幾檔你沒有特別看好的股票對照。"
+                    "回測沒有歷史處置股資料，處置股關卡只作用在即時系統。"
                 )
 
                 st.subheader("📉 權益曲線（模擬，逐筆交易累積報酬率）")
@@ -4253,6 +4673,19 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                 )
                 _bt_by_code = calculate_backtest_by_code(_bt_trades_df)
                 st.dataframe(_bt_by_code, use_container_width=True, hide_index=True)
+
+                # 【V2.12.0新增】觀察因子判別力
+                st.subheader("🔬 觀察因子判別力（K線／收盤位置／量比／收斂／量縮）")
+                st.caption(
+                    "這些因子目前**只記錄、不影響任何進場或出場判斷**。用固定分組比較勝率與平均淨報酬，"
+                    "只有在「差距明顯＋樣本足夠（每組至少數十筆）＋跨時段一致性檢查兩段方向相同」時，才值得考慮升級成正式關卡。"
+                    "小樣本下的漂亮差距多半是雜訊，請勿依此表直接調參。"
+                )
+                _obs_report = calculate_observation_factor_report(_bt_trades_df)
+                if _obs_report is not None and not _obs_report.empty:
+                    st.dataframe(_obs_report, use_container_width=True, hide_index=True)
+                else:
+                    st.info("交易筆數不足，暫時無法產生觀察因子分析。")
 
                 st.subheader("📋 交易明細")
                 _bt_display_df = _bt_trades_df.sort_values('exit_date', ascending=False).copy()
@@ -4327,10 +4760,21 @@ else:
     _portfolio_risk_pct_now = calculate_portfolio_risk_pct(portfolio)
     _portfolio_risk_suspended_now = _portfolio_risk_pct_now >= PORTFOLIO_RISK_SUSPEND_THRESHOLD_PCT
 
+    # 【V2.12.0新增】處置股／注意股清單：整輪分析只抓一次（快取1小時），失敗不影響其他功能
+    try:
+        _tw_alerts = fetch_tw_alert_codes()
+    except Exception:
+        _tw_alerts = {"disposition": set(MANUAL_DISPOSITION_CODES), "notice": set(), "ok": [], "failed": ["全部"]}
+    if _tw_alerts.get("failed"):
+        st.caption(f"ℹ️ 處置／注意股資料部分來源抓取失敗（{'、'.join(_tw_alerts['failed'])}），這些來源本輪不會提示；"
+                   "可在程式碼 MANUAL_DISPOSITION_CODES 手動填入處置中的代號。")
+
     for code, info in list(portfolio.items()):
         if isinstance(info, dict):
             _status = info.get('status', 'Active')
             if _status == 'Closed': continue
+            # 【V2.12.0新增】設定這一檔的 tick 規則（ETF／股票），供 round_to_tick() 使用
+            _TICK_IS_ETF.set((not (code.isalpha() or code.endswith('.US'))) and is_tw_etf(code))
             name, cost, cap, risk_pct = info.get('name', ''), info.get('cost', 0.0), info.get('cap', 20000.0), info.get('risk', 5.0)
             if _status == 'Paused':
                 # 【V2.10.11 新增】暫停分析（長期持有）：跳過完整的技術指標/AI分數計算，
@@ -4362,6 +4806,10 @@ else:
             if isinstance(c, pd.DataFrame): c, h, l, v = c.iloc[:, 0], h.iloc[:, 0], l.iloc[:, 0], v.iloc[:, 0]
 
             price, volume, vol_ma5 = float(c.iloc[-1]), float(v.iloc[-1]), float(v.rolling(5).mean().iloc[-1])
+            # 【V2.12.0註記，刻意不改公式】vol_ma5 是「含當天」的5日均量，所以「量≥1.5×vol_ma5」實際等於
+            # 「當天量≥前4日均量約1.71倍」；量能甜蜜點1.5~1.8倍約等於前4日均量的1.71~2.25倍。這跟看盤軟體
+            # 常見的「量比（對前5日）」不同。所有量能門檻都是用這個定義校準的，直接改公式會讓門檻全部失準，
+            # 所以這裡維持不變，另外在觀察因子 vol_ratio_prev5 提供標準量比供對照。
             # 【V2.11.2 新增，V2.11.33修正真實bug】未完成K棒提醒：如果抓到的最後一筆資料日期是
             # 「今天」，代表這根K棒可能還在交易時段中持續變動（尤其影響量能、KD、RSI），收盤後
             # 數字才會定案。
@@ -4413,6 +4861,18 @@ else:
                 _momentum_accel_score, _momentum_accel_detail = calculate_momentum_acceleration_score(_rsi_series, _osc_full_series, v)
             except Exception:
                 _momentum_accel_score, _momentum_accel_detail = 0.0, "計算失敗，暫不顯示"
+
+            # 【V2.12.0新增，觀察用】價格行為觀察因子（K線型態／收盤位置／量比／收斂／量縮），不影響任何判斷
+            try:
+                _o_series = df['Open'].squeeze()
+                if isinstance(_o_series, pd.DataFrame): _o_series = _o_series.iloc[:, 0]
+                _paf_last = calc_price_action_features(_o_series, h, l, c, v).iloc[-1].to_dict()
+                _price_action_text = describe_price_action_features(_paf_last)
+            except Exception:
+                _paf_last, _price_action_text = {}, "計算失敗，暫不顯示"
+
+            # 【V2.12.0新增】處置／注意股狀態
+            _is_disposition, _is_notice = tw_alert_status(code, _tw_alerts)
 
             # 【V2.9.3／V2.10.1 修正】yfinance 偶爾會回傳不完整的資料（例如最後一根K棒缺值），
             # 導致 price/ma/k/d/rsi/atr 等任一數值變成 NaN。NaN 沒被擋下來的話會一路
@@ -4524,6 +4984,10 @@ else:
 
 
             ai_advice = []
+            if _is_disposition:
+                ai_advice.append("<span style='color: #f87171;'>⛔ 處置股：目前採分盤集合競價（每5或20分鐘撮合一次），大額交易需預收款券；系統暫停建立新進場計畫與加碼。已持有部位的停損停利照常執行，但成交價可能與預期有落差。</span>")
+            elif _is_notice:
+                ai_advice.append("⚠️ 注意股：交易所已公告注意（漲跌幅或成交量異常），若再被列入可能轉為處置股，進場請保守、部位宜縮小。")
 
             if cost > 0 and price <= atr_stop_price:
                 final_status = "🔵 停利退場" if price > cost else "🔴 破損"
@@ -4642,6 +5106,8 @@ else:
                     # 【MACD深度整合】新增關卡：日線MACD出現頂背離或已翻黑，代表動能可能已經在轉弱，
                     # 這時候不該再加重部位，即使前面幾道關卡都通過也一樣暫停加碼。
                     ai_advice.append(f"⏸️ 暫不建議加碼：日線MACD出現「{_macd_daily_result.divergence_type if _macd_daily_result.divergence_type == '頂背離' else _macd_daily_result.osc_status}」，動能可能轉弱，暫緩加碼觀察後續。")
+                elif _is_disposition:
+                    ai_advice.append("⏸️ 暫不建議加碼：處置期間撮合方式改變，加碼成交價難以控制。")
                 else:
                     _addon_quality_gate_pass = True
                     _current_value = _held_qty * price
@@ -4709,6 +5175,7 @@ else:
                 "macd_osc_value": _macd_osc_value,
                 "swing_low": _swing_low, "volume": volume, "vol_ma5": vol_ma5,
                 "prev_close": float(c.iloc[-2]) if len(c) >= 2 else price,
+                "disposition_block": bool(_is_disposition),
             }
             _plan_portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": _held_qty,
                                      "available_cash": max(0.0, cap - _held_qty * price),
@@ -4807,6 +5274,7 @@ else:
                 "t1": t1, "t2": t2, "r1": r1, "r2": r2, "target_branch": _target_branch, "is_today_bar": is_today_bar,
                 "atr_stop_source": _atr_stop_source,
                 "momentum_accel_score": _momentum_accel_score, "momentum_accel_detail": _momentum_accel_detail,
+                "price_action_text": _price_action_text, "is_disposition": _is_disposition, "is_notice": _is_notice,
                 # ===== V2.11.x 交易計畫（trade_plan）欄位，統一用 plan_ 前綴，跟既有欄位分開，互不覆蓋 =====
                 "plan_state": trade_plan_data[code]["state"], "plan_origin_state": trade_plan_data[code]["origin_state"],
                 "plan_signal_type": trade_plan_data[code]["signal_type"], "plan_signal_reason": trade_plan_data[code]["signal_reason"],
