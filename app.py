@@ -8,6 +8,8 @@ import datetime
 from zoneinfo import ZoneInfo
 import json
 import math
+import time
+import hashlib
 import contextvars
 from dataclasses import dataclass, asdict
 from typing import Optional, Literal, Dict, Any, List, Tuple
@@ -17,7 +19,9 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.14.0"
+APP_VERSION = "V2.14.1"
+# 【V2.14.1】修正 Google Sheets「每分鐘讀寫次數超過上限（429）」：雲端資料改為每個瀏覽器工作階段快取、
+# 內容沒變就不寫入、分頁物件快取、遇到 429 自動等待重試、決策日誌輸入改用表單（填完按儲存才送出）。
 # 【V2.14.0】①手續費改為元大證券一般電子下單條件（6折、整股最低20元、零股最低1元），並分開計算整股與零股。
 # ②影子策略實單支援：卡片可標記「依影子訊號進場」，系統把結構停損設為防守線下限、不給加碼建議、
 # 決策日誌自動標註【影子策略】。③回測改用各股票在側邊欄設定的分配資金與風險%。
@@ -1431,7 +1435,104 @@ def get_gsheet_client():
     """建立與 Google Sheets 的連線（憑證讀取自 st.secrets['gcp_service_account']）。"""
     creds_info = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_info, scopes=GSHEET_SCOPES)
-    return gspread.authorize(creds)
+    client = gspread.authorize(creds)
+    _install_gs_retry(client)  # 【V2.14.1】429/5xx 自動等待重試
+    return client
+
+# ===== 【V2.14.1新增】Google Sheets 讀寫次數保護 =====
+# 背景：Streamlit 每次點按鈕、切換選項、在輸入框打字，都會把整支程式從頭重跑一次。舊版每次重跑都會
+# 重新讀取 portfolio／history／trade_plan／快照／決策日誌等分頁（每個分頁約2次API呼叫），結尾還會
+# 「清空＋重寫」history 分頁。Google Sheets API 對每個使用者每分鐘的讀取與寫入次數都有上限（常見為各60次），
+# 連續操作幾次就會超過上限（HTTP 429），頁面出現錯誤。以下四層保護：
+#   ① 雲端資料每個瀏覽器工作階段只讀一次，之後重跑直接用記憶體中的資料（SHEET_CACHE_TTL_SEC 後自動重讀，
+#      或按側邊欄「🔄重新讀取雲端資料」）
+#   ② 整表覆寫類的存檔（history／trade_plan／portfolio）內容沒變就不寫
+#   ③ 分頁物件快取，不再每次都向 Google 查詢分頁
+#   ④ 仍然遇到 429 或暫時性 5xx 錯誤時，自動等待 2→4→8→16→30 秒重試
+SHEET_CACHE_TTL_SEC = 600          # 雲端資料在記憶體中保留的秒數（10分鐘）
+GS_RETRY_DELAYS = (2, 4, 8, 16, 30)
+
+def _gs_retry(fn, *args, **kwargs):
+    for attempt, delay in enumerate((0,) + GS_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            _code = getattr(getattr(e, "response", None), "status_code", None)
+            if _code in (429, 500, 502, 503) and attempt < len(GS_RETRY_DELAYS):
+                continue
+            raise
+
+def _install_gs_retry(client):
+    """把重試包在 gspread 最底層的 request 上（相容 gspread 5.x 的 Client 與 6.x 的 HTTPClient）。"""
+    target = getattr(client, "http_client", None) or client
+    if getattr(target, "_taistock_retry_installed", False):
+        return
+    _orig = target.request
+    def _request_with_retry(*a, **k):
+        return _gs_retry(_orig, *a, **k)
+    target.request = _request_with_retry
+    target._taistock_retry_installed = True
+
+@st.cache_resource
+def _worksheet_cache():
+    return {}
+
+def _sheet_cache():
+    return st.session_state.setdefault("_sheet_cache", {})
+
+def _sheet_cache_get(key):
+    ent = _sheet_cache().get(key)
+    if ent and (time.time() - ent["t"]) < SHEET_CACHE_TTL_SEC:
+        return ent["data"]
+    return None
+
+def _sheet_cache_set(key, data):
+    _sheet_cache()[key] = {"t": time.time(), "data": data}
+
+def _sheet_cache_invalidate(*keys):
+    c = _sheet_cache()
+    for k in (keys or list(c.keys())):
+        c.pop(k, None)
+
+def _rows_hash(rows):
+    return hashlib.md5(json.dumps(rows, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+
+def _unchanged_since_last_save(name, rows):
+    h = _rows_hash(rows)
+    hashes = st.session_state.setdefault("_sheet_saved_hash", {})
+    if hashes.get(name) == h:
+        return True, h
+    return False, h
+
+def _mark_saved(name, h):
+    st.session_state.setdefault("_sheet_saved_hash", {})[name] = h
+
+def _remember_remote(name, records):
+    """記錄「這個工作階段最後一次看到的雲端內容」指紋，供存檔前檢查是否被其他裝置改過。"""
+    st.session_state.setdefault("_remote_hash", {})[name] = _rows_hash(records)
+
+def _remote_changed_by_others(name, ws):
+    """
+    【V2.14.1新增，多裝置保護】整表覆寫前先讀一次雲端現況，跟本工作階段最後看到的指紋比對。
+    不同代表另一台裝置（或你直接在試算表）已經改過資料——這時不覆寫，避免用較舊的記憶體資料蓋掉新資料。
+    """
+    known = st.session_state.get("_remote_hash", {}).get(name)
+    if known is None:
+        return False
+    try:
+        return _rows_hash(ws.get_all_records()) != known
+    except Exception:
+        return False
+
+def clear_cloud_cache():
+    """側邊欄「重新讀取雲端資料」用：清掉本工作階段的資料快取、存檔比對紀錄與分頁物件快取。"""
+    _sheet_cache_invalidate()
+    st.session_state.pop("_sheet_saved_hash", None)
+    st.session_state.pop("_remote_hash", None)
+    st.session_state.pop("_tp_migrated", None)
+    _worksheet_cache().clear()
 
 @st.cache_resource
 def get_spreadsheet():
@@ -1448,6 +1549,9 @@ def get_worksheet(name, headers, bootstrap_rows=None):
     bootstrap_rows，因為那種情況無法區分「真的是空的」跟「暫時性讀取異常」，見 load_portfolio()
     的說明。
     """
+    _wc = _worksheet_cache()
+    if name in _wc:
+        return _wc[name]
     ss = get_spreadsheet()
     try:
         ws = ss.worksheet(name)
@@ -1456,6 +1560,7 @@ def get_worksheet(name, headers, bootstrap_rows=None):
         ws.append_row(headers)
         if bootstrap_rows:
             ws.append_rows(bootstrap_rows)
+    _wc[name] = ws
     return ws
 
 def load_portfolio():
@@ -1499,6 +1604,7 @@ def load_portfolio():
             _existed_before = False
         ws = get_worksheet("portfolio", PORTFOLIO_HEADERS, bootstrap_rows=_bootstrap_rows)
         records = ws.get_all_records()
+        _remember_remote("portfolio", records)
         if not records:
             if not _existed_before:
                 # 分頁是這次執行才剛被建立的：bootstrap_rows 已經在 get_worksheet() 裡寫入，
@@ -1528,11 +1634,18 @@ def load_portfolio():
             if break_date:
                 entry["break_date"] = break_date
             data[code] = entry
+        _mark_saved("portfolio", _rows_hash(_portfolio_rows(data)))  # 【V2.14.1】剛讀到的內容視為已存
         return data
     except Exception as e:
         PORTFOLIO_LOAD_OK = False
         st.error(f"⚠️ 讀取 Google Sheet 持股資料失敗，本次強制改為安全模式（僅檢視，不顯示任何分析，且已停用「儲存持股」以免覆蓋你在 Google Sheet 上的既有真實資料），避免誤用內建示範持股去計算你的真實部位：{e}")
         return {}
+
+def _portfolio_rows(data):
+    rows = [PORTFOLIO_HEADERS]
+    for code, info in data.items():
+        rows.append([code, info.get("name", ""), info.get("cost", 0.0), info.get("cap", 20000.0), info.get("risk", 5.0), info.get("status", "Active"), info.get("break_date", ""), info.get("qty", 0.0)])
+    return rows
 
 def save_portfolio(data):
     """
@@ -1546,18 +1659,34 @@ def save_portfolio(data):
         st.error("⚠️ 持股資料本次讀取失敗，安全模式下已停用「儲存持股」以免覆蓋 Google Sheet 上的既有資料，請重新整理頁面確認連線/權限後再試一次。")
         return False
     try:
+        rows = _portfolio_rows(data)
+        _same, _h = _unchanged_since_last_save("portfolio", rows)   # 【V2.14.1】內容沒變就不寫
+        if _same:
+            return True
         ws = get_worksheet("portfolio", PORTFOLIO_HEADERS)
+        if _remote_changed_by_others("portfolio", ws):
+            _sheet_cache_invalidate("portfolio")
+            st.warning("⚠️ 雲端的持股資料已經被其他裝置（或直接在試算表）修改過，這次沒有寫入，以免蓋掉較新的資料。"
+                       "請按側邊欄「🔄重新讀取雲端資料」後再操作一次。")
+            return False
         ws.clear()
-        rows = [PORTFOLIO_HEADERS]
-        for code, info in data.items():
-            rows.append([code, info.get("name", ""), info.get("cost", 0.0), info.get("cap", 20000.0), info.get("risk", 5.0), info.get("status", "Active"), info.get("break_date", ""), info.get("qty", 0.0)])
         ws.update(rows)
+        _mark_saved("portfolio", _h)
+        _sheet_cache_set("portfolio", data)
+        try:
+            _remember_remote("portfolio", ws.get_all_records())
+        except Exception:
+            st.session_state.get("_remote_hash", {}).pop("portfolio", None)
         return True
     except Exception as e:
         st.error(f"⚠️ 寫入 Google Sheet 持股資料失敗：{e}")
         return False
 
+HISTORY_LOAD_OK = True  # 【V2.14.1新增】讀取失敗時禁止整表覆寫，避免用空資料蓋掉雲端的歷史紀錄
+
 def load_history():
+    global HISTORY_LOAD_OK
+    HISTORY_LOAD_OK = True
     try:
         ws = get_worksheet("history", HISTORY_HEADERS)
         records = ws.get_all_records()
@@ -1571,27 +1700,42 @@ def load_history():
                 "status": row.get("status", ""),
                 "price": float(row.get("price") or 0.0),
             }
+        _mark_saved("history", _rows_hash(_history_rows(data)))  # 【V2.14.1】剛讀到的內容視為已存，沒改就不寫
         return data
     except Exception as e:
+        HISTORY_LOAD_OK = False
         st.error(f"⚠️ 讀取 Google Sheet 歷史資料失敗：{e}")
         return {}
 
+def _history_rows(data):
+    rows = [HISTORY_HEADERS]
+    for code, records in data.items():
+        for date, rec in records.items():
+            score = rec.get("score", 0)
+            price = rec.get("price", 0.0)
+            # NaN 不是合法的 JSON 值，寫入 Google Sheet 會整批失敗；這裡保險起見再過濾一次
+            if score is None or (isinstance(score, float) and score != score): score = 0
+            if price is None or (isinstance(price, float) and price != price): price = 0.0
+            rows.append([code, date, score, rec.get("status", ""), price])
+    return rows
+
 def save_history(data):
+    if not HISTORY_LOAD_OK:
+        return False
     try:
+        rows = _history_rows(data)
+        _same, _h = _unchanged_since_last_save("history", rows)   # 【V2.14.1】內容沒變就不寫
+        if _same:
+            return True
         ws = get_worksheet("history", HISTORY_HEADERS)
         ws.clear()
-        rows = [HISTORY_HEADERS]
-        for code, records in data.items():
-            for date, rec in records.items():
-                score = rec.get("score", 0)
-                price = rec.get("price", 0.0)
-                # NaN 不是合法的 JSON 值，寫入 Google Sheet 會整批失敗；這裡保險起見再過濾一次
-                if score is None or (isinstance(score, float) and score != score): score = 0
-                if price is None or (isinstance(price, float) and price != price): price = 0.0
-                rows.append([code, date, score, rec.get("status", ""), price])
         ws.update(rows)
+        _mark_saved("history", _h)
+        _sheet_cache_set("history", data)
+        return True
     except Exception as e:
         st.error(f"⚠️ 寫入 Google Sheet 歷史資料失敗：{e}")
+        return False
 
 def load_decision_log():
     """
@@ -1601,9 +1745,14 @@ def load_decision_log():
     讀取失敗不影響任何交易判斷，不需要比照 portfolio/trade_plan 的安全模式機制）。
     """
     try:
+        _cached = _sheet_cache_get("decision_log")   # 【V2.14.1】工作階段快取，新增紀錄後自動失效
+        if _cached is not None:
+            return _cached
         ws = get_worksheet("decision_log", DECISION_LOG_HEADERS)
         records = ws.get_all_records()
-        return list(reversed(records))
+        _out = list(reversed(records))
+        _sheet_cache_set("decision_log", _out)
+        return _out
     except Exception as e:
         st.error(f"⚠️ 讀取決策日誌失敗：{e}")
         return []
@@ -1632,6 +1781,7 @@ def append_decision_log(log_date, code, system_suggestion, action_taken, actual_
     try:
         ws = get_worksheet("decision_log", DECISION_LOG_HEADERS)
         _ensure_decision_log_header(ws)
+        _sheet_cache_invalidate("decision_log")  # 【V2.14.1】下次顯示時重新讀取
         ws.append_row([log_date, str(code), system_suggestion, action_taken,
                         actual_price if actual_price else "", reason or "",
                         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1648,6 +1798,9 @@ def load_trade_plan_snapshots():
     純讀取失敗時安靜回傳空dict即可，這個分頁只是給使用者比對用，不是任何決策邏輯的輸入。
     """
     try:
+        _cached = _sheet_cache_get("trade_plan_snapshots")   # 【V2.14.1】工作階段快取
+        if _cached is not None:
+            return _cached
         ws = get_worksheet("trade_plan_snapshot", TRADE_PLAN_SNAPSHOT_HEADERS)
         records = ws.get_all_records()
         latest = {}
@@ -1657,12 +1810,17 @@ def load_trade_plan_snapshots():
             # records 是照試算表由上到下的順序（也就是append的先後順序），後面出現的會覆蓋前面的，
             # 天然就會留下「最新一筆」，不需要額外排序
             latest[code] = row
+        _sheet_cache_set("trade_plan_snapshots", latest)
         return latest
     except Exception as e:
         st.error(f"⚠️ 讀取交易計畫快照失敗：{e}")
         return {}
 
 def append_trade_plan_snapshot(code, old_plan):
+    _sheet_cache_invalidate("trade_plan_snapshots")  # 【V2.14.1】新增快照後，下次顯示重新讀取
+    return _append_trade_plan_snapshot_impl(code, old_plan)
+
+def _append_trade_plan_snapshot_impl(code, old_plan):
     """
     【V2.11.62補齊定義】當資料日期推進到新的一天時，將前一日最終確定版的交易計畫寫入
     trade_plan_snapshot 分頁（純append-only，避免覆寫舊紀錄）。
@@ -1686,6 +1844,10 @@ def append_trade_plan_snapshot(code, old_plan):
         return False
 
 def cleanup_old_trade_plan_snapshots(days_to_keep=30):
+    _sheet_cache_invalidate("trade_plan_snapshots")
+    return _cleanup_old_trade_plan_snapshots_impl(days_to_keep)
+
+def _cleanup_old_trade_plan_snapshots_impl(days_to_keep=30):
     """
     【V2.11.58新增】清理交易計畫快照分頁裡過舊的資料列。這個分頁從V2.11.41上線以來刻意設計成
     純append-only（只新增、不清除），理由是避免「清空重寫」類型的資料損毀窗口期——但也因此，
@@ -1801,17 +1963,26 @@ def load_trade_plan():
     try:
         ws = get_worksheet("trade_plan", TRADE_PLAN_HEADERS)
         records = ws.get_all_records()
+        _remember_remote("trade_plan", records)
         data = {}
         for row in records:
             code = str(row.get("code", "")).strip()
             if not code:
                 continue
             data[code] = _normalize_trade_plan_row(row)
+        _mark_saved("trade_plan", _rows_hash(_trade_plan_rows(data)))  # 【V2.14.1】剛讀到的內容視為已存
         return data
     except Exception as e:
         TRADE_PLAN_LOAD_OK = False
         st.warning(f"⚠️ 讀取 Google Sheet 交易計畫（trade_plan）失敗，本次強制改為 VIEW_ONLY 唯讀模式，不會修改任何既有交易計畫：{e}")
         return {}
+
+def _trade_plan_rows(data):
+    rows = [TRADE_PLAN_HEADERS]
+    for code, raw in data.items():
+        r = _normalize_trade_plan_row(dict(raw, code=code))
+        rows.append([r[h] for h in TRADE_PLAN_HEADERS])
+    return rows
 
 def save_trade_plan(data):
     """
@@ -1828,13 +1999,24 @@ def save_trade_plan(data):
     if not TRADE_PLAN_LOAD_OK:
         return False
     try:
+        rows = _trade_plan_rows(data)
+        _same, _h = _unchanged_since_last_save("trade_plan", rows)   # 【V2.14.1】內容沒變就不寫
+        if _same:
+            return True
         ws = get_worksheet("trade_plan", TRADE_PLAN_HEADERS)
+        if _remote_changed_by_others("trade_plan", ws):
+            _sheet_cache_invalidate("trade_plan")
+            st.warning("⚠️ 雲端的交易計畫已經被其他裝置更新過，這次沒有寫入，以免蓋掉較新的資料。"
+                       "請按側邊欄「🔄重新讀取雲端資料」後再操作一次。")
+            return False
         ws.clear()
-        rows = [TRADE_PLAN_HEADERS]
-        for code, raw in data.items():
-            r = _normalize_trade_plan_row(dict(raw, code=code))
-            rows.append([r[h] for h in TRADE_PLAN_HEADERS])
         ws.update(rows)
+        _mark_saved("trade_plan", _h)
+        _sheet_cache_set("trade_plan", data)
+        try:
+            _remember_remote("trade_plan", ws.get_all_records())
+        except Exception:
+            st.session_state.get("_remote_hash", {}).pop("trade_plan", None)
         return True
     except Exception as e:
         # 【V2.11.12修正】原本這裡宣稱「既有已保存的計畫不受影響」，但清空後若中途寫入失敗
@@ -4301,13 +4483,33 @@ def run_backtest(codes, years=2, progress_callback=None, portfolio_settings=None
         errors['__regime__'] = f"市場燈號歷史資料：{regime_err}（仍會繼續回測，市場燈號這段期間會視為中性）"
     return trades_df, metrics, errors, diag
 
-portfolio, system_history, trade_plan_data, today_str = load_portfolio(), load_history(), load_trade_plan(), datetime.datetime.now().strftime("%Y-%m-%d")
-trade_plan_snapshots = load_trade_plan_snapshots()  # 【V2.11.41新增】每檔股票「前一個確定版」的凍結快照
-migrate_trade_plan_sheet()
+# 【V2.14.1】雲端資料每個工作階段只讀一次（SHEET_CACHE_TTL_SEC 內重跑都用記憶體資料）；
+# 只有「讀取成功」才會放進快取，讀取失敗時下次重跑會再試，安全模式旗標維持原本的判斷。
+def _load_cached(key, loader, ok_flag_name=None):
+    _c = _sheet_cache_get(key)
+    if _c is not None:
+        return _c
+    _data = loader()
+    if ok_flag_name is None or globals().get(ok_flag_name, True):
+        _sheet_cache_set(key, _data)
+    return _data
+
+portfolio = _load_cached("portfolio", load_portfolio, "PORTFOLIO_LOAD_OK")
+system_history = _load_cached("history", load_history, "HISTORY_LOAD_OK")
+trade_plan_data = _load_cached("trade_plan", load_trade_plan, "TRADE_PLAN_LOAD_OK")
+today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+trade_plan_snapshots = load_trade_plan_snapshots()  # 【V2.11.41新增】每檔股票「前一個確定版」的凍結快照（V2.14.1起有快取）
+if not st.session_state.get("_tp_migrated"):  # 【V2.14.1】欄位遷移每個工作階段只檢查一次
+    migrate_trade_plan_sheet()
+    st.session_state["_tp_migrated"] = True
 
 # --- 5. 側邊欄 UI ---
 with st.sidebar:
     st.header("📋 持股與風控設定")
+    # 【V2.14.1新增】雲端資料快取的手動重新整理（例如在另一台裝置或直接在 Google Sheet 改過資料）
+    if st.button("🔄 重新讀取雲端資料", help=f"系統會把雲端資料暫存在記憶體中（{SHEET_CACHE_TTL_SEC // 60}分鐘），以避免超過 Google 的讀取次數上限。若你在其他裝置或直接在試算表改過資料，按這裡立即重新讀取。"):
+        clear_cloud_cache()
+        st.rerun()
     if not PORTFOLIO_LOAD_OK:
         st.error("🛡️ 安全模式中：持股資料本次讀取失敗，下方所有會修改持股的操作（新增/刪除/加減碼/CSV匯入/暫停恢復/歸檔）都已停用，避免覆蓋 Google Sheet 上的既有資料。重新整理頁面重試即可恢復正常。")
     with st.form("add_stock"):
@@ -4857,15 +5059,16 @@ def render_stock_card(data, system_history, portfolio_data):
                         _log_options = ["完全照做", "延後出場", "部分出場/股數不同", "有下單但未成交", "續抱未出場"]
                     else:
                         _log_options = ["完全照做", "延後執行", "部分執行/股數不同", "有下單但未成交", "沒有進場/加碼"]
-                    _log_action = st.radio("我實際上", _log_options, key=f"log_action_{data['code']}", horizontal=True)
-                    # 【V2.11.49新增】實際成交股數，跟實際價位分開填——「有下單但未成交」可以直接
-                    # 填0（明確記錄「這次是0股成交」，比留白清楚）；「部分執行/股數不同」可以填
-                    # 實際成交的數量，不用只靠自由文字的原因欄位描述。
-                    _log_shares_col, _log_price_col, _log_reason_col = st.columns(3)
-                    _log_shares = _log_shares_col.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"log_shares_{data['code']}")
-                    _log_price = _log_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_{data['code']}")
-                    _log_reason = _log_reason_col.text_input("原因（選填，例如：延後/沒做/續抱的理由）", key=f"log_reason_{data['code']}")
-                    if st.button("儲存這筆紀錄", key=f"log_submit_{data['code']}"):
+                    # 【V2.14.1】改用表單：填寫過程不會觸發整頁重跑（避免超過 Google Sheets 讀寫次數上限），按「儲存」才送出
+                    with st.form(key=f"log_form_{data['code']}", clear_on_submit=True):
+                        _log_action = st.radio("我實際上", _log_options, key=f"log_action_{data['code']}", horizontal=True)
+                        # 【V2.11.49新增】實際成交股數，跟實際價位分開填
+                        _log_shares_col, _log_price_col, _log_reason_col = st.columns(3)
+                        _log_shares = _log_shares_col.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"log_shares_{data['code']}")
+                        _log_price = _log_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_{data['code']}")
+                        _log_reason = _log_reason_col.text_input("原因（選填，例如：延後/沒做/續抱的理由）", key=f"log_reason_{data['code']}")
+                        _log_submitted = st.form_submit_button("儲存這筆紀錄")
+                    if _log_submitted:
                         _ok = append_decision_log(
                             today_str, data['code'], f"{_plan_state}：{data.get('plan_signal_reason', '')}",
                             _log_action, _log_shares, _log_price if _log_price > 0 else None, _log_reason,
@@ -4900,12 +5103,14 @@ def render_stock_card(data, system_history, portfolio_data):
                             _log_options2 = ["完全照做", "延後出場", "部分出場/股數不同", "有下單但未成交", "續抱未出場"]
                         else:
                             _log_options2 = ["完全照做", "延後執行", "部分執行/股數不同", "有下單但未成交", "沒有進場/加碼"]
-                        _log_action2 = st.radio("我實際上", _log_options2, key=f"log_action_snap_{data['code']}", horizontal=True)
-                        _log_shares_col2, _log_price_col2, _log_reason_col2 = st.columns(3)
-                        _log_shares2 = _log_shares_col2.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"log_shares_snap_{data['code']}")
-                        _log_price2 = _log_price_col2.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_snap_{data['code']}")
-                        _log_reason2 = _log_reason_col2.text_input("原因（選填）", key=f"log_reason_snap_{data['code']}")
-                        if st.button("儲存這筆紀錄", key=f"log_submit_snap_{data['code']}"):
+                        with st.form(key=f"log_form_snap_{data['code']}", clear_on_submit=True):  # 【V2.14.1】表單
+                            _log_action2 = st.radio("我實際上", _log_options2, key=f"log_action_snap_{data['code']}", horizontal=True)
+                            _log_shares_col2, _log_price_col2, _log_reason_col2 = st.columns(3)
+                            _log_shares2 = _log_shares_col2.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"log_shares_snap_{data['code']}")
+                            _log_price2 = _log_price_col2.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"log_price_snap_{data['code']}")
+                            _log_reason2 = _log_reason_col2.text_input("原因（選填）", key=f"log_reason_snap_{data['code']}")
+                            _log_submitted2 = st.form_submit_button("儲存這筆紀錄")
+                        if _log_submitted2:
                             _ok2 = append_decision_log(
                                 today_str, data['code'], f"{_snap_state}（昨晚確定版）：{_log_snap.get('signal_reason', '')}",
                                 _log_action2, _log_shares2, _log_price2 if _log_price2 > 0 else None, _log_reason2,
@@ -4921,12 +5126,14 @@ def render_stock_card(data, system_history, portfolio_data):
             # 欄位會清楚標示「無系統建議」，方便之後回顧時分辨這幾筆是你自己的判斷，不是照系統訊號做的。
             with st.expander("📝 補記其他操作（系統沒有主動建議、我自己判斷做的操作）"):
                 st.caption("系統目前/昨晚都沒有對這檔股票發出對應的建議，但我自己判斷做了某個操作，用這裡記錄下來。")
-                _adhoc_action = st.selectbox("我做了什麼", ["新增進場", "加碼", "減碼/部分賣出", "全部賣出", "其他"], key=f"adhoc_action_{data['code']}")
-                _adhoc_shares_col, _adhoc_price_col = st.columns(2)
-                _adhoc_shares = _adhoc_shares_col.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"adhoc_shares_{data['code']}")
-                _adhoc_price = _adhoc_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"adhoc_price_{data['code']}")
-                _adhoc_reason = st.text_input("為什麼這樣做（建議填寫，之後回顧會需要）", key=f"adhoc_reason_{data['code']}")
-                if st.button("儲存這筆紀錄", key=f"adhoc_submit_{data['code']}"):
+                with st.form(key=f"adhoc_form_{data['code']}", clear_on_submit=True):  # 【V2.14.1】表單
+                    _adhoc_action = st.selectbox("我做了什麼", ["新增進場", "加碼", "減碼/部分賣出", "全部賣出", "其他"], key=f"adhoc_action_{data['code']}")
+                    _adhoc_shares_col, _adhoc_price_col = st.columns(2)
+                    _adhoc_shares = _adhoc_shares_col.number_input("實際成交股數（選填）", min_value=0, value=0, step=1, key=f"adhoc_shares_{data['code']}")
+                    _adhoc_price = _adhoc_price_col.number_input("實際價位（選填）", min_value=0.0, value=0.0, step=0.01, key=f"adhoc_price_{data['code']}")
+                    _adhoc_reason = st.text_input("為什麼這樣做（建議填寫，之後回顧會需要）", key=f"adhoc_reason_{data['code']}")
+                    _adhoc_submitted = st.form_submit_button("儲存這筆紀錄")
+                if _adhoc_submitted:
                     _ok3 = append_decision_log(
                         today_str, data['code'], "（無系統建議，使用者主動操作）",
                         _adhoc_action, _adhoc_shares, _adhoc_price if _adhoc_price > 0 else None, _adhoc_reason,
@@ -5992,13 +6199,15 @@ else:
             })
         except Exception as e: st.error(f"分析 {code} 發生錯誤: {e}")
 
-    save_history(system_history)
+    if save_history(system_history) is False:
+        _sheet_cache_invalidate("history")  # 【V2.14.1】存檔失敗時，下次重跑重新讀取雲端資料
     # 【V2.11.x 新增】trade_plan 只在真的有新資料時才寫回（VIEW_ONLY 模式嚴格唯讀，不做任何寫入，
     # 避免同一天重複開啟頁面時，把「唯讀複本」誤當作正式結果覆蓋回 Google Sheet）。
     # 【修正】但若本次執行中有任何一檔因「今天K棒尚未收斂」被強制重新評估過，即使全域模式仍是
     # VIEW_ONLY，也要把這次追上最新資料的結果存回去，否則追平的計算白做了，畫面重整一次又會消失。
     if execution_mode != VIEW_ONLY or _any_intraday_reevaluation:
-        save_trade_plan(trade_plan_data)
+        if not save_trade_plan(trade_plan_data):
+            _sheet_cache_invalidate("trade_plan")  # 【V2.14.1】存檔失敗時，下次重跑重新讀取，避免記憶體與雲端不一致
     if execution_mode == VIEW_ONLY and _any_intraday_reevaluation:
         st.caption("🔄 偵測到部分股票的今日K棒尚未收斂，已針對這幾檔強制重新評估交易計畫並存回，其餘股票維持唯讀。")
 
