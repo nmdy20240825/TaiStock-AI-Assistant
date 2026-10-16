@@ -17,7 +17,15 @@ import plotly.graph_objects as go
 # 標題寫死成舊版本號、卻在程式碼各處的異動註解裡另外散落著不同的版本標記，
 # 導致「畫面顯示的版本」「程式碼註解裡的版本」「操作說明書裡的版本」三邊互相矛盾。
 # 之後每次做重大功能異動，記得同步更新這個常數（以及對應更新操作說明書的版本標示）。
-APP_VERSION = "V2.12.0"
+APP_VERSION = "V2.14.0"
+# 【V2.14.0】①手續費改為元大證券一般電子下單條件（6折、整股最低20元、零股最低1元），並分開計算整股與零股。
+# ②影子策略實單支援：卡片可標記「依影子訊號進場」，系統把結構停損設為防守線下限、不給加碼建議、
+# 決策日誌自動標註【影子策略】。③回測改用各股票在側邊欄設定的分配資金與風險%。
+# 【V2.13.0】①進場關卡診斷：卡片逐項顯示今天卡在哪一關；回測新增「錯過的行情」分析（空手期間漲幅≥15%的
+# 波段，起漲時被哪一關擋下）。②第二種進場方式「趨勢回檔進場」以影子測試導入：卡片顯示觀察訊號、回測獨立
+# 模擬績效，**不建立交易計畫、不影響既有任何決策**，待回測驗證後再決定是否正式啟用。
+# 【V2.12.1】新增「出清後走勢統計」：回測中每一筆「全部出清」交易，事後追蹤出場當天與之後5／10個交易日的
+# 股價，回答「賣掉之後是不是常常漲回去」。純統計、事後分析，不影響任何決策。
 # 【V2.12.0】本版重點：回測改為「扣除台股交易成本＋套用隔日開盤執行閘門（追價上限／失效價／漲跌停）」，
 # 與實盤可執行的條件對齊；新增 ETF 跳動單位、處置/注意股警示、K線/收斂/量能觀察因子（只記錄不影響決策）。
 # 回測報酬改為「淨報酬」（扣成本），V2.11.63（含）以前的回測數字與本版不可直接比較。
@@ -887,12 +895,14 @@ def round_to_tick(price, is_us_stock=False, is_etf=None, mode="nearest"):
     return round(units * tick, 2)
 
 # ===== 【V2.12.0新增】台股交易成本與漲跌停 =====
-# 【需要人工確認的參數】以下為法定費率；券商手續費折扣（TW_FEE_DISCOUNT，例如2.8折填0.28）與最低手續費
-# （TW_MIN_FEE，整股多數券商20元、零股各券商不同，常見1元）請依你實際開戶的券商條件修改。
-# 預設採「不打折＋最低20元」的保守設定，讓回測寧可低估績效、不要高估。
+# 【V2.14.0】預設改為「元大證券一般電子下單」條件：手續費6折（日退：交割時先收原價、次一營業日退回
+# 折讓，交割款要準備原價金額）、整股每筆最低20元、零股每筆最低1元。資料來源為2026年多家財經網站
+# 的券商費率整理（非元大官方公告），**請以你的元大對帳單／營業員告知的實際條件為準**，有個人優惠時直接修改。
 TW_FEE_RATE = 0.001425        # 手續費率（買賣各收一次）
-TW_FEE_DISCOUNT = 1.0         # 券商折扣，1.0＝不打折
-TW_MIN_FEE = 20.0             # 每筆最低手續費（元）
+TW_FEE_DISCOUNT = 0.6         # 元大一般電子下單 6 折
+TW_MIN_FEE = 20.0             # 整股每筆最低手續費（元）
+TW_MIN_FEE_ODD = 1.0          # 零股每筆最低手續費（元）
+TW_BOARD_LOT = 1000           # 一張＝1000股
 TW_STOCK_TAX_RATE = 0.003     # 股票證交稅（僅賣出）
 TW_ETF_TAX_RATE = 0.001       # ETF 證交稅（僅賣出）
 US_FEE_RATE = 0.0             # 美股：多數複委託/美國券商費率差異大，預設0，請依實際條件修改
@@ -903,6 +913,7 @@ def calc_trade_cost(side, price, qty, is_us_stock=False, is_etf=False):
     """
     【V2.12.0新增】單筆交易成本（元）。side="buy"/"sell"。
     台股：手續費＝max(無條件捨去(成交金額×費率×折扣), 最低手續費)；賣出另加證交稅＝無條件捨去(成交金額×稅率)。
+    【V2.14.0】整股部分與零股部分分開計算（最低手續費分別為 TW_MIN_FEE／TW_MIN_FEE_ODD）。
     美股：成交金額×US_FEE_RATE，最低 US_MIN_FEE。
     qty<=0 或價格無效時回傳 0。
     """
@@ -913,11 +924,20 @@ def calc_trade_cost(side, price, qty, is_us_stock=False, is_etf=False):
     notional = q * px
     if is_us_stock:
         return max(notional * US_FEE_RATE, US_MIN_FEE)
-    fee = max(math.floor(notional * TW_FEE_RATE * TW_FEE_DISCOUNT), TW_MIN_FEE)
-    tax = 0.0
-    if side == "sell":
-        tax = math.floor(notional * (TW_ETF_TAX_RATE if is_etf else TW_STOCK_TAX_RATE))
-    return float(fee + tax)
+    # 【V2.14.0】整股與零股是兩筆不同的委託（例如1,500股＝1張整股＋500股零股），各自計算手續費與最低金額
+    q_int = int(round(q))
+    lots_qty = (q_int // TW_BOARD_LOT) * TW_BOARD_LOT
+    odd_qty = q_int - lots_qty
+    tax_rate = TW_ETF_TAX_RATE if is_etf else TW_STOCK_TAX_RATE
+    total = 0.0
+    for part_qty, min_fee in ((lots_qty, TW_MIN_FEE), (odd_qty, TW_MIN_FEE_ODD)):
+        if part_qty <= 0:
+            continue
+        part_notional = part_qty * px
+        total += max(math.floor(part_notional * TW_FEE_RATE * TW_FEE_DISCOUNT), min_fee)
+        if side == "sell":
+            total += math.floor(part_notional * tax_rate)
+    return float(total)
 
 def tw_limit_hit(prev_close, open_price, direction="up", is_etf=False):
     """
@@ -1338,6 +1358,8 @@ TRADE_PLAN_HEADERS = [
     "review_state", "review_at",
     # 版本
     "plan_version",
+    # 【V2.14.0新增，放在最後以相容既有分頁】影子策略實單標記
+    "entry_source", "shadow_stop", "shadow_marked_date", "shadow_valid_until",
 ]
 
 # 規格書第六節定義的11種狀態；ChatGPT 草稿版少了 PULLBACK_WAIT，這裡補齊。
@@ -1357,8 +1379,10 @@ ALLOWED_TRANSITIONS = {
     # ADD_NEXT_DAY／PARTIAL_EXIT_NEXT_DAY／FULL_EXIT_NEXT_DAY，因此這幾種轉移也要開放。
     "PREPARE": {"BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "INVALID", "EXPIRED",
                 "HOLD", "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY", "PREPARE"},
-    "BREAKOUT_WAIT": {"ENTER_NEXT_DAY", "PULLBACK_WAIT", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "BREAKOUT_WAIT"},
-    "PULLBACK_WAIT": {"ENTER_NEXT_DAY", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "PULLBACK_WAIT"},
+    # 【V2.14.0修正】等待中狀態新增 →PREPARE：使用者在系統計畫之外自行買進（例如依影子訊號進場）時，
+    # 原本的等待計畫要能結束，交給持有中流程管理；否則部位會卡在等待狀態，永遠收不到出場訊號。
+    "BREAKOUT_WAIT": {"ENTER_NEXT_DAY", "PULLBACK_WAIT", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "BREAKOUT_WAIT", "PREPARE"},
+    "PULLBACK_WAIT": {"ENTER_NEXT_DAY", "INVALID", "EXPIRED", "BREAKOUT_FAILED", "PULLBACK_WAIT", "PREPARE"},
     # 【修正】原本漏了 INVALID／EXPIRED：訊號確認「下一交易日可進場」後，如果執行前價格突然
     # 跌破失效價、或超過有效期限使用者都還沒來得及執行，理論上應該要能判定失效／過期，
     # 原本的轉移表卻擋住這條路，導致這兩種情況發生時轉移一直被拒絕（見上方 transition_state 修正說明）。
@@ -1598,6 +1622,13 @@ def append_decision_log(log_date, code, system_suggestion, action_taken, actual_
     拿來統計分析。這個欄位刻意放在 DECISION_LOG_HEADERS 清單的最後（不是邏輯上「自然」的
     actual_price旁邊），理由見該常數的說明——確保已經有舊表頭的分頁不會發生欄位錯位。
     """
+    # 【V2.14.0】影子策略部位或已標記影子進場的股票，自動加上【影子策略】標註，方便日後分開統計
+    try:
+        _tp = globals().get("trade_plan_data", {}) or {}
+        if str((_tp.get(str(code)) or {}).get("entry_source", "")) == SHADOW_ENTRY_SOURCE and "【影子策略】" not in str(system_suggestion):
+            system_suggestion = f"【影子策略】{system_suggestion}"
+    except Exception:
+        pass
     try:
         ws = get_worksheet("decision_log", DECISION_LOG_HEADERS)
         _ensure_decision_log_header(ws)
@@ -1730,6 +1761,10 @@ def _normalize_trade_plan_row(row):
     if r["review_state"] not in ("PENDING", "ACKNOWLEDGED"):
         r["review_state"] = "PENDING"
     r["plan_version"] = str(r.get("plan_version", "") or "2.11.x")
+    r["entry_source"] = str(r.get("entry_source", "") or "")
+    r["shadow_stop"] = _safe_float(r.get("shadow_stop"), 0.0)
+    r["shadow_marked_date"] = _date_str(r.get("shadow_marked_date"))
+    r["shadow_valid_until"] = _date_str(r.get("shadow_valid_until"))
     for k in ["entry_price", "breakout_price", "pullback_low", "pullback_high", "chase_limit",
               "invalid_price", "t1_price", "t2_price", "initial_stop", "previous_trailing_stop",
               "current_trailing_stop", "max_risk_amount", "used_risk_amount", "remaining_risk_amount",
@@ -2597,6 +2632,138 @@ def calculate_breakout_quality_score(volume, vol_ma5, macd_osc_atr_ratio, breako
     detail = {"volume": round(vol_score, 1), "macd": round(macd_score, 1), "breakout_margin": round(breakout_score, 1), "decision_score": round(decision_score_score, 1)}
     return round(total, 1), grade, detail
 
+def diagnose_entry_gates(indicators, market_context):
+    """
+    【V2.13.0新增】空手進場關卡逐項診斷，回答「為什麼還沒有進場訊號」。
+    條件與 calculate_entry_plan() **逐條相同**（同一組 indicators 欄位、同一組門檻），分成兩組：
+      core（建立進場計畫的條件）：全部通過 ⇔ calculate_entry_plan() 會建立計畫（不回傳 None）
+      price（轉為隔日進場的條件）：收盤站上突破價、未超過追價上限、突破品質分數達門檻
+    回傳 (gates, summary)。gates 是 list of dict：key, group, label, ok(True/False/None), detail。
+    ok=None 代表「尚未適用」（例如還沒突破，就不評估品質分數）。
+    【維護注意】calculate_entry_plan() 的進場條件若有任何修改，這裡必須同步修改；
+    V2.13.0 以隨機測試驗證兩者在 core 組的判斷完全一致。
+    """
+    price = _safe_float(indicators.get("price"))
+    atr = _safe_float(indicators.get("atr"))
+    previous_high = _safe_float(indicators.get("previous_high"))
+    decision_score = _safe_float(indicators.get("decision_score"))
+    is_us_stock = bool(indicators.get("is_us_stock"))
+    macd_osc_status = indicators.get("macd_osc_status")
+    macd_divergence_type = indicators.get("macd_divergence_type")
+    _volume = indicators.get("volume")
+    _vol_ma5 = indicators.get("vol_ma5")
+    gates = []
+
+    def add(key, group, label, ok, detail=""):
+        gates.append({"key": key, "group": group, "label": label, "ok": ok, "detail": detail})
+
+    add("chip", "core", "動能/趨勢燈（價>MA60且MACD>0）" if is_us_stock else "籌碼燈（法人連買≥3天或金額達標）",
+        bool(indicators.get("chip_gate")))
+    add("volume_light", "core", "量能燈（K>D、RSI>50、量>5日均量）", bool(indicators.get("volume_gate")))
+    add("trend", "core", f"趨勢燈（多頭排列連續{TREND_CONFIRM_DAYS}天）", bool(indicators.get("trend_gate")))
+    add("score", "core", "決策分數≥70", decision_score >= 70, f"目前 {decision_score:.0f} 分")
+    add("regime", "core", "市場非逆風", indicators.get("market_regime") != "BEARISH")
+    _macd_block = macd_divergence_type == "頂背離" or macd_osc_status == "翻黑"
+    add("macd_block", "core", "MACD無頂背離、未翻黑", not _macd_block,
+        f"柱狀體：{macd_osc_status or '資料不足'}／背離：{macd_divergence_type or '資料不足'}")
+    _macd_ok = (macd_osc_status in ("正值", "翻紅第1根")) if macd_osc_status is not None else True
+    add("macd_confirm", "core", "MACD柱狀體為正值或剛翻紅", _macd_ok)
+    if _vol_ma5 is not None and _safe_float(_vol_ma5) > 0:
+        _vr = _safe_float(_volume) / _safe_float(_vol_ma5)
+        add("breakout_volume", "core", "突破量≥1.5×5日均量（含當天）", _vr >= 1.5, f"目前 {_vr:.2f} 倍")
+    else:
+        add("breakout_volume", "core", "突破量≥1.5×5日均量（含當天）", True, "量能資料不足，視為通過")
+    add("disposition", "core", "非處置股", not indicators.get("disposition_block", False))
+    add("atr", "core", "ATR資料有效", atr > 0)
+
+    core_pass = all(g["ok"] for g in gates if g["group"] == "core")
+
+    breakout_price = round_to_tick(previous_high * 1.005, is_us_stock, mode="up") if previous_high > 0 else round_to_tick(price, is_us_stock)
+    chase_limit = round_to_tick(min(breakout_price + atr, breakout_price * 1.03), is_us_stock) if atr > 0 else 0.0
+    _gap_pct = (breakout_price / price - 1) * 100 if price > 0 else 0.0
+    _broke = price >= breakout_price > 0
+    add("price_breakout", "price", "收盤站上突破價（60日前高×1.005）", _broke,
+        f"現價 {price:.2f}／突破價 {breakout_price:.2f}" + ("" if _broke else f"（還差 {_gap_pct:.1f}%）"))
+    if _broke:
+        add("chase", "price", "未超過追價上限", price <= chase_limit,
+            f"追價上限 {chase_limit:.2f}" + ("" if price <= chase_limit else "（超過→改等回測，強勢股常在此錯過）"))
+        _margin = (price - breakout_price) / atr if atr > 0 else None
+        _mv = indicators.get("macd_osc_value")
+        _mr = (abs(_mv) / atr) if (_mv is not None and atr > 0) else None
+        _bq, _grade, _ = calculate_breakout_quality_score(_volume, _vol_ma5, _mr, _margin, decision_score)
+        _rs = calculate_regime_score(market_context or {})
+        _thr = _breakout_quality_gate_threshold_for_regime(_rs["us_regime"] if is_us_stock else _rs["tw_regime"])
+        add("quality", "price", "突破品質分數達門檻", _bq >= _thr, f"{_bq:.0f} 分／門檻 {_thr:.0f} 分")
+    else:
+        add("chase", "price", "未超過追價上限", None, "尚未突破，暫不適用")
+        add("quality", "price", "突破品質分數達門檻", None, "尚未突破，暫不適用")
+
+    first_fail = next((g for g in gates if g["ok"] is False), None)
+    summary = {
+        "core_pass": core_pass,
+        "n_core_pass": sum(1 for g in gates if g["group"] == "core" and g["ok"]),
+        "n_core": sum(1 for g in gates if g["group"] == "core"),
+        "first_fail_key": first_fail["key"] if first_fail else "",
+        "first_fail_label": first_fail["label"] if first_fail else "",
+        "fail_keys": [g["key"] for g in gates if g["ok"] is False],
+        "breakout_price": breakout_price, "chase_limit": chase_limit,
+    }
+    return gates, summary
+
+# ===== 【V2.13.0新增，影子測試】第二種進場方式：趨勢回檔進場 =====
+# 【需要人工確認的參數】以下為初版規則，刻意在回測前就固定下來（避免看結果挑參數）。
+PB_TOUCH_LOOKBACK = 5         # 回看幾天內是否回檔碰過 MA10
+PB_TOUCH_TOL = 0.01           # 最低價在 MA10 上方 1% 以內，視為碰到
+PB_MAX_EXTENSION_ATR = 1.5    # 收盤不能高於 MA20 + 1.5×ATR（避免追在離均線太遠的位置）
+PB_STOP_BUFFER_ATR = 0.2      # 結構停損＝近6日最低價 − 0.2×ATR
+PB_CHASE_ATR = 0.5            # 隔日開盤高於訊號日收盤 + 0.5×ATR 就不追
+SHADOW_ENTRY_SOURCE = "SHADOW_PULLBACK"   # 【V2.14.0】trade_plan.entry_source 的影子策略標記值
+SHADOW_MARK_VALID_DAYS = 2                # 標記後幾個交易日內沒有輸入持股，標記自動失效
+
+def shadow_stop_floor(plan):
+    """【V2.14.0】影子策略部位的防守線下限（結構停損）；不是影子部位回傳0。"""
+    if str(plan.get("entry_source", "")) == SHADOW_ENTRY_SOURCE:
+        return _safe_float(plan.get("shadow_stop"), 0.0)
+    return 0.0
+
+def calc_trend_pullback_setup(o, h, l, c, v, ma10, ma20, atr, trend_confirmed):
+    """
+    【V2.13.0新增，影子測試】趨勢回檔進場：補上「強勢股突破後不回測到前高、5天後計畫過期」的缺口。
+    訊號日 t 必須同時符合：
+      pb_trend      趨勢燈已確認（多頭排列連續N天，與既有趨勢燈同一定義）
+      pb_ma20_up    MA20 向上（MA20_t > MA20_{t−5}）
+      pb_touched    前5天內最低價曾回到 MA10 附近（≤ MA10×1.01）
+      pb_held       前5天每天收盤都在 MA20 之上（回檔沒有破壞結構）
+      pb_vol_dry    回檔期間量縮（前5日均量 < 前20日均量）
+      pb_reversal   當天收紅K、收盤高於前一日、並站回 MA10 之上
+      pb_not_ext    收盤 ≤ MA20 + 1.5×ATR（不追在離均線太遠的位置）
+    pb_stop：結構停損＝近6日（含當天）最低價 − 0.2×ATR。
+    全部只用當天以前（含當天）的資料，沒有前視偏誤。回傳 DataFrame。
+    """
+    o = pd.Series(o).astype(float); h = pd.Series(h).astype(float); l = pd.Series(l).astype(float)
+    c = pd.Series(c).astype(float); v = pd.Series(v).astype(float)
+    ma10 = pd.Series(ma10).astype(float); ma20 = pd.Series(ma20).astype(float); atr = pd.Series(atr).astype(float)
+    tc = pd.Series(trend_confirmed).fillna(False).astype(bool)
+    n = PB_TOUCH_LOOKBACK
+    out = pd.DataFrame(index=c.index)
+    out["pb_trend"] = tc
+    out["pb_ma20_up"] = (ma20 > ma20.shift(5)).fillna(False)
+    out["pb_touched"] = ((l <= ma10 * (1 + PB_TOUCH_TOL)).astype(float).shift(1).rolling(n).max() == 1).fillna(False)
+    out["pb_held"] = ((c >= ma20).astype(float).shift(1).rolling(n).min() == 1).fillna(False)
+    out["pb_vol_dry"] = (v.shift(1).rolling(n).mean() < v.shift(1).rolling(20).mean()).fillna(False)
+    out["pb_reversal"] = ((c > o) & (c > c.shift(1)) & (c > ma10)).fillna(False)
+    out["pb_not_ext"] = (c <= ma20 + PB_MAX_EXTENSION_ATR * atr).fillna(False)
+    _cols = ["pb_trend", "pb_ma20_up", "pb_touched", "pb_held", "pb_vol_dry", "pb_reversal", "pb_not_ext"]
+    out["pb_setup"] = out[_cols].all(axis=1)
+    out["pb_stop"] = l.rolling(n + 1).min() - PB_STOP_BUFFER_ATR * atr
+    return out
+
+PB_COMPONENT_LABELS = [
+    ("pb_trend", "趨勢燈已確認"), ("pb_ma20_up", "MA20向上"), ("pb_touched", "近5日回檔碰MA10"),
+    ("pb_held", "回檔期間收盤守住MA20"), ("pb_vol_dry", "回檔量縮"), ("pb_reversal", "今日紅K站回MA10"),
+    ("pb_not_ext", "未離MA20過遠"),
+]
+
 def calculate_entry_plan(code, indicators, portfolio_info, market_context):
     """
     空手進場計畫（規格書 7節）。indicators 需含：price, atr, previous_high, ma20, decision_score,
@@ -2780,8 +2947,22 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info,
 
     # ===== 持倉分支：全部出清 > T1/T2分批停利 > 逆風暫停加碼 > 加碼 > 續抱 =====
     if held_qty > 0:
+        # 【V2.14.0修正，真實bug】持有部位時，若計畫還停在空手類狀態（等待突破／等待回測／失效／過期／
+        # 突破失敗），代表使用者是在系統計畫之外自行買進。舊版轉移表不允許這些狀態直接轉到持有類狀態，
+        # 導致部位卡住、收不到任何停損停利訊號。這裡先把等待計畫結束（回到PREPARE），再交給下面的持有流程。
+        if plan.get("state") in {"BREAKOUT_WAIT", "PULLBACK_WAIT", "INVALID", "EXPIRED", "BREAKOUT_FAILED"}:
+            plan = transition_state(plan, "PREPARE", {}, data_date,
+                                    f"偵測到已持有部位（原狀態 {plan.get('state')}），結束原等待計畫，改由持有中流程管理")
         previous_qty = _safe_int(plan.get("last_known_qty"), held_qty)
         plan["last_known_qty"] = held_qty
+        # 【V2.14.0】影子策略部位第一次被評估為持有時：進場價改用實際成本、初始停損改用結構停損
+        # （避免沿用同一檔股票先前主策略等待計畫留下的突破價），之後由下面的防守線邏輯接手。
+        _shadow_floor = shadow_stop_floor(plan)
+        if _shadow_floor > 0 and previous_qty <= 0:
+            plan["entry_price"] = cost
+            plan["initial_stop"] = _shadow_floor
+            plan["t1_taken"] = False
+            plan["t2_taken"] = False
         if plan.get("entry_price", 0) <= 0:
             plan["entry_price"] = cost
 
@@ -2795,7 +2976,7 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info,
 
         exit_plan = calculate_exit_plan(
             price, cost, indicators.get("atr"), indicators.get("ma20"),
-            plan.get("current_trailing_stop") or plan.get("initial_stop"),
+            max(_safe_float(plan.get("current_trailing_stop") or plan.get("initial_stop")), _shadow_floor) or None,
             indicators.get("previous_high"), plan.get("t1_taken"), plan.get("t2_taken"),
             held_qty, is_us_stock, plan.get("partial_exit_ratio", 0.30),
             macd_osc_status=indicators.get("macd_osc_status"),
@@ -2860,7 +3041,8 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info,
             plan = transition_state(plan, "HOLD", {"current_trailing_stop": exit_plan["current_trailing_stop"], "current_trailing_stop_source": exit_plan["stop_source"]},
                                      data_date, "全帳戶總風險已降回門檻以下，重新評估加碼條件")
 
-        if not regime_bearish and not portfolio_risk_suspended and portfolio_info.get("addon_quality_gate", True):
+        if (not regime_bearish and not portfolio_risk_suspended and portfolio_info.get("addon_quality_gate", True)
+                and str(plan.get("entry_source", "")) != SHADOW_ENTRY_SOURCE):  # 【V2.14.0】影子策略部位不加碼
             addon_shares = calculate_addon_shares(
                 held_qty, price, exit_plan["current_trailing_stop"], price, exit_plan["current_trailing_stop"],
                 portfolio_info.get("cap", 20000.0), portfolio_info.get("risk", 5.0),
@@ -2895,12 +3077,20 @@ def evaluate_trade_state(trade_plan, indicators, market_context, portfolio_info,
     # ===== 空手分支：先處理既有計畫（過期/失效/推進），逆風時不建立新計畫，但不刪除既有計畫 =====
     plan["last_known_qty"] = 0
     active_wait_states = {"PREPARE", "BREAKOUT_WAIT", "PULLBACK_WAIT", "ENTER_NEXT_DAY", "SUSPENDED_BY_REGIME", "SUSPENDED_BY_PORTFOLIO_RISK"}
+    # 【V2.14.0】影子策略標記：空手且已超過有效期限（標記後沒有輸入持股）→ 清除標記
+    if str(plan.get("entry_source", "")) == SHADOW_ENTRY_SOURCE:
+        _vu = plan.get("shadow_valid_until", "")
+        if not _vu or (data_date and data_date > _vu):
+            plan.update({"entry_source": "", "shadow_stop": 0.0, "shadow_marked_date": "", "shadow_valid_until": ""})
 
     # 【重置防卡死機制】任何「非等待中」的舊狀態（HOLD/ADD_NEXT_DAY/PARTIAL_EXIT_NEXT_DAY/
     # FULL_EXIT_NEXT_DAY/INVALID/EXPIRED）在偵測到目前是空手時，代表這筆交易已經結束
     # （不論是照系統計畫出清、還是使用者在系統外手動賣出），一律重置回 PREPARE 並清空舊的
     # 進場/停利/防守欄位，才能重新開始追蹤全新訊號，避免卡在轉移表允許範圍外的死狀態。
     if plan.get("state") not in active_wait_states:
+        # 【V2.14.0】持有中的部位已結束（HOLD類狀態→空手）：影子策略標記一併清除，避免影響下一筆交易
+        if plan.get("state") in {"HOLD", "ADD_NEXT_DAY", "PARTIAL_EXIT_NEXT_DAY", "FULL_EXIT_NEXT_DAY"}:
+            plan.update({"entry_source": "", "shadow_stop": 0.0, "shadow_marked_date": "", "shadow_valid_until": ""})
         plan = transition_state(
             plan, "PREPARE",
             {"entry_price": 0.0, "breakout_price": 0.0, "chase_limit": 0.0, "pullback_low": 0.0,
@@ -3149,6 +3339,10 @@ def _fetch_backtest_indicator_frame(code, years=2):
         # 邏輯完全一致，改用 rolling+shift 向量化寫法
         df['previous_high'] = h.rolling(60).max().shift(1)
         df['swing_low'] = l.rolling(20).min().shift(1)
+        # 【V2.13.0新增，影子測試】趨勢回檔進場的訊號欄位
+        _pb = calc_trend_pullback_setup(o, h, l, c, v, df['ma10'], df['ma20'], df['atr'], df['trend_confirmed'])
+        for _col in _pb.columns:
+            df[_col] = _pb[_col]
         df['pivot_point'] = (h.shift(1) + l.shift(1) + c.shift(1)) / 3
         # 【V2.12.0新增，觀察用】價格行為觀察因子（只記錄在交易明細，不影響任何決策）
         _paf = calc_price_action_features(o, h, l, c, v)
@@ -3237,7 +3431,7 @@ def _fetch_regime_history(years=2):
     except Exception as e:
         return None, str(e)
 
-def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000.0, risk_pct=5.0, exec_stats=None):
+def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000.0, risk_pct=5.0, exec_stats=None, diag=None):
     """
     對單一股票逐日重演狀態機。核心原則：
       - 每一天只看得到「當天以前」的資料（ind_df每一列本身就是因果的，rolling/ewm天生只看過去）
@@ -3274,6 +3468,10 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
             exec_stats.setdefault(_k, 0)
         trades = []
         open_trade = None
+        # 【V2.13.0新增】進場診斷與影子測試用的逐日紀錄（只記錄，不影響主策略任何決策）
+        _day_info = {}          # i -> {"flat", "first_fail", "fail_keys", "state"}
+        _day_flags = {}         # i -> (regime_bearish, macd_block)
+        _main_fill_idx = set()  # 主策略實際進場成交的日期索引
 
         dates = ind_df.index
         warmup = 60
@@ -3407,6 +3605,17 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
             new_plan = evaluate_trade_state(plan, indicators, market_context, portfolio_info)
             state = new_plan.get('state')
 
+            # 【V2.13.0新增】逐日紀錄：空手日的進場關卡診斷、市場逆風與MACD阻擋旗標（供影子測試共用）
+            _day_flags[i] = (indicators["market_regime"] == "BEARISH",
+                             macd_divergence_type == "頂背離" or macd_osc_status == "翻黑")
+            if qty == 0:
+                try:
+                    _g, _sm = diagnose_entry_gates(indicators, market_context)
+                    _day_info[i] = {"flat": True, "first_fail": _sm["first_fail_key"] or f"plan_{state}",
+                                    "fail_keys": _sm["fail_keys"], "state": state}
+                except Exception:
+                    _day_info[i] = {"flat": True, "first_fail": "unknown", "fail_keys": [], "state": state}
+
             _lim_up_open = (not is_us_stock) and tw_limit_hit(price, next_open, "up", is_etf)
             _lim_dn_open = (not is_us_stock) and tw_limit_hit(price, next_open, "down", is_etf)
 
@@ -3430,6 +3639,7 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                     if _gate == "EXECUTE_WITH_LIMIT":
                         exec_stats["below_breakout_filled"] += 1
                     exec_stats["entry_filled"] += 1
+                    _main_fill_idx.add(i + 1)
                     _buy_cost = calc_trade_cost("buy", next_open, fill_qty, is_us_stock, is_etf)
                     qty, cost = fill_qty, next_open
                     # 【V2.11.26新增】記錄進場當下的市場燈號分數（用決策當天 i 的 market_context）。
@@ -3502,6 +3712,8 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
                         open_trade['gross_proceeds'] = open_trade.get('gross_proceeds', 0.0) + float(qty * next_open)
                         open_trade['total_costs'] = open_trade.get('total_costs', 0.0) + _sell_cost
                         open_trade['exit_reason'] = new_plan.get('signal_reason', '')
+                        # 【V2.12.1新增】出清後走勢（事後統計，用出場之後的資料，不影響任何決策）
+                        open_trade.update(calc_post_exit_path(ind_df, i + 1, next_open))
                         trades.append(open_trade)
                     open_trade = None
                     qty, cost = 0, 0.0
@@ -3520,12 +3732,289 @@ def _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=20000
             open_trade['exit_reason'] = '回測結束強制平倉（尚未實際出場）'
             trades.append(open_trade)
 
+        # 【V2.13.0新增】影子測試＋錯過的行情分析（只寫入 diag，不影響上面的主策略交易）
+        if diag is not None:
+            try:
+                _shadow_trades, _shadow_fill_idx = _simulate_pullback_shadow(
+                    code, ind_df, _day_flags, is_us_stock, is_etf, cap, risk_pct)
+                diag.setdefault("shadow", []).extend(_shadow_trades)
+                _eps = find_missed_move_episodes(code, ind_df, _day_info, _main_fill_idx, _shadow_fill_idx)
+                diag.setdefault("missed", []).extend(_eps)
+                _ff = diag.setdefault("flat_first_fail", {})
+                for _d in _day_info.values():
+                    _ff[_d["first_fail"]] = _ff.get(_d["first_fail"], 0) + 1
+                diag["flat_days"] = diag.get("flat_days", 0) + len(_day_info)
+            except Exception as _diag_err:
+                diag.setdefault("errors", []).append(f"{code}：{_diag_err}")
+
         return trades, None
     except Exception as e:
         return [], str(e)
     finally:
         if _tick_token is not None:
             _TICK_IS_ETF.reset(_tick_token)
+
+# ===== 【V2.13.0新增】進場診斷：錯過的行情分析 =====
+MISSED_MOVE_GAIN_PCT = 15.0   # 未來N日內最高收盤比當天收盤高出這麼多%，視為一段「行情」
+MISSED_MOVE_HORIZON = 20      # 往後看幾個交易日
+
+GATE_LABELS = {
+    "chip": "籌碼燈（美股：動能/趨勢燈）", "volume_light": "量能燈", "trend": "趨勢燈（多頭排列連續確認）",
+    "score": "決策分數<70", "regime": "市場逆風", "macd_block": "MACD頂背離/翻黑",
+    "macd_confirm": "MACD未轉正", "breakout_volume": "突破量不足1.5倍", "disposition": "處置股",
+    "atr": "ATR資料無效", "price_breakout": "尚未站上突破價", "chase": "超過追價上限→等回測",
+    "quality": "突破品質分數不足",
+}
+
+def gate_label(key):
+    if key.startswith("plan_"):
+        return f"關卡皆過，計畫狀態：{key[5:]}"
+    return GATE_LABELS.get(key, key)
+
+def find_missed_move_episodes(code, ind_df, day_info, main_fill_idx, shadow_fill_idx,
+                              gain_pct=MISSED_MOVE_GAIN_PCT, horizon=MISSED_MOVE_HORIZON):
+    """
+    【V2.13.0新增，事後分析，刻意使用未來資料】找出「主策略空手」期間的上漲波段：某個空手日 t，
+    未來 horizon 個交易日內最高收盤 ≥ 當天收盤×(1+gain_pct%)，就是行情候選日；連續的候選日合併成一段。
+    每一段記錄：起漲日當天卡在哪一關（first_fail）、整段期間最常卡住的關卡、主策略／影子策略有沒有在
+    起漲日到高點之間進場。只用於統計，不影響任何決策，所以不構成前視偏誤。
+    """
+    closes = ind_df['close'].astype(float).to_numpy()
+    dates = ind_df.index
+    n = len(closes)
+    cand = {}
+    for i, info in day_info.items():
+        if not info.get("flat") or i + horizon >= n or not (closes[i] > 0):
+            continue
+        fwd = closes[i + 1:i + 1 + horizon]
+        cand[i] = (np.nanmax(fwd) / closes[i] - 1) * 100 >= gain_pct
+    episodes = []
+    days = sorted(cand)
+    k = 0
+    while k < len(days):
+        i = days[k]
+        if not cand[i]:
+            k += 1; continue
+        s0 = i; e0 = i
+        while k + 1 < len(days) and days[k + 1] == e0 + 1 and cand[days[k + 1]]:
+            k += 1; e0 = days[k]
+        k += 1
+        hi_end = min(n - 1, e0 + horizon)
+        seg = closes[s0 + 1:hi_end + 1]
+        peak = s0 + 1 + int(np.nanargmax(seg))
+        gain = (closes[peak] / closes[s0] - 1) * 100
+        main_hit = sorted(f for f in main_fill_idx if s0 <= f <= peak)
+        shadow_hit = sorted(f for f in shadow_fill_idx if s0 <= f <= peak)
+        counts = {}
+        for d in range(s0, e0 + 1):
+            for key in day_info.get(d, {}).get("fail_keys", []):
+                counts[key] = counts.get(key, 0) + 1
+        most = max(counts, key=counts.get) if counts else day_info[s0]["first_fail"]
+        episodes.append({
+            "code": code, "start_date": dates[s0], "peak_date": dates[peak], "gain_pct": round(gain, 1),
+            "caught_main": bool(main_hit), "caught_shadow": bool(shadow_hit),
+            "main_entry_date": dates[main_hit[0]] if main_hit else None,
+            "main_entry_lag_gain_pct": round((closes[main_hit[0]] / closes[s0] - 1) * 100, 1) if main_hit else None,
+            "start_block": day_info[s0]["first_fail"], "start_block_label": gate_label(day_info[s0]["first_fail"]),
+            "most_common_block_label": gate_label(most),
+        })
+    return episodes
+
+def calculate_missed_move_report(episodes):
+    """【V2.13.0新增】彙總錯過的行情。回傳 (summary_dict, block_table_df)；沒有任何行情時回傳 (None, None)。"""
+    if not episodes:
+        return None, None
+    df = pd.DataFrame(episodes)
+    missed = df[~df["caught_main"]]
+    summary = {
+        "n": len(df), "caught_main_rate": df["caught_main"].mean() * 100,
+        "caught_shadow_rate": df["caught_shadow"].mean() * 100,
+        "caught_either_rate": (df["caught_main"] | df["caught_shadow"]).mean() * 100,
+        "shadow_rescue": int((~df["caught_main"] & df["caught_shadow"]).sum()),
+        "avg_gain": df["gain_pct"].mean(),
+        "avg_main_lag": df["main_entry_lag_gain_pct"].dropna().mean() if df["caught_main"].any() else None,
+        "n_missed": len(missed),
+    }
+    if missed.empty:
+        return summary, pd.DataFrame()
+    t = (missed.groupby("start_block_label")
+         .agg(段數=("gain_pct", "size"), 平均漲幅=("gain_pct", "mean"))
+         .reset_index().rename(columns={"start_block_label": "起漲日卡住的關卡"}))
+    t["佔錯過段數%"] = (t["段數"] / len(missed) * 100).round(1)
+    t["平均漲幅"] = t["平均漲幅"].round(1)
+    return summary, t.sort_values("段數", ascending=False)
+
+def _simulate_pullback_shadow(code, ind_df, day_flags, is_us_stock, is_etf, cap, risk_pct):
+    """
+    【V2.13.0新增，影子測試】獨立模擬「趨勢回檔進場」，與主策略完全分開（兩者部位可能重疊，各自計算）。
+    進場：訊號日收盤後決定，隔日開盤執行；開盤漲停不買、開盤跌破結構停損取消、開盤高於訊號日收盤＋0.5×ATR不追。
+          市場逆風或MACD頂背離/翻黑的日子不進場（與主策略相同的安全過濾）。
+    股數：與主策略相同的風險公式（calculate_position_size，停損距離＝開盤價−結構停損）。
+    出場：與主策略共用 calculate_stop_plan() 的移動防守線（初始值＝結構停損），收盤跌破→隔日開盤出清；
+          **不做分批停利**（只比較進場方式的好壞，出場刻意簡化），開盤跌停延後一天。含交易成本。
+    回傳 (trades, fill_idx_set)。
+    """
+    trades, fill_idx = [], set()
+    n = len(ind_df)
+    pos = None
+    for i in range(60, n - 1):
+        row = ind_df.iloc[i]
+        if pd.isna(row[['ma10', 'ma20', 'ma60', 'atr']]).any():
+            continue
+        price = float(row['close']); atr = float(row['atr']); ma20 = float(row['ma20'])
+        nxt = ind_df.iloc[i + 1]
+        next_open = float(nxt['open'])
+        if pd.isna(next_open) or next_open <= 0:
+            continue
+        if pos is not None:
+            pos['mfe'] = max(pos['mfe'], _safe_float(row.get('high'), price))
+            pos['mae'] = min(pos['mae'], _safe_float(row.get('low'), price))
+            stop, _src = calculate_stop_plan(price, pos['cost'], atr, ma20, pos['stop'],
+                                             swing_low=_safe_float(row.get('swing_low'), 0.0),
+                                             trend_confirmed=bool(row.get('trend_confirmed')))
+            pos['stop'] = stop
+            if price <= stop:
+                if (not is_us_stock) and tw_limit_hit(price, next_open, "down", is_etf):
+                    continue
+                fee = calc_trade_cost("sell", next_open, pos['qty'], is_us_stock, is_etf)
+                proceeds = pos['qty'] * next_open - fee
+                gross = pos['qty'] * next_open
+                pnl = (proceeds - pos['invested']) / pos['invested'] * 100
+                trades.append({"code": code, "entry_date": pos['entry_date'], "exit_date": ind_df.index[i + 1],
+                               "entry_price": pos['cost'], "exit_price": next_open, "pnl_pct": pnl,
+                               "gross_pnl_pct": (gross - pos['gross_invested']) / pos['gross_invested'] * 100,
+                               "holding_days": (ind_df.index[i + 1] - pos['entry_date']).days,
+                               "mfe_pct": (pos['mfe'] / pos['cost'] - 1) * 100, "mae_pct": (pos['mae'] / pos['cost'] - 1) * 100,
+                               "win": pnl > 0, "exit_reason": "收盤跌破移動防守線"})
+                pos = None
+            continue
+        if not bool(row.get('pb_setup', False)):
+            continue
+        bearish, macd_block = day_flags.get(i, (False, False))
+        if bearish or macd_block:
+            continue
+        stop0 = _safe_float(row.get('pb_stop'), 0.0)
+        if stop0 <= 0 or stop0 >= price:
+            continue
+        if (not is_us_stock) and tw_limit_hit(price, next_open, "up", is_etf):
+            continue
+        if next_open < stop0 or next_open > price + PB_CHASE_ATR * atr:
+            continue
+        qty = calculate_position_size(cap, risk_pct, next_open, stop0, cap)
+        if qty <= 0:
+            continue
+        fee = calc_trade_cost("buy", next_open, qty, is_us_stock, is_etf)
+        pos = {"entry_date": ind_df.index[i + 1], "cost": next_open, "qty": qty, "stop": stop0,
+               "invested": qty * next_open + fee, "gross_invested": qty * next_open,
+               "mfe": next_open, "mae": next_open}
+        fill_idx.add(i + 1)
+    if pos is not None:
+        last = float(ind_df.iloc[-1]['close'])
+        fee = calc_trade_cost("sell", last, pos['qty'], is_us_stock, is_etf)
+        pnl = (pos['qty'] * last - fee - pos['invested']) / pos['invested'] * 100
+        trades.append({"code": code, "entry_date": pos['entry_date'], "exit_date": ind_df.index[-1],
+                       "entry_price": pos['cost'], "exit_price": last, "pnl_pct": pnl,
+                       "gross_pnl_pct": (pos['qty'] * last - pos['gross_invested']) / pos['gross_invested'] * 100,
+                       "holding_days": (ind_df.index[-1] - pos['entry_date']).days,
+                       "mfe_pct": (pos['mfe'] / pos['cost'] - 1) * 100, "mae_pct": (pos['mae'] / pos['cost'] - 1) * 100,
+                       "win": pnl > 0, "exit_reason": "回測結束強制平倉（尚未實際出場）"})
+    return trades, fill_idx
+
+def calculate_simple_metrics(trades_df):
+    """【V2.13.0新增】精簡版績效（影子策略與主策略並列比較用）。"""
+    if trades_df is None or trades_df.empty:
+        return None
+    w = trades_df[trades_df['win']]; lo = trades_df[~trades_df['win']]
+    gp = w['pnl_pct'].sum(); gl = abs(lo['pnl_pct'].sum())
+    return {
+        "筆數": len(trades_df), "勝率%": round(len(w) / len(trades_df) * 100, 1),
+        "平均獲利%": round(w['pnl_pct'].mean(), 2) if len(w) else 0.0,
+        "平均虧損%": round(lo['pnl_pct'].mean(), 2) if len(lo) else 0.0,
+        "Profit Factor": round(gp / gl, 2) if gl > 0 else (float('inf') if gp > 0 else 0.0),
+        "淨期望值%（每筆平均）": round(trades_df['pnl_pct'].mean(), 2),
+        "平均持有天數": round(trades_df['holding_days'].mean(), 1),
+    }
+
+POST_EXIT_WINDOWS = (5, 10)  # 【V2.12.1新增】出清後追蹤的交易日數（含出場當天）
+
+def calc_post_exit_path(ind_df, exit_idx, exit_price, windows=POST_EXIT_WINDOWS):
+    """
+    【V2.12.1新增，事後分析用，刻意使用「出場之後」的資料】
+    全部出清後，追蹤出場當天（exit_idx，開盤成交那一天）起 N 個交易日的走勢，回答「賣掉之後是不是
+    常常漲回去」。這裡讀取的是未來資料，**只用於交易結束後的統計，絕不回饋到任何進出場判斷**，
+    所以不構成回測的前視偏誤（look-ahead bias）。
+
+    回傳 dict（資料不足 N 天的視窗回傳 None，不納入統計，避免回測尾端的交易把平均值拉偏）：
+      pe_day0_close_pct     出場當天收盤 相對 出場價（開盤成交價）的漲跌%——直接回答「賣在開盤，當天卻一路漲」
+      pe_reclaim_{N}d       N天內是否有任何一天「收盤」站回出場價之上（True/False）
+      pe_max_close_{N}d_pct N天內最高收盤 相對 出場價%（賣掉後最多「錯過」多少，用收盤避免盤中雜訊）
+      pe_min_low_{N}d_pct   N天內最低價 相對 出場價%（賣掉後最多「躲過」多少）
+      pe_close_{N}d_pct     第N天收盤 相對 出場價%（如果多抱N天，結果差多少）
+    """
+    out = {"pe_day0_close_pct": None}
+    try:
+        ep = _safe_float(exit_price)
+        if ep <= 0 or exit_idx is None or exit_idx >= len(ind_df):
+            return out
+        closes = ind_df['close'].astype(float)
+        lows = ind_df['low'].astype(float)
+        out["pe_day0_close_pct"] = (float(closes.iloc[exit_idx]) / ep - 1) * 100
+        for n in windows:
+            end = exit_idx + n
+            if end > len(ind_df):
+                out[f"pe_reclaim_{n}d"] = None
+                out[f"pe_max_close_{n}d_pct"] = None
+                out[f"pe_min_low_{n}d_pct"] = None
+                out[f"pe_close_{n}d_pct"] = None
+                continue
+            wc = closes.iloc[exit_idx:end]
+            wl = lows.iloc[exit_idx:end]
+            out[f"pe_reclaim_{n}d"] = bool((wc > ep).any())
+            out[f"pe_max_close_{n}d_pct"] = (float(wc.max()) / ep - 1) * 100
+            out[f"pe_min_low_{n}d_pct"] = (float(wl.min()) / ep - 1) * 100
+            out[f"pe_close_{n}d_pct"] = (float(wc.iloc[-1]) / ep - 1) * 100
+    except Exception:
+        pass
+    return out
+
+def calculate_post_exit_report(trades_df, windows=POST_EXIT_WINDOWS):
+    """
+    【V2.12.1新增】彙總「全部出清」交易的出清後走勢。只納入真正因防守線出清的交易
+    （排除回測結束強制平倉），且每個視窗只納入資料足夠的交易。回傳 dict，交易數為0時回傳 None。
+    """
+    if trades_df is None or trades_df.empty or 'pe_day0_close_pct' not in trades_df.columns:
+        return None
+    df = trades_df[trades_df['exit_reason'].astype(str) != '回測結束強制平倉（尚未實際出場）'].copy()
+    df = df[pd.to_numeric(df['pe_day0_close_pct'], errors='coerce').notna()]
+    if df.empty:
+        return None
+    d0 = pd.to_numeric(df['pe_day0_close_pct'], errors='coerce')
+    rep = {"n_exits": len(df),
+           "day0_up_rate": float((d0 > 0).mean() * 100),
+           "day0_avg_pct": float(d0.mean()),
+           "windows": {}}
+    for n in windows:
+        col = f"pe_reclaim_{n}d"
+        if col not in df.columns:
+            continue
+        sub = df[df[col].notna()]
+        if sub.empty:
+            continue
+        rc = sub[col].astype(bool)
+        mx = pd.to_numeric(sub[f"pe_max_close_{n}d_pct"], errors='coerce')
+        mn = pd.to_numeric(sub[f"pe_min_low_{n}d_pct"], errors='coerce')
+        cl = pd.to_numeric(sub[f"pe_close_{n}d_pct"], errors='coerce')
+        rep["windows"][n] = {
+            "n": len(sub),
+            "reclaim_rate": float(rc.mean() * 100),
+            "avg_max_close_pct": float(mx.mean()),
+            "avg_min_low_pct": float(mn.mean()),
+            "avg_close_pct": float(cl.mean()),
+            "median_close_pct": float(cl.median()),
+            "big_rebound_rate": float((mx >= 5).mean() * 100),   # 收盤曾比出場價高5%以上
+            "big_drop_rate": float((mn <= -5).mean() * 100),      # 曾比出場價再跌5%以上
+        }
+    return rep
 
 def _aggregate_backtest_trades(trade):
     """把一筆 open_trade 記錄（含分批加碼/分批出場）換算成單筆交易的績效指標。"""
@@ -3589,6 +4078,8 @@ def _aggregate_backtest_trades(trade):
         'obs_clv': trade.get('obs_clv'), 'obs_vol_ratio_prev5': trade.get('obs_vol_ratio_prev5'),
         'obs_range_contraction': trade.get('obs_range_contraction'), 'obs_volume_dryup': trade.get('obs_volume_dryup'),
         'obs_candle_pattern': trade.get('obs_candle_pattern', ''),
+        # 【V2.12.1新增】出清後走勢（只有「全部出清」的交易才有值）
+        **{k: v for k, v in trade.items() if k.startswith('pe_')},
     }
 
 def calculate_backtest_metrics(trades_df):
@@ -3772,7 +4263,7 @@ def calculate_backtest_by_code(trades_df):
     out = pd.DataFrame(rows).sort_values('總報酬貢獻%', ascending=False).reset_index(drop=True)
     return out
 
-def run_backtest(codes, years=2, progress_callback=None):
+def run_backtest(codes, years=2, progress_callback=None, portfolio_settings=None):
     """
     回測總入口。逐檔抓資料、逐檔重演狀態機，任何單一股票失敗都不會中斷整批回測（跟即時系統
     main loop的個股try/except防護原則一致）。回傳 (trades_df, metrics, errors)。
@@ -3781,6 +4272,7 @@ def run_backtest(codes, years=2, progress_callback=None):
     all_trades = []
     errors = {}
     exec_stats = {}  # 【V2.12.0新增】隔日開盤執行閘門的統計（跨所有股票累計）
+    diag = {}        # 【V2.13.0新增】進場診斷、錯過的行情、影子測試（跨所有股票累計）
     for idx, code in enumerate(codes):
         if progress_callback:
             progress_callback(idx, len(codes), code)
@@ -3790,7 +4282,12 @@ def run_backtest(codes, years=2, progress_callback=None):
         inst_df, inst_err = _fetch_institutional_history(code, years)
         if inst_err and not (code.isalpha() or code.endswith('.US')):
             errors[code] = f"籌碼資料：{inst_err}（仍會繼續回測，籌碼燈這段期間會偏保守判定不過關）"
-        trades, sim_err = _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, exec_stats=exec_stats)
+        # 【V2.14.0】使用該股在側邊欄設定的分配資金與風險%（沒有設定的代號用預設 20,000 元／5%）
+        _ps = (portfolio_settings or {}).get(code, {}) if isinstance(portfolio_settings, dict) else {}
+        _cap = _safe_float(_ps.get('cap'), 20000.0) if isinstance(_ps, dict) else 20000.0
+        _risk = _safe_float(_ps.get('risk'), 5.0) if isinstance(_ps, dict) else 5.0
+        trades, sim_err = _simulate_stock_backtest(code, ind_df, raw_df, inst_df, regime_df, cap=_cap or 20000.0, risk_pct=_risk or 5.0,
+                                                   exec_stats=exec_stats, diag=diag)
         if sim_err:
             errors.setdefault(code, ""); errors[code] += f" 模擬失敗：{sim_err}"
             continue
@@ -3802,7 +4299,7 @@ def run_backtest(codes, years=2, progress_callback=None):
         metrics['exec_stats'] = exec_stats
     if regime_err:
         errors['__regime__'] = f"市場燈號歷史資料：{regime_err}（仍會繼續回測，市場燈號這段期間會視為中性）"
-    return trades_df, metrics, errors
+    return trades_df, metrics, errors, diag
 
 portfolio, system_history, trade_plan_data, today_str = load_portfolio(), load_history(), load_trade_plan(), datetime.datetime.now().strftime("%Y-%m-%d")
 trade_plan_snapshots = load_trade_plan_snapshots()  # 【V2.11.41新增】每檔股票「前一個確定版」的凍結快照
@@ -4214,6 +4711,59 @@ def render_stock_card(data, system_history, portfolio_data):
                         f"{_bp:.2f}~{_cl:.2f} → 依計畫執行"
                     )
 
+            # 【V2.14.0新增】影子策略部位的提示
+            if data.get('held_qty', 0) > 0 and data.get('is_shadow_position'):
+                st.info(f"🧪 這是依影子策略（趨勢回檔進場）建立的部位：結構停損 {_safe_float(data.get('shadow_stop')):.2f} 為防守線下限、"
+                        "不給加碼建議；分批停利與移動防守線照主策略規則執行。決策日誌會自動標註【影子策略】。")
+
+            # 【V2.13.0新增】空手時：進場關卡逐項檢核＋影子訊號
+            if data.get('held_qty', 0) <= 0:
+                _eg = data.get('entry_gates') or []
+                _ed = data.get('entry_diag') or {}
+                if _eg:
+                    _title = (f"🔍 今日進場關卡檢核：建立計畫條件 {_ed.get('n_core_pass', 0)}/{_ed.get('n_core', 0)} 通過"
+                              + (f"，第一個卡住：{_ed.get('first_fail_label')}" if _ed.get('first_fail_label') else "，全部通過"))
+                    with st.expander(_title, expanded=False):
+                        _icon = {True: "✅", False: "❌", None: "➖"}
+                        st.markdown("**① 建立進場計畫的條件**（全部通過才會出現 BREAKOUT_WAIT 等待突破）")
+                        st.markdown("\n".join(f"- {_icon[g['ok']]} {g['label']}" + (f"　<span style='color:#94a3b8'>{g['detail']}</span>" if g['detail'] else "")
+                                               for g in _eg if g['group'] == 'core'), unsafe_allow_html=True)
+                        st.markdown("**② 轉為隔日進場的條件**")
+                        st.markdown("\n".join(f"- {_icon[g['ok']]} {g['label']}" + (f"　<span style='color:#94a3b8'>{g['detail']}</span>" if g['detail'] else "")
+                                               for g in _eg if g['group'] == 'price'), unsafe_allow_html=True)
+                        st.caption("這裡只說明原因，不會改變任何判斷。長期統計請看回測頁面的「🔍進場診斷：錯過的行情」。")
+                _pb = data.get('pb_live') or {}
+                if _pb:
+                    _pb_ok = bool(_pb.get('pb_setup')) and not _pb.get('blocked_by')
+                    _pb_head = ("🧪 影子訊號：趨勢回檔進場條件成立" if _pb_ok else
+                                ("🧪 影子訊號：條件成立但被安全過濾擋下（" + "、".join(_pb.get('blocked_by', [])) + "）" if _pb.get('pb_setup') else
+                                 f"🧪 影子訊號：趨勢回檔進場 {sum(1 for k, _ in PB_COMPONENT_LABELS if _pb.get(k))}/{len(PB_COMPONENT_LABELS)} 條件成立"))
+                    with st.expander(_pb_head, expanded=_pb_ok):
+                        st.markdown("\n".join(f"- {'✅' if _pb.get(k) else '❌'} {lbl}" for k, lbl in PB_COMPONENT_LABELS))
+                        if _pb_ok:
+                            st.info(f"參考價位：隔日開盤高於 {_safe_float(_pb.get('chase_ref')):.2f} 不追；結構停損 {_safe_float(_pb.get('pb_stop')):.2f}。")
+                            # 【V2.14.0新增】標記「明天要依影子訊號進場」，讓系統記住結構停損
+                            _tp_row = trade_plan_data.get(data['code'], {})
+                            if str(_tp_row.get("entry_source", "")) == SHADOW_ENTRY_SOURCE:
+                                st.success(f"📌 已標記依影子訊號進場（結構停損 {_safe_float(_tp_row.get('shadow_stop')):.2f}，"
+                                           f"標記有效至 {_tp_row.get('shadow_valid_until') or '—'}）。成交後請在側邊欄輸入股數與成本。")
+                            elif st.button("📌 我明天要依這個影子訊號進場（記住結構停損）", key=f"pb_mark_{data['code']}"):
+                                if data['code'] in trade_plan_data:
+                                    _mark_date = data.get('plan_taiwan_data_date') or today_str
+                                    trade_plan_data[data['code']].update({
+                                        "entry_source": SHADOW_ENTRY_SOURCE,
+                                        "shadow_stop": round_to_tick(_safe_float(_pb.get('pb_stop')), data.get('is_us', False), mode="down"),
+                                        "shadow_marked_date": _mark_date,
+                                        "shadow_valid_until": _add_business_days(_mark_date, SHADOW_MARK_VALID_DAYS, data.get('is_us', False)),
+                                    })
+                                    save_trade_plan(trade_plan_data)
+                                    append_decision_log(today_str, data['code'], "【影子策略】趨勢回檔進場訊號（標記）",
+                                                        "標記隔日依影子訊號進場", None, None,
+                                                        f"結構停損 {_safe_float(_pb.get('pb_stop')):.2f}；不追價位 {_safe_float(_pb.get('chase_ref')):.2f}")
+                                st.rerun()
+                        st.warning("⚠️ 影子測試中：這個進場方式尚未通過回測驗證，系統不會為它建立交易計畫。建議先觀察並記錄，"
+                                   "等回測「🧪影子測試」累積足夠樣本、淨期望值為正後再考慮實際使用。")
+
             # 【修正】原本用 st.columns(2) 左右分欄，在手機/平板較窄的螢幕上兩欄文字容易被硬擠在一起、
             # 看起來混在一起分不清楚，改成單欄、由上到下依序顯示，寬螢幕/窄螢幕都不會有排版混淆的問題。
             st.write(f"**訊號日期資料**\n台股資料日：{data.get('plan_taiwan_data_date') or '—'}\n美股資料日：{data.get('plan_us_data_date') or '—'}\n建議執行日：{data.get('plan_execution_date') or '—'}\n有效期限：{data.get('plan_valid_until') or '—'}")
@@ -4558,7 +5108,8 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                 _bt_progress.progress((idx + 1) / total, text=f"正在回測第 {idx + 1}/{total} 檔：{code}")
 
             with st.spinner("回測執行中，請勿關閉頁面..."):
-                _bt_trades_df, _bt_metrics, _bt_errors = run_backtest(_bt_codes, years=2, progress_callback=_bt_progress_cb)
+                _bt_trades_df, _bt_metrics, _bt_errors, _bt_diag = run_backtest(_bt_codes, years=2, progress_callback=_bt_progress_cb,
+                                                                                portfolio_settings=portfolio)
             _bt_progress.progress(1.0, text="回測完成")
 
             if _bt_errors:
@@ -4610,7 +5161,8 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                 if _drag is not None:
                     st.caption(
                         f"💸 以上勝率／平均獲利／虧損／Expectancy 都是**扣除交易成本後的淨報酬**（手續費{TW_FEE_RATE*100:.4f}%×折扣{TW_FEE_DISCOUNT:g}、"
-                        f"最低{TW_MIN_FEE:.0f}元、證交稅股票{TW_STOCK_TAX_RATE*100:.1f}%／ETF{TW_ETF_TAX_RATE*100:.1f}%）。"
+                        f"整股最低{TW_MIN_FEE:.0f}元／零股最低{TW_MIN_FEE_ODD:.0f}元、證交稅股票{TW_STOCK_TAX_RATE*100:.1f}%／ETF{TW_ETF_TAX_RATE*100:.1f}%；"
+                        "股數與資金依各股票在側邊欄的設定）。"
                         f"平均每筆被成本吃掉 {_drag:.2f} 個百分點；若不扣成本，平均每筆報酬為 {_gexp:.2f}%。"
                     )
                 _es = _bt_metrics.get('exec_stats') or {}
@@ -4687,6 +5239,40 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                 else:
                     st.info("交易筆數不足，暫時無法產生觀察因子分析。")
 
+                # 【V2.12.1新增】出清後走勢
+                st.subheader("🔁 出清後走勢：賣掉之後是不是常常漲回去？")
+                _pe = calculate_post_exit_report(_bt_trades_df)
+                if _pe is None:
+                    st.info("這次回測沒有因防守線出清的交易，或出清後的資料天數不足，暫無統計。")
+                else:
+                    st.caption(
+                        f"統計對象：{_pe['n_exits']} 筆因跌破防守線而「全部出清」的交易（不含回測結束強制平倉）。"
+                        "出場價＝出清當天的開盤成交價。這是事後統計，用的是出場之後的資料，不影響任何進出場判斷。"
+                    )
+                    _pc1, _pc2 = st.columns(2)
+                    _pc1.metric("出場當天收盤高於出場價的比例", f"{_pe['day0_up_rate']:.0f}%")
+                    _pc2.metric("出場當天收盤 相對 出場價（平均）", f"{_pe['day0_avg_pct']:+.2f}%")
+                    _pe_rows = []
+                    for _n, _w in _pe["windows"].items():
+                        _pe_rows.append({
+                            "追蹤天數": f"{_n}個交易日", "樣本數": _w["n"],
+                            "收盤曾站回出場價%": round(_w["reclaim_rate"], 1),
+                            "最高收盤平均%（錯過）": round(_w["avg_max_close_pct"], 2),
+                            "最低價平均%（躲過）": round(_w["avg_min_low_pct"], 2),
+                            "第N天收盤平均%": round(_w["avg_close_pct"], 2),
+                            "第N天收盤中位數%": round(_w["median_close_pct"], 2),
+                            "曾反彈≥5%的比例%": round(_w["big_rebound_rate"], 1),
+                            "曾再跌≥5%的比例%": round(_w["big_drop_rate"], 1),
+                        })
+                    st.dataframe(pd.DataFrame(_pe_rows), use_container_width=True, hide_index=True)
+                    st.caption(
+                        "怎麼讀：①「收盤曾站回出場價」比例高，只代表賣掉後常有反彈，不代表該晚點賣——要同時看「最低價平均%」"
+                        "（賣掉後原本還會再跌多少）和「曾再跌≥5%」的比例，那是停損替你擋掉的風險。"
+                        "②「第N天收盤平均%」是最接近「如果多抱N天」的單一數字：明顯為正，代表出清整體偏早，值得研究延後出場的規則"
+                        "（需另外回測驗證）；接近0或為負，代表目前的出清時機合理，被洗掉的那幾次是停損的正常成本。"
+                        "③樣本少於30筆時，請把結果當作方向參考。"
+                    )
+
                 st.subheader("📋 交易明細")
                 _bt_display_df = _bt_trades_df.sort_values('exit_date', ascending=False).copy()
                 _bt_display_df['entry_date'] = pd.to_datetime(_bt_display_df['entry_date']).dt.strftime('%Y-%m-%d')
@@ -4698,6 +5284,74 @@ with st.expander("📊 策略回測（Backtest）— 用歷史資料驗證這套
                     file_name=f"backtest_trades_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                 )
+
+            # ===== 【V2.13.0新增】進場診斷與影子測試（即使主策略0筆交易也會顯示）=====
+            st.subheader("🔍 進場診斷：錯過的行情")
+            _mm_sum, _mm_tbl = calculate_missed_move_report((_bt_diag or {}).get("missed", []))
+            if _mm_sum is None:
+                st.info(f"回測期間沒有找到主策略空手時、{MISSED_MOVE_HORIZON}個交易日內漲幅≥{MISSED_MOVE_GAIN_PCT:.0f}%的行情。")
+            else:
+                st.caption(
+                    f"定義：主策略空手的某一天，未來{MISSED_MOVE_HORIZON}個交易日內最高收盤比當天高出{MISSED_MOVE_GAIN_PCT:.0f}%以上，"
+                    "連續的這種日子合併成一段「行情」。這是事後統計（使用未來資料），不影響任何決策。"
+                )
+                _d1, _d2, _d3, _d4 = st.columns(4)
+                _d1.metric("找到的行情段數", f"{_mm_sum['n']}")
+                _d2.metric("主策略有進場的比例", f"{_mm_sum['caught_main_rate']:.0f}%")
+                _d3.metric("影子策略有進場的比例", f"{_mm_sum['caught_shadow_rate']:.0f}%")
+                _d4.metric("兩者合計涵蓋", f"{_mm_sum['caught_either_rate']:.0f}%")
+                _lag_txt = f"；主策略有進場的段落，平均在起漲後已漲 {_mm_sum['avg_main_lag']:.1f}% 才進場" if _mm_sum.get('avg_main_lag') is not None else ""
+                st.caption(f"行情平均漲幅 {_mm_sum['avg_gain']:.1f}%；主策略錯過 {_mm_sum['n_missed']} 段，其中影子策略補上 {_mm_sum['shadow_rescue']} 段{_lag_txt}。")
+                if _mm_tbl is not None and not _mm_tbl.empty:
+                    st.markdown("**主策略錯過的段落，起漲當天卡在哪一關**（只列第一個沒通過的關卡）")
+                    st.dataframe(_mm_tbl, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "怎麼用：佔比最高的那一關，就是下一步最值得測試放寬的對象（一次只放寬一關，並比較淨期望值與最大回撤）。"
+                        "注意：「錯過」不等於「該進場」——放寬後也會多出許多失敗的進場，必須用回測確認淨效果。"
+                    )
+                with st.expander("錯過的行情明細", expanded=False):
+                    _mm_df = pd.DataFrame(_bt_diag.get("missed", []))
+                    for _dc in ("start_date", "peak_date", "main_entry_date"):
+                        if _dc in _mm_df.columns:
+                            _mm_df[_dc] = pd.to_datetime(_mm_df[_dc]).dt.strftime('%Y-%m-%d')
+                    st.dataframe(_mm_df, use_container_width=True, hide_index=True)
+            _ff = (_bt_diag or {}).get("flat_first_fail", {})
+            if _ff:
+                with st.expander(f"空手日的第一道未通過關卡分布（共 {(_bt_diag or {}).get('flat_days', 0)} 個空手日）", expanded=False):
+                    _ff_df = pd.DataFrame([{"關卡": gate_label(k), "天數": v} for k, v in _ff.items()]).sort_values("天數", ascending=False)
+                    _ff_df["佔比%"] = (_ff_df["天數"] / _ff_df["天數"].sum() * 100).round(1)
+                    st.dataframe(_ff_df, use_container_width=True, hide_index=True)
+
+            st.subheader("🧪 影子測試：趨勢回檔進場（第二種進場方式）")
+            st.caption(
+                "規則：多頭排列已確認、MA20向上、近5日回檔碰到MA10、回檔期間收盤守住MA20且量縮、今天紅K站回MA10、"
+                "沒有離MA20過遠時，隔日開盤進場；停損＝近6日最低價−0.2×ATR，之後用與主策略相同的移動防守線，"
+                "**只做全部出清、不做分批停利**，含交易成本。與主策略獨立模擬（部位可能重疊），"
+                "**不會建立任何交易計畫**，用來判斷這種進場方式值不值得正式加入。"
+            )
+            _sh_df = pd.DataFrame((_bt_diag or {}).get("shadow", []))
+            if _sh_df.empty:
+                st.info("回測期間影子策略沒有產生任何交易。")
+            else:
+                _rows = []
+                _sm = calculate_simple_metrics(_sh_df)
+                if _sm: _rows.append({"策略": "🧪 趨勢回檔進場（影子）", **_sm})
+                if _bt_trades_df is not None and not _bt_trades_df.empty:
+                    _mm = calculate_simple_metrics(_bt_trades_df)
+                    if _mm: _rows.append({"策略": "主策略（突破進場）", **_mm})
+                st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+                st.caption(
+                    "比較時注意：主策略有分批停利、影子策略沒有，平均獲利與持有天數不完全可比；重點看淨期望值、Profit Factor、"
+                    "以及上方「錯過的行情」中影子策略補上了幾段。正式啟用的建議門檻：影子策略至少30筆、淨期望值為正、"
+                    "跨不同期間方向一致。"
+                )
+                with st.expander("影子策略交易明細", expanded=False):
+                    _shd = _sh_df.copy()
+                    for _dc in ("entry_date", "exit_date"):
+                        _shd[_dc] = pd.to_datetime(_shd[_dc]).dt.strftime('%Y-%m-%d')
+                    st.dataframe(_shd, use_container_width=True, hide_index=True)
+            if (_bt_diag or {}).get("errors"):
+                st.caption("⚠️ 部分股票的診斷計算失敗（不影響主策略回測）：" + "；".join(_bt_diag["errors"][:5]))
 
 # --- 5-2. 決策日誌（V2.11.39新增）---
 # 每一檔股票的「🗓️交易計畫」分頁，遇到系統要求你做決定的狀態時，會出現「📝記錄我的決定」小工具，
@@ -4714,6 +5368,16 @@ with st.expander("📝 決策日誌 — 系統建議 vs 你實際執行了什麼
         st.info("目前還沒有任何紀錄。到某檔股票的「🗓️交易計畫」分頁，遇到需要決定的訊號時，展開「📝記錄我的決定」開始記錄。")
     else:
         _log_df = pd.DataFrame(_decision_log_data)
+        # 【V2.14.0】影子策略紀錄分開統計
+        if "system_suggestion" in _log_df.columns:
+            _is_sh = _log_df["system_suggestion"].astype(str).str.contains("【影子策略】", na=False)
+            if _is_sh.any():
+                st.caption(f"🧪 其中 {int(_is_sh.sum())} 筆為影子策略（趨勢回檔進場）相關紀錄，可用下方篩選單獨檢視。")
+                _view = st.radio("顯示", ["全部", "只看影子策略", "只看主策略"], horizontal=True, key="dlog_filter")
+                if _view == "只看影子策略":
+                    _log_df = _log_df[_is_sh]
+                elif _view == "只看主策略":
+                    _log_df = _log_df[~_is_sh]
         st.dataframe(_log_df, use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ 下載決策日誌（CSV）",
@@ -4913,6 +5577,11 @@ else:
             # 同一個答案，不是只是公式一樣但各自從零開始算。
             _old_plan = _normalize_trade_plan_row(trade_plan_data.get(code, _trade_plan_defaults(code)))
             _prev_stop_for_calc = _old_plan.get("current_trailing_stop") or _old_plan.get("initial_stop")
+            # 【V2.14.0】影子策略部位：結構停損是防守線下限（與狀態機同一規則）
+            _shadow_floor_live = shadow_stop_floor(_old_plan) if _safe_int(info.get('qty', 0)) > 0 else 0.0
+            if _shadow_floor_live > 0:
+                _prev_stop_for_calc = max(_safe_float(_prev_stop_for_calc), _shadow_floor_live)
+            _is_shadow_position = _shadow_floor_live > 0
 
             # 【V2.11.10新增，Trend Runner】波段低點：過去20天（不含今日）實際低點，當防守線的
             # 第三種候選方法（跟MA20−ATR、現價−1.5×ATR取最大值），用真實買盤支撐過的價位當防守線，
@@ -5108,6 +5777,8 @@ else:
                     ai_advice.append(f"⏸️ 暫不建議加碼：日線MACD出現「{_macd_daily_result.divergence_type if _macd_daily_result.divergence_type == '頂背離' else _macd_daily_result.osc_status}」，動能可能轉弱，暫緩加碼觀察後續。")
                 elif _is_disposition:
                     ai_advice.append("⏸️ 暫不建議加碼：處置期間撮合方式改變，加碼成交價難以控制。")
+                elif _is_shadow_position:
+                    ai_advice.append("⏸️ 不加碼：這是依影子策略（趨勢回檔進場）建立的部位，依規則不加碼，只執行停損與停利。")
                 else:
                     _addon_quality_gate_pass = True
                     _current_value = _held_qty * price
@@ -5177,6 +5848,23 @@ else:
                 "prev_close": float(c.iloc[-2]) if len(c) >= 2 else price,
                 "disposition_block": bool(_is_disposition),
             }
+            # 【V2.13.0新增】進場關卡診斷（與 calculate_entry_plan 同一組條件）與影子訊號「趨勢回檔進場」
+            try:
+                _entry_gates, _entry_diag = diagnose_entry_gates(_plan_indicators, macro_data)
+            except Exception:
+                _entry_gates, _entry_diag = [], {}
+            try:
+                _o_pb = df['Open'].squeeze()
+                if isinstance(_o_pb, pd.DataFrame): _o_pb = _o_pb.iloc[:, 0]
+                _pb_last = calc_trend_pullback_setup(_o_pb, h, l, c, v, c.rolling(10).mean(), c.rolling(20).mean(),
+                                                     _atr_series, _trend_confirmed_series).iloc[-1].to_dict()
+                _pb_last["blocked_by"] = [x for x, cond in (
+                    ("市場逆風", _plan_indicators["market_regime"] == "BEARISH"),
+                    ("MACD頂背離/翻黑", _macd_divergence_type == "頂背離" or _macd_osc_status == "翻黑"),
+                    ("處置股", bool(_is_disposition))) if cond]
+                _pb_last["chase_ref"] = price + PB_CHASE_ATR * atr
+            except Exception:
+                _pb_last = {}
             _plan_portfolio_info = {"cost": cost, "cap": cap, "risk": risk_pct, "qty": _held_qty,
                                      "available_cash": max(0.0, cap - _held_qty * price),
                                      "addon_quality_gate": _addon_quality_gate_pass,
@@ -5275,6 +5963,8 @@ else:
                 "atr_stop_source": _atr_stop_source,
                 "momentum_accel_score": _momentum_accel_score, "momentum_accel_detail": _momentum_accel_detail,
                 "price_action_text": _price_action_text, "is_disposition": _is_disposition, "is_notice": _is_notice,
+                "entry_gates": _entry_gates, "entry_diag": _entry_diag, "pb_live": _pb_last,
+                "is_shadow_position": _is_shadow_position, "shadow_stop": _shadow_floor_live,
                 # ===== V2.11.x 交易計畫（trade_plan）欄位，統一用 plan_ 前綴，跟既有欄位分開，互不覆蓋 =====
                 "plan_state": trade_plan_data[code]["state"], "plan_origin_state": trade_plan_data[code]["origin_state"],
                 "plan_signal_type": trade_plan_data[code]["signal_type"], "plan_signal_reason": trade_plan_data[code]["signal_reason"],
